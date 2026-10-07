@@ -158,8 +158,7 @@ fn run_observer(
     }
 
     while !stopping.load(Ordering::Acquire) {
-        let previous = snapshot.clone();
-        refresh_snapshot(
+        if refresh_snapshot(
             &mut snapshot,
             &mut resolved_hwnd,
             &mut last_geometry_refresh,
@@ -167,14 +166,15 @@ fn run_observer(
             mouse_resize,
             &pane_geometry_errors,
             &last_pane_geometry_error,
-        );
-        if snapshot != previous {
+        ) {
             *write_lock(&value) = snapshot.clone();
         }
         thread::sleep(foreground_poll_interval);
     }
 }
 
+/// Returns true when the snapshot mutated, so the observer only publishes
+/// (clones) on real changes instead of every tick.
 fn refresh_snapshot(
     snapshot: &mut DesktopSnapshot,
     resolved_hwnd: &mut isize,
@@ -183,40 +183,78 @@ fn refresh_snapshot(
     mouse_resize: MouseResizeConfig,
     pane_geometry_errors: &AtomicU64,
     last_pane_geometry_error: &RwLock<Option<String>>,
-) {
+) -> bool {
+    let mut changed = false;
     let current_hwnd = foreground_hwnd();
     if current_hwnd != *resolved_hwnd {
-        snapshot.terminal = if current_hwnd == 0 {
+        let terminal = if current_hwnd == 0 {
             None
         } else {
             terminal_window_identity(current_hwnd).ok().flatten()
         };
-        snapshot.pane_layout = PaneLayout::default();
-        *resolved_hwnd = current_hwnd;
-        *last_geometry_refresh = Instant::now()
-            .checked_sub(mouse_resize.geometry_poll_interval())
-            .unwrap_or_else(Instant::now);
+        changed |= apply_terminal_switch(
+            snapshot,
+            terminal,
+            resolved_hwnd,
+            current_hwnd,
+            last_geometry_refresh,
+            mouse_resize.geometry_poll_interval(),
+        );
     }
 
     let Some(accessibility) = accessibility else {
-        return;
+        return changed;
     };
     let Some(terminal) = snapshot.terminal else {
-        return;
+        return changed;
     };
     if last_geometry_refresh.elapsed() < mouse_resize.geometry_poll_interval() {
-        return;
+        return changed;
     }
     *last_geometry_refresh = Instant::now();
 
     match accessibility.pane_geometries(terminal.hwnd) {
-        Ok(panes) => snapshot.pane_layout = PaneLayout::from_panes(panes),
+        Ok(panes) => changed |= apply_layout(snapshot, PaneLayout::from_panes(panes)),
         Err(error) => {
-            snapshot.pane_layout = PaneLayout::default();
+            changed |= apply_layout(snapshot, PaneLayout::default());
             pane_geometry_errors.fetch_add(1, Ordering::Relaxed);
             *write_lock(last_pane_geometry_error) = Some(error.to_string());
         }
     }
+    changed
+}
+
+fn apply_terminal_switch(
+    snapshot: &mut DesktopSnapshot,
+    terminal: Option<WindowIdentity>,
+    resolved_hwnd: &mut isize,
+    current_hwnd: isize,
+    last_geometry_refresh: &mut Instant,
+    geometry_poll_interval: Duration,
+) -> bool {
+    *resolved_hwnd = current_hwnd;
+    *last_geometry_refresh = Instant::now()
+        .checked_sub(geometry_poll_interval)
+        .unwrap_or_else(Instant::now);
+
+    let mut changed = false;
+    if snapshot.terminal != terminal {
+        snapshot.terminal = terminal;
+        changed = true;
+    }
+    if snapshot.pane_layout != PaneLayout::default() {
+        snapshot.pane_layout = PaneLayout::default();
+        changed = true;
+    }
+    changed
+}
+
+fn apply_layout(snapshot: &mut DesktopSnapshot, new_layout: PaneLayout) -> bool {
+    if snapshot.pane_layout == new_layout {
+        return false;
+    }
+    snapshot.pane_layout = new_layout;
+    true
 }
 
 fn read_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
@@ -231,6 +269,8 @@ fn write_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use crate::pane_layout::{PaneGeometry, ScreenRect};
+
     use super::*;
 
     #[test]
@@ -245,5 +285,77 @@ mod tests {
 
         assert_eq!(*read_lock(&lock), DesktopSnapshot::default());
         *write_lock(&lock) = DesktopSnapshot::default();
+    }
+
+    #[test]
+    fn terminal_switch_is_dirty_only_when_identity_or_layout_changes() {
+        let mut snapshot = DesktopSnapshot::default();
+        let mut resolved_hwnd = 7;
+        let mut last_geometry_refresh = Instant::now();
+
+        assert!(
+            !apply_terminal_switch(
+                &mut snapshot,
+                None,
+                &mut resolved_hwnd,
+                7,
+                &mut last_geometry_refresh,
+                Duration::from_millis(100),
+            ),
+            "resolving the same hwnd to the same identity must not republish"
+        );
+
+        snapshot.terminal = Some(WindowIdentity {
+            hwnd: 99,
+            process_id: 1,
+            process_started_at_100ns: 2,
+            channel: crate::model::TerminalChannel::Stable,
+        });
+        assert!(apply_terminal_switch(
+            &mut snapshot,
+            None,
+            &mut resolved_hwnd,
+            8,
+            &mut last_geometry_refresh,
+            Duration::from_millis(100),
+        ));
+        assert_eq!(resolved_hwnd, 8);
+        assert_eq!(snapshot.terminal, None);
+        assert_eq!(snapshot.pane_layout, PaneLayout::default());
+    }
+
+    #[test]
+    fn layout_is_reassigned_only_when_it_actually_differs() {
+        let mut snapshot = DesktopSnapshot::default();
+        let layout = PaneLayout::from_panes(vec![PaneGeometry {
+            bounds: ScreenRect::new(0, 0, 100, 100),
+            has_keyboard_focus: false,
+        }]);
+
+        assert!(!apply_layout(&mut snapshot, PaneLayout::default()));
+        assert!(apply_layout(&mut snapshot, layout.clone()));
+        assert!(!apply_layout(&mut snapshot, layout));
+        assert!(apply_layout(&mut snapshot, PaneLayout::default()));
+    }
+
+    #[test]
+    fn refresh_snapshot_with_disabled_accessibility_stays_quiet() {
+        let errors = AtomicU64::new(0);
+        let last_error = RwLock::new(None);
+        let mut snapshot = DesktopSnapshot::default();
+        let mut resolved_hwnd = foreground_hwnd();
+        let mut last_geometry_refresh = Instant::now();
+
+        refresh_snapshot(
+            &mut snapshot,
+            &mut resolved_hwnd,
+            &mut last_geometry_refresh,
+            None,
+            MouseResizeConfig::default(),
+            &errors,
+            &last_error,
+        );
+        assert_eq!(errors.load(Ordering::Relaxed), 0);
+        assert_eq!(snapshot.pane_layout, PaneLayout::default());
     }
 }

@@ -1,5 +1,7 @@
+use windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY;
+
 use crate::model::{Direction, WindowIdentity};
-use crate::platform::windows::{KeyTransition as RawTransition, RawKeyEvent};
+use crate::platform::windows::{KeyTransition as RawTransition, RawKeyEvent, key_is_down};
 use crate::prefix::{KeyEvent, KeyTransition, LogicalKey, Modifiers, PhysicalKey};
 
 #[derive(Default)]
@@ -53,6 +55,39 @@ impl KeyboardNormalizer {
             VK_RSHIFT => self.right_shift = is_down,
             VK_LWIN => self.left_windows = is_down,
             VK_RWIN => self.right_windows = is_down,
+            _ => {}
+        }
+        if !is_down {
+            self.reconcile_released_modifier(virtual_key);
+        }
+    }
+
+    /// Clears both sides of a modifier group after an observed key-up when
+    /// async keyboard state reports the whole group is released.
+    ///
+    /// A press observed as `VK_RCONTROL` whose release is reported as the
+    /// generic `VK_CONTROL` would otherwise clear only the left slot and
+    /// leave the right slot stuck on, ghosting `modifiers.ctrl` into the
+    /// prefix machine. Async state can only be trusted to mean "definitely
+    /// not held" right after an observed up event: if it still reports the
+    /// key down, slots are kept as-is because the other side is genuinely
+    /// still held and its own events recover it.
+    fn reconcile_released_modifier(&mut self, virtual_key: u32) {
+        match virtual_key {
+            VK_CONTROL | VK_LCONTROL | VK_RCONTROL
+                if !key_is_down(VIRTUAL_KEY(VK_CONTROL as u16)) =>
+            {
+                self.left_ctrl = false;
+                self.right_ctrl = false;
+            }
+            VK_MENU | VK_LMENU | VK_RMENU if !key_is_down(VIRTUAL_KEY(VK_MENU as u16)) => {
+                self.left_alt = false;
+                self.right_alt = false;
+            }
+            VK_SHIFT | VK_LSHIFT | VK_RSHIFT if !key_is_down(VIRTUAL_KEY(VK_SHIFT as u16)) => {
+                self.left_shift = false;
+                self.right_shift = false;
+            }
             _ => {}
         }
     }
@@ -170,8 +205,12 @@ mod tests {
         }
     }
 
+    /// Tracks observed ctrl presses through plain keystrokes and recovers
+    /// both slots when a right-ctrl press is released as generic `VK_CONTROL`
+    /// (bug M2: the release used to clear only the left slot and leave
+    /// `modifiers.ctrl` stuck on).
     #[test]
-    fn tracks_physical_modifiers_without_async_key_queries() {
+    fn tracks_ctrl_state_and_recovers_stuck_slot_on_release() {
         let mut normalizer = KeyboardNormalizer::default();
         let ctrl = normalizer.normalize(raw(VK_LCONTROL, RawTransition::Down), None);
         assert!(ctrl.modifiers.ctrl);
@@ -182,6 +221,94 @@ mod tests {
 
         let released = normalizer.normalize(raw(VK_LCONTROL, RawTransition::Up), None);
         assert!(!released.modifiers.ctrl);
+
+        let right_down = normalizer.normalize(raw(VK_RCONTROL, RawTransition::Down), None);
+        assert!(right_down.modifiers.ctrl);
+        assert!(normalizer.right_ctrl);
+
+        let mismatched_up = normalizer.normalize(raw(VK_CONTROL, RawTransition::Up), None);
+        assert!(!mismatched_up.modifiers.ctrl);
+        assert!(!normalizer.left_ctrl);
+        assert!(!normalizer.right_ctrl);
+    }
+
+    #[test]
+    fn generic_control_down_still_sets_left_slot_only() {
+        let mut normalizer = KeyboardNormalizer::default();
+        let ctrl = normalizer.normalize(raw(VK_CONTROL, RawTransition::Down), None);
+        assert!(ctrl.modifiers.ctrl);
+        assert!(normalizer.left_ctrl);
+        assert!(!normalizer.right_ctrl);
+
+        let shift = normalizer.normalize(raw(VK_SHIFT, RawTransition::Down), None);
+        assert!(shift.modifiers.shift);
+        assert!(normalizer.left_shift);
+        assert!(!normalizer.right_shift);
+
+        let alt = normalizer.normalize(raw(VK_MENU, RawTransition::Down), None);
+        assert!(alt.modifiers.alt);
+        assert!(normalizer.left_alt);
+        assert!(!normalizer.right_alt);
+    }
+
+    #[test]
+    fn generic_shift_release_clears_both_shift_slots() {
+        let mut normalizer = KeyboardNormalizer::default();
+        let right_down = normalizer.normalize(raw(VK_RSHIFT, RawTransition::Down), None);
+        assert!(right_down.modifiers.shift);
+        assert!(normalizer.right_shift);
+
+        let mismatched_up = normalizer.normalize(raw(VK_SHIFT, RawTransition::Up), None);
+        assert!(!mismatched_up.modifiers.shift);
+        assert!(!normalizer.left_shift);
+        assert!(!normalizer.right_shift);
+    }
+
+    #[test]
+    fn generic_alt_release_clears_both_alt_slots() {
+        let mut normalizer = KeyboardNormalizer::default();
+        let right_down = normalizer.normalize(raw(VK_RMENU, RawTransition::Down), None);
+        assert!(right_down.modifiers.alt);
+        assert!(normalizer.right_alt);
+
+        let mismatched_up = normalizer.normalize(raw(VK_MENU, RawTransition::Up), None);
+        assert!(!mismatched_up.modifiers.alt);
+        assert!(!normalizer.left_alt);
+        assert!(!normalizer.right_alt);
+    }
+
+    #[test]
+    fn is_alt_down_stays_authoritative_over_slot_state() {
+        let mut normalizer = KeyboardNormalizer::default();
+        let mut event = raw(u32::from(b'A'), RawTransition::Down);
+        event.is_alt_down = true;
+        let key = normalizer.normalize(event, None);
+        assert!(key.modifiers.alt);
+        assert!(!normalizer.left_alt);
+        assert!(!normalizer.right_alt);
+    }
+
+    /// Documents the hook-restart edge (L9): the first event seen after a
+    /// (re)start is a lone modifier Up with async state already clear. The
+    /// slots must end up clear (recovery), never stuck — both when no press
+    /// was ever observed by this normalizer and when a stale slot survived
+    /// from before the restart.
+    #[test]
+    fn lone_modifier_up_as_first_event_after_restart_ends_clear() {
+        let mut fresh = KeyboardNormalizer::default();
+        let ctrl_up = fresh.normalize(raw(VK_RCONTROL, RawTransition::Up), None);
+        assert!(!ctrl_up.modifiers.ctrl);
+        assert!(!fresh.left_ctrl);
+        assert!(!fresh.right_ctrl);
+
+        let mut stale = KeyboardNormalizer::default();
+        stale.normalize(raw(VK_RCONTROL, RawTransition::Down), None);
+        assert!(stale.right_ctrl);
+
+        let recovered = stale.normalize(raw(VK_CONTROL, RawTransition::Up), None);
+        assert!(!recovered.modifiers.ctrl);
+        assert!(!stale.left_ctrl);
+        assert!(!stale.right_ctrl);
     }
 
     #[test]

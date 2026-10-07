@@ -1,5 +1,6 @@
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY;
 
@@ -11,6 +12,9 @@ use crate::prefix::KeyChord;
 use crate::{AppError, AppResult};
 
 use super::keyboard::virtual_key_for_logical_key;
+
+const STOP_SEND_ATTEMPTS: usize = 50;
+const STOP_SEND_INTERVAL: Duration = Duration::from_millis(20);
 
 pub(super) enum WorkerMessage {
     Dispatch {
@@ -42,7 +46,7 @@ pub(super) struct WorkerReport {
 }
 
 pub(super) struct ActionWorker {
-    sender: SyncSender<WorkerMessage>,
+    sender: Option<SyncSender<WorkerMessage>>,
     join: Option<JoinHandle<AppResult<WorkerReport>>>,
 }
 
@@ -56,17 +60,21 @@ impl ActionWorker {
                 AppError::Native(format!("failed to spawn action worker thread: {error}"))
             })?;
         Ok(Self {
-            sender,
+            sender: Some(sender),
             join: Some(join),
         })
     }
 
     pub(super) fn sender(&self) -> SyncSender<WorkerMessage> {
-        self.sender.clone()
+        self.sender
+            .clone()
+            .expect("action worker sender exists until stop()")
     }
 
     pub(super) fn stop(mut self) -> AppResult<WorkerReport> {
-        let _ = self.sender.send(WorkerMessage::Stop);
+        if let Some(sender) = self.sender.take() {
+            request_stop(&sender, STOP_SEND_ATTEMPTS, STOP_SEND_INTERVAL);
+        }
         let Some(join) = self.join.take() else {
             return Ok(WorkerReport::default());
         };
@@ -78,10 +86,26 @@ impl ActionWorker {
 impl Drop for ActionWorker {
     fn drop(&mut self) {
         if let Some(join) = self.join.take() {
-            let _ = self.sender.send(WorkerMessage::Stop);
+            if let Some(sender) = self.sender.take() {
+                request_stop(&sender, STOP_SEND_ATTEMPTS, STOP_SEND_INTERVAL);
+            }
             let _ = join.join();
         }
     }
+}
+
+/// Enqueues `WorkerMessage::Stop` with a bounded retry budget so a saturated
+/// queue cannot hang shutdown; dropping the sender afterwards still lets the
+/// worker observe `RecvError` and exit.
+fn request_stop(sender: &SyncSender<WorkerMessage>, attempts: usize, interval: Duration) -> bool {
+    for _ in 0..attempts {
+        match sender.try_send(WorkerMessage::Stop) {
+            Ok(()) => return true,
+            Err(mpsc::TrySendError::Disconnected(_)) => return false,
+            Err(mpsc::TrySendError::Full(_)) => thread::sleep(interval),
+        }
+    }
+    false
 }
 
 fn run(receiver: Receiver<WorkerMessage>) -> WorkerReport {
@@ -180,4 +204,57 @@ fn dispatch_pointer_resize(
         send_bridge_chord(target, binding.bridge_chord).map_err(|error| error.to_string())?;
     }
     Ok(u64::from(steps))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_enqueue_succeeds_when_the_queue_has_room() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        assert!(request_stop(&sender, 1, Duration::from_millis(1)));
+        drop(receiver);
+    }
+
+    #[test]
+    fn stop_enqueue_gives_up_on_a_saturated_queue() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender
+            .send(WorkerMessage::Stop)
+            .expect("queue accepts the first message");
+        assert!(!request_stop(&sender, 1, Duration::from_millis(1)));
+        drop(receiver);
+    }
+
+    #[test]
+    fn worker_loop_exits_when_all_senders_drop() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let join = thread::spawn(move || run(receiver));
+        drop(sender);
+        let report = join.join().expect("worker exits after disconnect");
+        assert_eq!(report.dispatched_actions, 0);
+        assert_eq!(report.failed_actions, 0);
+    }
+
+    #[test]
+    fn worker_loop_exits_on_the_stop_message() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let join = thread::spawn(move || run(receiver));
+        sender
+            .send(WorkerMessage::Stop)
+            .expect("stop message enqueues");
+        let report = join.join().expect("worker exits after stop");
+        assert_eq!(report.dispatched_actions, 0);
+    }
+
+    #[test]
+    fn stop_returns_the_report_without_blocking() {
+        let worker = ActionWorker::start(4).expect("worker starts");
+        let sender = worker.sender();
+        drop(sender);
+        let report = worker.stop().expect("stop succeeds");
+        assert_eq!(report.dispatched_actions, 0);
+        assert_eq!(report.failed_actions, 0);
+    }
 }

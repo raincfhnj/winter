@@ -1,13 +1,13 @@
 //! Shared command-line implementation for `winter.exe` and `winterminalp.exe`.
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde::Serialize;
 
-use crate::integration::{IntegrationConfig, doctor, install, plan, uninstall};
+use crate::integration::{DoctorReport, IntegrationConfig, doctor, install, plan, uninstall};
 use crate::platform::windows::relaunch_current_process_elevated;
 use crate::{
     AppError, AppResult, ControllerConfig, ControllerOptions, bridge_is_ready,
@@ -26,22 +26,26 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum CliCommand {
-    /// Show, locate, or edit the user shortcut configuration.
+    /// Show, locate, or edit the user configuration file.
     Config {
         /// Print only the configuration file path.
         #[arg(long = "path", conflicts_with = "edit")]
         path_only: bool,
         /// Open the configuration file in Notepad.
-        #[arg(long, conflicts_with = "path_only")]
+        #[arg(long)]
         edit: bool,
     },
     /// Show the settings changes that install would make.
+    ///
+    /// Exit status: 0 ready, 2 not installable, 1 failure.
     Plan,
     /// Install the managed action fragment and hidden bridge keybindings.
     Install,
     /// Remove only integration entries still owned by WinTerminalP.
     Uninstall,
     /// Diagnose the current Windows Terminal integration.
+    ///
+    /// Exit status: 0 healthy, 2 needs attention, 1 failure.
     Doctor,
     /// Run the keyboard controller in this process.
     Run {
@@ -97,22 +101,81 @@ fn execute(cli: Cli) -> AppResult<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         CliCommand::Doctor => {
-            let path = default_config_path()?;
-            if path.exists() {
-                let _config = ControllerConfig::load(&path)?;
-            }
-            let report = doctor(&integration)?;
+            let report = build_doctor_report(&integration, &default_config_path()?)?;
             print_json(&report)?;
-            Ok(if bridge_is_ready(&report) {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(2)
-            })
+            Ok(ExitCode::from(doctor_exit_code(report.healthy)))
         }
         CliCommand::Run { no_launch } => run_command(&integration, no_launch),
         CliCommand::Launch => launch(&integration),
         CliCommand::Config { .. } => unreachable!("config is handled before integration is loaded"),
     }
+}
+
+/// Single JSON document written to stdout by `winter doctor`.
+#[derive(Debug, Serialize)]
+struct DoctorCommandReport {
+    schema_version: u32,
+    healthy: bool,
+    config: ConfigDiagnosis,
+    integration: DoctorReport,
+}
+
+/// Configuration half of the doctor envelope.
+#[derive(Debug, Serialize)]
+struct ConfigDiagnosis {
+    path: String,
+    ok: bool,
+    error: Option<String>,
+}
+
+/// Diagnoses the configuration file and the Windows Terminal integration.
+///
+/// An invalid configuration is reported instead of aborting, so `winter
+/// doctor` always produces a full report; only environment and serialization
+/// failures abort with a hard error (exit status 1).
+fn build_doctor_report(
+    integration: &IntegrationConfig,
+    config_path: &Path,
+) -> AppResult<DoctorCommandReport> {
+    let config = diagnose_config(config_path);
+    let integration_report = doctor(integration)?;
+    let healthy = config.ok && bridge_is_ready(&integration_report);
+    Ok(DoctorCommandReport {
+        schema_version: 1,
+        healthy,
+        config,
+        integration: integration_report,
+    })
+}
+
+/// Inspects the configuration file without aborting on invalid content.
+///
+/// A missing file counts as healthy because the controller runs on defaults
+/// until the user creates one. When the file parses, its key chords are also
+/// compiled here so a broken shortcut is reported by `doctor` as well.
+fn diagnose_config(path: &Path) -> ConfigDiagnosis {
+    let rendered = path.display().to_string();
+    if !path.exists() {
+        return ConfigDiagnosis {
+            path: rendered,
+            ok: true,
+            error: None,
+        };
+    }
+    let error = match ControllerConfig::load(path) {
+        Ok(config) => config.prefix_config().err(),
+        Err(error) => Some(error),
+    };
+    ConfigDiagnosis {
+        ok: error.is_none(),
+        path: rendered,
+        error: error.map(|error| error.to_string()),
+    }
+}
+
+/// Maps the doctor verdict onto the documented exit statuses (0 or 2).
+const fn doctor_exit_code(healthy: bool) -> u8 {
+    if healthy { 0 } else { 2 }
 }
 
 fn run_command(integration: &IntegrationConfig, no_launch: bool) -> AppResult<ExitCode> {
@@ -148,7 +211,7 @@ fn ensure_bridge_ready(integration: &IntegrationConfig) -> AppResult<()> {
     if bridge_is_ready(&doctor(integration)?) {
         return Ok(());
     }
-    println!("Windows Terminal integration is not installed; setting it up now...");
+    eprintln!("Windows Terminal integration is not installed; setting it up now...");
     install(integration)?;
     if bridge_is_ready(&doctor(integration)?) {
         Ok(())
@@ -172,7 +235,7 @@ fn configure(path_only: bool, edit: bool) -> AppResult<ExitCode> {
             .arg(&path)
             .spawn()
             .map_err(|error| AppError::io("open controller config editor", &path, error))?;
-        println!(
+        eprintln!(
             "Opened {}. Restart the controller after saving.",
             path.display()
         );
@@ -192,7 +255,7 @@ fn launch(integration: &IntegrationConfig) -> AppResult<ExitCode> {
     ensure_bridge_ready(integration)?;
 
     spawn_background_controller()?;
-    println!("WinTerminalP elevated controller is starting; Windows Terminal will open elevated.");
+    eprintln!("WinTerminalP elevated controller is starting; Windows Terminal will open elevated.");
     Ok(ExitCode::SUCCESS)
 }
 
@@ -203,6 +266,10 @@ fn spawn_background_controller() -> AppResult<()> {
     let (program, arguments) = if sibling_daemon.is_file() {
         (sibling_daemon, vec!["--launch"])
     } else {
+        eprintln!(
+            "warning: winterd.exe was not found next to {}; falling back to `run --no-launch`, so diagnostics (last-error.log) will be unavailable",
+            current_exe.display()
+        );
         (current_exe, vec!["run", "--no-launch"])
     };
 
@@ -270,5 +337,111 @@ mod tests {
         ));
 
         ensure_bridge_ready(&config).expect("second launch should be a no-op");
+    }
+
+    #[test]
+    fn doctor_reports_broken_config_without_aborting() {
+        let temp = tempdir().expect("temporary directory should be created");
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, "prefix = \nthis is not valid toml [[[\n")
+            .expect("garbage configuration should be written");
+        let integration = IntegrationConfig::new(
+            temp.path(),
+            temp.path().join("state"),
+            temp.path().join("documents"),
+        );
+
+        let report = build_doctor_report(&integration, &config_path)
+            .expect("an invalid configuration must not abort the doctor report");
+        let value = serde_json::to_value(&report).expect("doctor report must serialize to JSON");
+
+        assert_eq!(value["schema_version"], serde_json::json!(1));
+        assert_eq!(value["config"]["ok"], serde_json::Value::Bool(false));
+        assert!(
+            value["config"]["error"].is_string(),
+            "a broken config must carry an error message: {value}"
+        );
+        let rendered_path = config_path.display().to_string();
+        assert_eq!(
+            value["config"]["path"].as_str(),
+            Some(rendered_path.as_str())
+        );
+        assert!(
+            value["integration"].is_object(),
+            "the integration report must stay present: {value}"
+        );
+        assert_eq!(value["healthy"], serde_json::Value::Bool(false));
+        assert_eq!(doctor_exit_code(report.healthy), 2);
+    }
+
+    #[test]
+    fn doctor_reports_valid_configuration_as_ok() {
+        let temp = tempdir().expect("temporary directory should be created");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            "schema_version = 2\nprefix_timeout_ms = 1500\nlaunch_terminal_on_start = true\n",
+        )
+        .expect("valid configuration should be written");
+        let integration = IntegrationConfig::new(
+            temp.path(),
+            temp.path().join("state"),
+            temp.path().join("documents"),
+        );
+
+        let report = build_doctor_report(&integration, &config_path)
+            .expect("a valid configuration must produce a report");
+        let value = serde_json::to_value(&report).expect("doctor report must serialize to JSON");
+
+        assert_eq!(value["config"]["ok"], serde_json::Value::Bool(true));
+        assert!(
+            value["config"]["error"].is_null(),
+            "a healthy config must not carry an error: {value}"
+        );
+        assert!(value["integration"].is_object());
+        assert_eq!(
+            doctor_exit_code(report.healthy),
+            2,
+            "the bridge is not installed in the temporary environment"
+        );
+    }
+
+    #[test]
+    fn doctor_flags_chords_that_load_but_do_not_compile() {
+        let temp = tempdir().expect("temporary directory should be created");
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, "schema_version = 2\nprefix = \"b\"\n")
+            .expect("configuration fixture should be written");
+        let integration = IntegrationConfig::new(
+            temp.path(),
+            temp.path().join("state"),
+            temp.path().join("documents"),
+        );
+
+        let report = build_doctor_report(&integration, &config_path)
+            .expect("a bad chord must not abort the doctor report");
+        let value = serde_json::to_value(&report).expect("doctor report must serialize to JSON");
+
+        assert_eq!(value["config"]["ok"], serde_json::Value::Bool(false));
+        assert_eq!(value["healthy"], serde_json::Value::Bool(false));
+        assert_eq!(doctor_exit_code(report.healthy), 2);
+    }
+
+    #[test]
+    fn doctor_accepts_an_absent_configuration_file() {
+        let temp = tempdir().expect("temporary directory should be created");
+        let config_path = temp.path().join("config.toml");
+        let integration = IntegrationConfig::new(
+            temp.path(),
+            temp.path().join("state"),
+            temp.path().join("documents"),
+        );
+
+        let report = build_doctor_report(&integration, &config_path)
+            .expect("an absent configuration must produce a report");
+        let value = serde_json::to_value(&report).expect("doctor report must serialize to JSON");
+
+        assert_eq!(value["config"]["ok"], serde_json::Value::Bool(true));
+        assert!(value["config"]["error"].is_null());
     }
 }

@@ -28,6 +28,7 @@ pub use hook::{
     CONTROLLER_INPUT_MARKER, HookDecision, InputHook, KeyTransition, MouseEventKind, RawInputEvent,
     RawInputHandler, RawKeyEvent, RawMouseEvent,
 };
+pub(crate) use input::key_is_down;
 pub use input::{InputDispatch, send_bridge_chord, send_literal_chord};
 pub use known_folder::documents_directory;
 pub use launcher::launch_windows_terminal;

@@ -101,11 +101,9 @@ impl ControllerConfig {
     pub fn load(path: &Path) -> AppResult<Self> {
         let source = fs::read_to_string(path)
             .map_err(|error| AppError::io("read controller config", path, error))?;
-        let mut config: Self = toml::from_str(&source).map_err(|error| {
-            AppError::InvalidConfiguration(format!("{}: {error}", path.display()))
-        })?;
-        config.migrate_schema();
+        let mut config = parse_config_source(&source, path)?;
         config.validate()?;
+        config.migrate_schema(path);
         Ok(config)
     }
 
@@ -128,21 +126,38 @@ impl ControllerConfig {
         let serialized = toml::to_string_pretty(&config).map_err(|error| {
             AppError::InvalidConfiguration(format!("serialize default configuration: {error}"))
         })?;
-        match OpenOptions::new().write(true).create_new(true).open(path) {
-            Ok(mut file) => {
-                file.write_all(serialized.as_bytes())
-                    .and_then(|()| file.sync_all())
-                    .map_err(|error| AppError::io("write controller config", path, error))?;
-                Ok(config)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Self::load(path),
-            Err(error) => Err(AppError::io("create controller config", path, error)),
+        if install_file_if_absent(path, &serialized)? {
+            return Self::load(path);
         }
+        Ok(config)
     }
 
+    /// Validates scalar settings and shortcut names without compiling chords.
+    ///
+    /// Chord compilation stays in [`Self::prefix_config`], which the controller
+    /// and `winter doctor` call where a usable key map is actually required.
     pub fn validate(&self) -> AppResult<()> {
-        // `prefix_config` validates the scalar fields before compiling chords.
-        let _ = self.prefix_config()?;
+        self.validate_scalar_fields()?;
+        self.validate_shortcut_names()
+    }
+
+    fn validate_shortcut_names(&self) -> AppResult<()> {
+        let known_names = shortcut_specs()
+            .iter()
+            .map(|spec| spec.name)
+            .collect::<HashSet<_>>();
+        let unknown_names = self
+            .shortcuts
+            .keys()
+            .filter(|name| !known_names.contains(name.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unknown_names.is_empty() {
+            return Err(AppError::InvalidConfiguration(format!(
+                "unknown shortcut name(s): {}",
+                unknown_names.join(", ")
+            )));
+        }
         Ok(())
     }
 
@@ -166,7 +181,7 @@ impl ControllerConfig {
     }
 
     pub fn prefix_config(&self) -> AppResult<PrefixConfig> {
-        self.validate_scalar_fields()?;
+        self.validate()?;
         let prefix_chord = parse_configured_chord("prefix", &self.prefix)?;
         if !prefix_chord.modifiers.has_ctrl_or_alt() {
             return Err(AppError::InvalidConfiguration(
@@ -177,23 +192,6 @@ impl ControllerConfig {
             return Err(AppError::InvalidConfiguration(format!(
                 "prefix {:?} is reserved by Windows or by Prefix cancellation",
                 self.prefix
-            )));
-        }
-
-        let known_names = shortcut_specs()
-            .iter()
-            .map(|spec| spec.name)
-            .collect::<HashSet<_>>();
-        let unknown_names = self
-            .shortcuts
-            .keys()
-            .filter(|name| !known_names.contains(name.as_str()))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !unknown_names.is_empty() {
-            return Err(AppError::InvalidConfiguration(format!(
-                "unknown shortcut name(s): {}",
-                unknown_names.join(", ")
             )));
         }
 
@@ -245,12 +243,23 @@ impl ControllerConfig {
 
     pub fn to_pretty_toml(&self) -> AppResult<String> {
         self.validate()?;
-        let mut expanded = self.clone();
-        expanded.schema_version = CONFIG_SCHEMA_VERSION;
-        let mut effective_shortcuts = default_shortcuts();
-        effective_shortcuts.extend(self.shortcuts.clone());
-        expanded.shortcuts = effective_shortcuts;
-        toml::to_string_pretty(&expanded).map_err(|error| {
+        let defaults = default_shortcuts();
+        let mut shortcuts = defaults
+            .iter()
+            .map(|(name, chord)| (name.as_str(), chord.as_str()))
+            .collect::<BTreeMap<&str, &str>>();
+        for (name, chord) in &self.shortcuts {
+            shortcuts.insert(name.as_str(), chord.as_str());
+        }
+        let effective = EffectiveControllerConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            prefix_timeout_ms: self.prefix_timeout_ms,
+            launch_terminal_on_start: self.launch_terminal_on_start,
+            prefix: &self.prefix,
+            shortcuts,
+            mouse_resize: &self.mouse_resize,
+        };
+        toml::to_string_pretty(&effective).map_err(|error| {
             AppError::InvalidConfiguration(format!("serialize controller configuration: {error}"))
         })
     }
@@ -260,9 +269,126 @@ impl ControllerConfig {
         Duration::from_millis(self.prefix_timeout_ms)
     }
 
-    fn migrate_schema(&mut self) {
-        if self.schema_version == LEGACY_CONFIG_SCHEMA_VERSION {
-            self.schema_version = CONFIG_SCHEMA_VERSION;
+    fn migrate_schema(&mut self, path: &Path) {
+        if self.schema_version != LEGACY_CONFIG_SCHEMA_VERSION {
+            return;
+        }
+        self.schema_version = CONFIG_SCHEMA_VERSION;
+        let write_back = toml::to_string_pretty(self)
+            .map_err(|error| {
+                AppError::InvalidConfiguration(format!("serialize migrated configuration: {error}"))
+            })
+            .and_then(|contents| replace_file_contents(path, &contents));
+        if let Err(error) = write_back {
+            eprintln!(
+                "warning: could not write back migrated configuration {}: {error}; continuing with the in-memory schema {CONFIG_SCHEMA_VERSION}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// Borrowed serialization view of the effective configuration.
+///
+/// Lets `to_pretty_toml` expand defaults without cloning the source config.
+#[derive(Serialize)]
+struct EffectiveControllerConfig<'a> {
+    schema_version: u32,
+    prefix_timeout_ms: u64,
+    launch_terminal_on_start: bool,
+    prefix: &'a str,
+    shortcuts: BTreeMap<&'a str, &'a str>,
+    mouse_resize: &'a MouseResizeConfig,
+}
+
+/// Minimal probe that reads only `schema_version` from a configuration file.
+#[derive(Debug, Deserialize)]
+struct SchemaProbe {
+    #[serde(default)]
+    schema_version: Option<u32>,
+}
+
+/// Deserializes `source`, rejecting unsupported schema versions before the
+/// strict `deny_unknown_fields` parse can misreport them as unknown fields.
+fn parse_config_source(source: &str, path: &Path) -> AppResult<ControllerConfig> {
+    let unsupported_version = toml::from_str::<SchemaProbe>(source)
+        .ok()
+        .and_then(|probe| probe.schema_version)
+        .filter(|version| {
+            !(LEGACY_CONFIG_SCHEMA_VERSION..=CONFIG_SCHEMA_VERSION).contains(version)
+        });
+    if let Some(version) = unsupported_version {
+        return Err(AppError::InvalidConfiguration(format!(
+            "{}: unsupported config schema_version {version} (this winter supports up to {CONFIG_SCHEMA_VERSION})",
+            path.display()
+        )));
+    }
+    toml::from_str(source)
+        .map_err(|error| AppError::InvalidConfiguration(format!("{}: {error}", path.display())))
+}
+
+/// Sibling temp path used for atomic configuration writes.
+fn config_temp_path(path: &Path) -> PathBuf {
+    let name = path.file_name().map_or_else(
+        || "config.toml".to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    path.with_file_name(format!("{name}.tmp-{}", std::process::id()))
+}
+
+/// Writes `contents` to `temp` and syncs it to disk, removing `temp` on failure.
+fn write_temp_file(temp: &Path, target: &Path, contents: &str) -> AppResult<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(temp)
+        .map_err(|error| AppError::io("create temporary controller config", temp, error))?;
+    let written = file
+        .write_all(contents.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = written {
+        let _ = fs::remove_file(temp);
+        return Err(AppError::io("write controller config", target, error));
+    }
+    Ok(())
+}
+
+/// Atomically replaces `path` with `contents` via a sibling temp file.
+fn replace_file_contents(path: &Path, contents: &str) -> AppResult<()> {
+    let temp = config_temp_path(path);
+    write_temp_file(&temp, path, contents)?;
+    match fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(&temp);
+            Err(AppError::io("replace controller config", path, error))
+        }
+    }
+}
+
+/// Atomically installs `contents` at `path` only while `path` is absent.
+///
+/// The commit is a hard link because `fs::rename` replaces an existing target
+/// on Windows, which would break the "never overwrite an existing config"
+/// contract under a create race. Returns `true` when another process created
+/// `path` first, so the caller must load that file instead.
+fn install_file_if_absent(path: &Path, contents: &str) -> AppResult<bool> {
+    let temp = config_temp_path(path);
+    write_temp_file(&temp, path, contents)?;
+    match fs::hard_link(&temp, path) {
+        Ok(()) => {
+            let _ = fs::remove_file(&temp);
+            Ok(false)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&temp);
+            Ok(true)
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temp);
+            Err(AppError::io("create controller config", path, error))
         }
     }
 }
@@ -302,6 +428,21 @@ mod tests {
 
     use super::*;
 
+    fn temporary_leftovers(directory: &Path) -> Vec<String> {
+        let mut leftovers = Vec::new();
+        for entry in fs::read_dir(directory).expect("directory should be readable") {
+            let name = entry
+                .expect("directory entry should be readable")
+                .file_name()
+                .to_string_lossy()
+                .into_owned();
+            if name.contains(".tmp-") {
+                leftovers.push(name);
+            }
+        }
+        leftovers
+    }
+
     #[test]
     fn creates_and_reloads_default_configuration() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
@@ -313,6 +454,10 @@ mod tests {
 
         assert_eq!(created, ControllerConfig::default());
         assert_eq!(loaded, created);
+        assert!(
+            temporary_leftovers(path.parent().expect("config should have a parent")).is_empty(),
+            "atomic creation must not leave a temporary file behind"
+        );
     }
 
     #[test]
@@ -390,9 +535,16 @@ mod tests {
             .expect("default shortcut configuration should compile");
 
         assert_eq!(config.schema_version, CONFIG_SCHEMA_VERSION);
-        assert_eq!(
-            fs::read_to_string(path).expect("legacy fixture should remain readable"),
-            "schema_version = 1\nprefix_timeout_ms = 1500\nlaunch_terminal_on_start = true\n"
+        let migrated = fs::read_to_string(&path).expect("legacy fixture should remain readable");
+        assert!(
+            migrated.contains("schema_version = 2"),
+            "migration must write the current schema back to disk: {migrated}"
+        );
+        assert!(migrated.contains("prefix_timeout_ms = 1500"));
+        assert!(migrated.contains("launch_terminal_on_start = true"));
+        assert!(
+            temporary_leftovers(directory.path()).is_empty(),
+            "migration must not leave a temporary file behind"
         );
         assert_eq!(config.prefix, "ctrl+b");
         assert_eq!(config.mouse_resize, MouseResizeConfig::default());
@@ -465,7 +617,9 @@ new_tab = "t"
         duplicate
             .shortcuts
             .insert("new_tab".to_owned(), "n".to_owned());
-        let duplicate_error = duplicate.validate().expect_err("duplicate chord must fail");
+        let duplicate_error = duplicate
+            .prefix_config()
+            .expect_err("duplicate chord must fail");
         assert!(duplicate_error.to_string().contains("both use n"));
 
         let mut unknown = ControllerConfig::default();
@@ -473,6 +627,10 @@ new_tab = "t"
             .shortcuts
             .insert("launch_spaceship".to_owned(), "s".to_owned());
         let unknown_error = unknown.validate().expect_err("unknown shortcut must fail");
+        assert!(unknown_error.to_string().contains("launch_spaceship"));
+        let unknown_error = unknown
+            .prefix_config()
+            .expect_err("unknown shortcut must fail chord compilation too");
         assert!(unknown_error.to_string().contains("launch_spaceship"));
     }
 
@@ -484,7 +642,7 @@ new_tab = "t"
         };
         assert!(
             plain_prefix
-                .validate()
+                .prefix_config()
                 .expect_err("plain prefix must fail")
                 .to_string()
                 .contains("must include ctrl or alt")
@@ -496,7 +654,7 @@ new_tab = "t"
             .insert("shutdown".to_owned(), DISABLED_SHORTCUT.to_owned());
         assert!(
             no_shutdown
-                .validate()
+                .prefix_config()
                 .expect_err("shutdown cannot be disabled")
                 .to_string()
                 .contains("cannot be disabled")
@@ -508,10 +666,123 @@ new_tab = "t"
             .insert("new_tab".to_owned(), "alt+f4".to_owned());
         assert!(
             system_shortcut
-                .validate()
+                .prefix_config()
                 .expect_err("system shortcut must fail")
                 .to_string()
                 .contains("reserved system chord")
+        );
+    }
+
+    #[test]
+    fn scalar_validation_defers_chord_compilation_to_prefix_config() {
+        let plain_prefix = ControllerConfig {
+            prefix: "b".to_owned(),
+            ..ControllerConfig::default()
+        };
+        plain_prefix
+            .validate()
+            .expect("scalar validation must not compile chords");
+
+        let mut duplicate = ControllerConfig::default();
+        duplicate
+            .shortcuts
+            .insert("new_tab".to_owned(), "n".to_owned());
+        duplicate
+            .shortcuts
+            .insert("rename_tab".to_owned(), "n".to_owned());
+        duplicate
+            .validate()
+            .expect("duplicate chords must not fail scalar validation");
+        assert!(
+            duplicate
+                .prefix_config()
+                .expect_err("duplicate chords must fail compilation")
+                .to_string()
+                .contains("both use n")
+        );
+    }
+
+    #[test]
+    fn schema_version_above_current_is_rejected_before_strict_parse() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let path = directory.path().join("config.toml");
+        let fixture = "schema_version = 99\nfuture_field = true\n";
+        fs::write(&path, fixture).expect("future fixture should be written");
+
+        let error = ControllerConfig::load(&path).expect_err("future schema must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("unsupported config schema_version 99 (this winter supports up to 2)"),
+            "unexpected message: {message}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("fixture should remain readable"),
+            fixture
+        );
+    }
+
+    #[test]
+    fn unknown_field_on_current_schema_keeps_serde_message() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "schema_version = 2\nfuture_field = true\n")
+            .expect("fixture should be written");
+
+        let error = ControllerConfig::load(&path).expect_err("unknown field must fail");
+        let message = error.to_string();
+        assert!(message.contains("unknown field"), "unexpected: {message}");
+        assert!(message.contains("future_field"), "unexpected: {message}");
+    }
+
+    #[test]
+    fn atomic_replace_removes_temp_file_when_rename_fails() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let path = directory.path().join("config.toml");
+        fs::create_dir(&path).expect("blocking destination should be created");
+
+        assert!(
+            replace_file_contents(&path, "schema_version = 2\n").is_err(),
+            "renaming a file over a directory must fail"
+        );
+        assert!(
+            temporary_leftovers(directory.path()).is_empty(),
+            "the temporary file must be removed after a failed rename"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn migration_write_back_failure_is_non_fatal() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            "schema_version = 1\nprefix_timeout_ms = 1500\nlaunch_terminal_on_start = true\n",
+        )
+        .expect("legacy fixture should be written");
+
+        let locked = OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .open(&path)
+            .expect("fixture should stay readable");
+
+        let config =
+            ControllerConfig::load(&path).expect("a failed write-back must not fail the load");
+        assert_eq!(config.schema_version, CONFIG_SCHEMA_VERSION);
+        drop(locked);
+
+        assert!(
+            fs::read_to_string(&path)
+                .expect("fixture should remain readable")
+                .contains("schema_version = 1"),
+            "the on-disk file must keep its schema when the write-back fails"
+        );
+        assert!(
+            temporary_leftovers(directory.path()).is_empty(),
+            "a failed write-back must not leave a temporary file behind"
         );
     }
 

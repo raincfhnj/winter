@@ -149,11 +149,37 @@ shutdown = "q"
 ```
 
 The prefix must include `Ctrl` or `Alt`. `Escape` and reserved system combinations
-(`Alt+Tab`, `Alt+F4`, `Ctrl+Escape`, Windows-key chords) cannot be bound. Two actions
+(`Alt+Tab`, `Ctrl+Tab`, `Ctrl+Shift+Tab`, `Alt+F4`, `Alt+Escape`, `Ctrl+Escape`,
+`Ctrl+Shift+T`, `Ctrl+Shift+W`, Windows-key chords) cannot be bound. Two actions
 cannot share a chord. Optional actions may be set to `"disabled"`. Shortcut changes do
 not require re-running `winter install`.
 
+All configuration keys, defaults, and accepted ranges:
+
+| Key | Default | Range / notes |
+|---|---|---|
+| `schema_version` | `2` | Config schema; legacy `1` files load and are migrated in memory |
+| `prefix_timeout_ms` | `1500` | `250`–`5000`; prefix expiry |
+| `launch_terminal_on_start` | `true` | Boolean; open a native Windows Terminal window when the controller starts |
+| `prefix` | `"ctrl+b"` | Must include `ctrl` or `alt` |
+| `shortcuts` | see above | Map of action name → chord or `"disabled"` |
+| `mouse_resize.enabled` | `true` | Boolean; enable native divider dragging |
+| `mouse_resize.divider_hit_slop_px` | `8` | `0`–`32` |
+| `mouse_resize.geometry_poll_interval_ms` | `100` | `50`–`1000` |
+
 See [`docs/SHORTCUTS.md`](docs/SHORTCUTS.md) for the full reference.
+
+## Exit codes
+
+`plan`, `install`, `uninstall`, and `doctor` print a JSON report on stdout;
+`winter doctor` returns `{ schema_version, healthy, config: { path, ok, error },
+integration }`.
+
+| Code | Meaning |
+|---|---|
+| `0` | Success; the command finished and the result is healthy |
+| `1` | Hard failure (I/O error, unsupported configuration, ...) |
+| `2` | Needs attention: `winter plan` when the bridge is not installable; `winter doctor` when the configuration is invalid or the bridge is not ready |
 
 ## Safety and privacy
 
@@ -163,8 +189,9 @@ See [`docs/SHORTCUTS.md`](docs/SHORTCUTS.md) for the full reference.
 - Injected (synthetic) input is always passed through and never re-enters the prefix
   state machine.
 - The controller opens no network port and reads no terminal buffer.
-- Installs back up raw bytes before writing and use compare-and-swap; uninstall removes
-  only entries that still match the managed manifest and reports anything you changed.
+- Install backs up the raw bytes before writing and uses compare-and-swap; uninstall
+  removes only entries that still match the managed manifest and reports anything you
+  changed.
 
 ## Uninstall
 

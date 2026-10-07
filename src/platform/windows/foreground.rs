@@ -2,13 +2,13 @@ use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
-use windows::Win32::Foundation::{FILETIME, HANDLE, HWND};
+use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, FILETIME, HANDLE, HWND};
 use windows::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
-use windows::core::{Owned, PWSTR};
+use windows::core::{Error, Owned, PWSTR};
 
 use crate::model::{TerminalChannel, WindowIdentity};
 
@@ -119,13 +119,25 @@ fn process_image_path(process: HANDLE) -> PlatformResult<PathBuf> {
                 buffer.truncate(length as usize);
                 return Ok(PathBuf::from(OsString::from_wide(&buffer)));
             }
-            Err(_) if capacity == INITIAL_PROCESS_PATH_CHARS => continue,
+            Err(source)
+                if capacity == INITIAL_PROCESS_PATH_CHARS
+                    && is_insufficient_capacity(&source, length, capacity) =>
+            {
+                continue;
+            }
             Err(source) => {
                 return Err(PlatformError::win32("QueryFullProcessImageNameW", source));
             }
         }
     }
     unreachable!("the final loop iteration returns on success or failure")
+}
+
+/// Reports whether a failed `QueryFullProcessImageNameW` call failed only
+/// because the buffer was too small, i.e. whether retrying with a larger
+/// buffer can succeed.
+fn is_insufficient_capacity(source: &Error, reported_length: u32, capacity: usize) -> bool {
+    source.code() == ERROR_INSUFFICIENT_BUFFER.to_hresult() || reported_length as usize > capacity
 }
 
 fn process_creation_time(process: HANDLE) -> PlatformResult<u64> {
@@ -142,24 +154,25 @@ fn process_creation_time(process: HANDLE) -> PlatformResult<u64> {
     Ok(filetime_to_u64(creation))
 }
 
+const PACKAGED_CHANNEL_MARKERS: [(&[u8], TerminalChannel); 3] = [
+    (
+        b"microsoft.windowsterminalpreview_",
+        TerminalChannel::Preview,
+    ),
+    (b"microsoft.windowsterminalcanary_", TerminalChannel::Canary),
+    (b"microsoft.windowsterminal_", TerminalChannel::Stable),
+];
+
 fn terminal_channel_for_path(path: &Path) -> Option<TerminalChannel> {
-    let executable = path.file_name()?.to_string_lossy();
-    if !executable.eq_ignore_ascii_case("WindowsTerminal.exe") {
+    if !eq_ignore_ascii_case(path.file_name()?.as_encoded_bytes(), b"WindowsTerminal.exe") {
         return None;
     }
 
-    let normalized = path
-        .to_string_lossy()
-        .replace('/', "\\")
-        .to_ascii_lowercase();
-    if normalized.contains("microsoft.windowsterminalpreview_") {
-        return Some(TerminalChannel::Preview);
-    }
-    if normalized.contains("microsoft.windowsterminalcanary_") {
-        return Some(TerminalChannel::Canary);
-    }
-    if normalized.contains("microsoft.windowsterminal_") {
-        return Some(TerminalChannel::Stable);
+    let raw_path = path.as_os_str().as_encoded_bytes();
+    for (marker, channel) in PACKAGED_CHANNEL_MARKERS {
+        if contains_ascii_case_insensitive(raw_path, marker) {
+            return Some(channel);
+        }
     }
 
     let portable_marker = path.parent().map(|parent| parent.join(".portable"));
@@ -168,6 +181,24 @@ fn terminal_channel_for_path(path: &Path) -> Option<TerminalChannel> {
     } else {
         Some(TerminalChannel::Unpackaged)
     }
+}
+
+fn eq_ignore_ascii_case(actual: &[u8], expected: &[u8]) -> bool {
+    actual.len() == expected.len()
+        && actual
+            .iter()
+            .zip(expected)
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
+fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack.len() >= needle.len()
+        && haystack
+            .windows(needle.len())
+            .any(|window| eq_ignore_ascii_case(window, needle))
 }
 
 const fn filetime_to_u64(value: FILETIME) -> u64 {
@@ -210,6 +241,83 @@ mod tests {
             )),
             Some(TerminalChannel::Canary)
         );
+    }
+
+    #[test]
+    fn classifies_channels_case_insensitively_without_normalized_copy() {
+        assert_eq!(
+            terminal_channel_for_path(Path::new(
+                r"c:\program files\windowsapps\MICROSOFT.WINDOWSTERMINALPREVIEW_1.25.0_x64__8wekyb3d8bbwe\Windowsterminal.EXE"
+            )),
+            Some(TerminalChannel::Preview)
+        );
+        assert_eq!(
+            terminal_channel_for_path(Path::new(
+                r"C:/Program Files/WindowsApps/Microsoft.WindowsTerminalCanary_1.26.0_x64__8wekyb3d8bbwe/WindowsTerminal.exe"
+            )),
+            Some(TerminalChannel::Canary)
+        );
+        assert_eq!(
+            terminal_channel_for_path(Path::new(
+                r"C:\Проекты\Microsoft.WindowsTerminal_1.24.0_x64__8wekyb3d8bbwe\WindowsTerminal.exe"
+            )),
+            Some(TerminalChannel::Stable)
+        );
+    }
+
+    #[test]
+    fn ascii_case_helpers_match_only_expected_patterns() {
+        assert!(eq_ignore_ascii_case(
+            b"WindowsTerminal.exe",
+            b"windowsterminal.EXE"
+        ));
+        assert!(!eq_ignore_ascii_case(
+            b"WindowsTerminal.exe",
+            b"WindowsTerminal.exe "
+        ));
+        assert!(!eq_ignore_ascii_case(
+            b"WindowsTerminal.ex",
+            b"WindowsTerminal.exe"
+        ));
+
+        let haystack = b"C:\\Apps\\Microsoft.WindowsTerminalPreview_1.0\\wt.exe";
+        assert!(contains_ascii_case_insensitive(
+            haystack,
+            b"microsoft.windowsterminalpreview_"
+        ));
+        assert!(contains_ascii_case_insensitive(
+            haystack,
+            b"MICROSOFT.windowsterminalPREVIEW_"
+        ));
+        assert!(!contains_ascii_case_insensitive(
+            haystack,
+            b"microsoft.windowsterminalcanary_"
+        ));
+        assert!(!contains_ascii_case_insensitive(b"short", b"longer_needle"));
+        assert!(contains_ascii_case_insensitive(b"anything", b""));
+    }
+
+    #[test]
+    fn retries_path_query_only_when_buffer_was_too_small() {
+        let capacity = INITIAL_PROCESS_PATH_CHARS as u32;
+        let insufficient = Error::from_hresult(ERROR_INSUFFICIENT_BUFFER.to_hresult());
+        let access_denied =
+            Error::from_hresult(windows::Win32::Foundation::ERROR_ACCESS_DENIED.to_hresult());
+
+        assert!(is_insufficient_capacity(
+            &insufficient,
+            capacity,
+            capacity as usize
+        ));
+        assert!(
+            !is_insufficient_capacity(&access_denied, capacity, capacity as usize),
+            "a real failure must propagate instead of retrying"
+        );
+        assert!(is_insufficient_capacity(
+            &access_denied,
+            capacity + 1,
+            capacity as usize
+        ));
     }
 
     #[test]

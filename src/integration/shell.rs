@@ -37,7 +37,7 @@ if (-not $Global:__WinTerminalP_PromptWrapped) {
 }"#;
 
 fn managed_block(newline: &str) -> String {
-    let body = SNIPPET_BODY.replace('\n', newline);
+    let body = SNIPPET_BODY.replace("\r\n", "\n").replace('\n', newline);
     format!("{BEGIN_MARKER}{newline}{body}{newline}{END_MARKER}")
 }
 
@@ -99,23 +99,19 @@ fn plan_profile_inner(shell: ShellKind, path: &Path) -> AppResult<ShellIntegrati
         ));
     };
     let (_, text) = decode_profile(path, &snapshot.bytes)?;
-    let desired = managed_block(detect_newline(&text));
     Ok(match block_state(&text) {
         BlockState::Absent => report(shell, path, ChangeStatus::Update, None, None),
         BlockState::Present { start, end } => {
-            if normalized(&text[start..end]) == normalized(&desired) {
+            let desired = managed_block(detect_newline(&text));
+            if normalized_eq(&text[start..end], &desired) {
                 report(shell, path, ChangeStatus::Unchanged, None, None)
             } else {
                 report(shell, path, ChangeStatus::Update, None, None)
             }
         }
-        BlockState::Malformed => report(
-            shell,
-            path,
-            ChangeStatus::Conflict,
-            None,
-            Some("profile contains an incomplete WinTerminalP marker block".to_owned()),
-        ),
+        BlockState::Malformed(message) => {
+            report(shell, path, ChangeStatus::Conflict, None, Some(message))
+        }
     })
 }
 
@@ -153,17 +149,17 @@ fn install_profile_inner(
 
     let (encoding, text) = decode_profile(path, &snapshot.bytes)?;
     let newline = detect_newline(&text);
-    let desired = managed_block(newline);
     match block_state(&text) {
-        BlockState::Malformed => Ok(report(
+        BlockState::Malformed(message) => Ok(report(
             shell,
             path,
             ChangeStatus::Conflict,
             None,
-            Some("profile contains an incomplete WinTerminalP marker block".to_owned()),
+            Some(message),
         )),
         BlockState::Present { start, end } => {
-            if normalized(&text[start..end]) == normalized(&desired) {
+            let desired = managed_block(newline);
+            if normalized_eq(&text[start..end], &desired) {
                 return Ok(report(shell, path, ChangeStatus::Unchanged, None, None));
             }
             let backup = create_backup(&config.state_dir, "shell", path, &snapshot)?;
@@ -184,12 +180,9 @@ fn install_profile_inner(
             let backup = create_backup(&config.state_dir, "shell", path, &snapshot)?;
             let mut updated = text.clone();
             if !updated.is_empty() {
-                if !updated.ends_with('\n') {
-                    updated.push_str(newline);
-                }
                 updated.push_str(newline);
             }
-            updated.push_str(&desired);
+            updated.push_str(&managed_block(newline));
             updated.push_str(newline);
             write_profile(path, encoding, &updated, Some(&snapshot.sha256))?;
             Ok(report(
@@ -235,16 +228,16 @@ fn uninstall_profile_inner(
             None,
             Some("managed block is not present".to_owned()),
         )),
-        BlockState::Malformed => Ok(report(
+        BlockState::Malformed(message) => Ok(report(
             shell,
             path,
             ChangeStatus::Conflict,
             None,
-            Some("profile contains an incomplete WinTerminalP marker block".to_owned()),
+            Some(message),
         )),
         BlockState::Present { start, end } => {
-            let desired = managed_block(detect_newline(&text));
-            if normalized(&text[start..end]) != normalized(&desired) {
+            let newline = detect_newline(&text);
+            if !normalized_eq(&text[start..end], &managed_block(newline)) {
                 return Ok(report(
                     shell,
                     path,
@@ -254,9 +247,17 @@ fn uninstall_profile_inner(
                 ));
             }
             let backup = create_backup(&config.state_dir, "shell", path, &snapshot)?;
+            let mut block_start = start;
+            if block_start >= newline.len() && text[..block_start].ends_with(newline) {
+                block_start -= newline.len();
+            }
+            let mut block_end = end;
+            if &text[block_end..] == newline {
+                block_end += newline.len();
+            }
             let mut updated = String::with_capacity(text.len());
-            updated.push_str(&text[..start]);
-            updated.push_str(&text[end..]);
+            updated.push_str(&text[..block_start]);
+            updated.push_str(&text[block_end..]);
             write_profile(path, encoding, &updated, Some(&snapshot.sha256))?;
             Ok(report(
                 shell,
@@ -382,24 +383,46 @@ fn detect_newline(text: &str) -> &'static str {
     if text.contains("\r\n") { "\r\n" } else { "\n" }
 }
 
-fn normalized(text: &str) -> String {
-    text.replace("\r\n", "\n")
+/// Equality check that treats `\r\n` and `\n` as equivalent, with a
+/// zero-allocation fast path when both sides are byte-identical.
+fn normalized_eq(left: &str, right: &str) -> bool {
+    left == right || left.replace("\r\n", "\n") == right.replace("\r\n", "\n")
 }
 
 enum BlockState {
     Absent,
     Present { start: usize, end: usize },
-    Malformed,
+    Malformed(String),
 }
 
+/// Classifies every marker occurrence instead of only the first pair, so a
+/// stray, reversed, or duplicated marker cannot slip past install/uninstall and
+/// leave a silently surviving second block behind.
 fn block_state(text: &str) -> BlockState {
-    match (text.find(BEGIN_MARKER), text.find(END_MARKER)) {
+    let mut begins = text.match_indices(BEGIN_MARKER).map(|(index, _)| index);
+    let mut ends = text.match_indices(END_MARKER).map(|(index, _)| index);
+    let begin = begins.next();
+    let end = ends.next();
+    let begin_count = usize::from(begin.is_some()) + begins.count();
+    let end_count = usize::from(end.is_some()) + ends.count();
+    match (begin, end) {
         (None, None) => BlockState::Absent,
-        (Some(begin), Some(end)) if end >= begin => BlockState::Present {
-            start: begin,
-            end: end + END_MARKER.len(),
-        },
-        _ => BlockState::Malformed,
+        (Some(begin), Some(end)) if begin_count == 1 && end_count == 1 && end >= begin => {
+            BlockState::Present {
+                start: begin,
+                end: end + END_MARKER.len(),
+            }
+        }
+        _ => {
+            let mut message = format!(
+                "profile contains {begin_count} BEGIN marker(s) and {end_count} END marker(s); \
+                 exactly one WinTerminalP marker block pair is required"
+            );
+            if begin_count == 1 && end_count == 1 {
+                message.push_str("; the END marker appears before the BEGIN marker");
+            }
+            BlockState::Malformed(message)
+        }
     }
 }
 
@@ -562,5 +585,193 @@ mod tests {
             fs::read(&profile).expect("profile should remain readable"),
             b"\x81\x8d invalid windows-1252"
         );
+    }
+
+    fn windows_report(reports: &[ShellIntegrationReport]) -> &ShellIntegrationReport {
+        reports
+            .iter()
+            .find(|entry| entry.shell == ShellKind::WindowsPowerShell)
+            .expect("windows powershell target")
+    }
+
+    #[test]
+    fn install_then_uninstall_restores_the_original_bytes() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let config = config_with(temp.path());
+        let profile_dir = config.documents_dir.join("WindowsPowerShell");
+        fs::create_dir_all(&profile_dir).expect("profile directory should be created");
+        let profile = profile_dir.join("Microsoft.PowerShell_profile.ps1");
+
+        let originals = [
+            "Set-Alias ll Get-ChildItem\n",
+            "Set-Alias ll Get-ChildItem",
+            "Set-Alias ll Get-ChildItem\r\n",
+            "Set-Alias a Get-ChildItem\r\nSet-Alias b Get-ChildItem",
+            "",
+        ];
+        for original in originals {
+            fs::write(&profile, original).expect("profile should be written");
+            let before = fs::read(&profile).expect("profile should be readable");
+            for cycle in 0..2 {
+                let installed = install(&config);
+                assert_eq!(
+                    windows_report(&installed).status,
+                    ChangeStatus::Update,
+                    "install should update {original:?} on cycle {cycle}"
+                );
+                let removed = uninstall(&config);
+                assert_eq!(
+                    windows_report(&removed).status,
+                    ChangeStatus::Removed,
+                    "uninstall should remove {original:?} on cycle {cycle}"
+                );
+                assert_eq!(
+                    fs::read(&profile).expect("profile should be readable"),
+                    before,
+                    "cycle {cycle} for {original:?} must restore the original bytes"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn crlf_profile_gets_a_fully_crlf_managed_block() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let config = config_with(temp.path());
+        let profile_dir = config.documents_dir.join("WindowsPowerShell");
+        fs::create_dir_all(&profile_dir).expect("profile directory should be created");
+        let profile = profile_dir.join("Microsoft.PowerShell_profile.ps1");
+        fs::write(&profile, "Set-Alias ll Get-ChildItem\r\n").expect("profile should be written");
+
+        install(&config);
+
+        let text = fs::read_to_string(&profile).expect("profile should be readable");
+        assert_eq!(
+            text.matches('\n').count(),
+            text.matches("\r\n").count(),
+            "every LF in a CRLF profile must be part of a CRLF sequence"
+        );
+        assert!(
+            !text.contains("\r\r"),
+            "the injected block must not double carriage returns"
+        );
+        assert!(text.contains(&managed_block("\r\n")));
+    }
+
+    #[test]
+    fn stray_end_marker_refuses_plan_install_and_uninstall_with_counts() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let config = config_with(temp.path());
+        let profile_dir = config.documents_dir.join("WindowsPowerShell");
+        fs::create_dir_all(&profile_dir).expect("profile directory should be created");
+        let profile = profile_dir.join("Microsoft.PowerShell_profile.ps1");
+        let original = format!(
+            "Set-Alias ll Get-ChildItem\n{END_MARKER}\n{}\n",
+            managed_block("\n")
+        );
+        fs::write(&profile, &original).expect("profile should be written");
+        let before = fs::read(&profile).expect("profile should be readable");
+
+        for (label, reports) in [
+            ("plan", plan(&config)),
+            ("install", install(&config)),
+            ("uninstall", uninstall(&config)),
+        ] {
+            let windows = windows_report(&reports);
+            assert_eq!(
+                windows.status,
+                ChangeStatus::Conflict,
+                "{label} should refuse a stray END marker"
+            );
+            let message = windows
+                .message
+                .as_deref()
+                .expect("conflict should explain the marker counts");
+            assert!(
+                message.contains("1 BEGIN marker(s) and 2 END marker(s)"),
+                "{label} should count every marker, got: {message}"
+            );
+        }
+        assert_eq!(
+            fs::read(&profile).expect("profile should remain readable"),
+            before,
+            "a refused profile must not be rewritten"
+        );
+    }
+
+    #[test]
+    fn duplicate_managed_blocks_are_refused_with_counts() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let config = config_with(temp.path());
+        let profile_dir = config.documents_dir.join("WindowsPowerShell");
+        fs::create_dir_all(&profile_dir).expect("profile directory should be created");
+        let profile = profile_dir.join("Microsoft.PowerShell_profile.ps1");
+        let block = managed_block("\n");
+        let original = format!("Set-Alias ll Get-ChildItem\n{block}\n{block}\n");
+        fs::write(&profile, &original).expect("profile should be written");
+        let before = fs::read(&profile).expect("profile should be readable");
+
+        for (label, reports) in [
+            ("plan", plan(&config)),
+            ("install", install(&config)),
+            ("uninstall", uninstall(&config)),
+        ] {
+            let windows = windows_report(&reports);
+            assert_eq!(
+                windows.status,
+                ChangeStatus::Conflict,
+                "{label} should refuse duplicate managed blocks"
+            );
+            let message = windows
+                .message
+                .as_deref()
+                .expect("conflict should explain the marker counts");
+            assert!(
+                message.contains("2 BEGIN marker(s) and 2 END marker(s)"),
+                "{label} should count every marker, got: {message}"
+            );
+        }
+        assert_eq!(
+            fs::read(&profile).expect("profile should remain readable"),
+            before,
+            "duplicate blocks must survive untouched instead of being partially removed"
+        );
+    }
+
+    #[test]
+    fn block_state_scans_all_marker_occurrences() {
+        assert!(matches!(
+            block_state("Set-Alias ll Get-ChildItem\n"),
+            BlockState::Absent
+        ));
+
+        let well_formed = format!("content\n{}\nmore", managed_block("\n"));
+        match block_state(&well_formed) {
+            BlockState::Present { start, end } => {
+                assert_eq!(&well_formed[start..end], managed_block("\n"));
+            }
+            _ => panic!("a single well-formed block must be present"),
+        }
+
+        let reversed = format!("{END_MARKER}\ncontent\n{BEGIN_MARKER}\n");
+        match block_state(&reversed) {
+            BlockState::Malformed(message) => {
+                assert!(
+                    message.contains("1 BEGIN marker(s) and 1 END marker(s)")
+                        && message.contains("END marker appears before the BEGIN marker"),
+                    "unexpected message: {message}"
+                );
+            }
+            _ => panic!("reversed markers must be malformed"),
+        }
+    }
+
+    #[test]
+    fn normalized_eq_treats_crlf_and_lf_as_equal() {
+        assert!(normalized_eq("a\r\nb", "a\nb"));
+        assert!(normalized_eq("a\nb", "a\nb"));
+        assert!(!normalized_eq("a\r\nb", "a\r\n\r\nb"));
+        assert!(!normalized_eq("a\rb", "a\nb"));
+        assert!(!normalized_eq("a", "ab"));
     }
 }

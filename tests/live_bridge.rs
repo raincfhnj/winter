@@ -1,11 +1,32 @@
 //! Opt-in live bridge probe.
 //!
-//! This test is ignored by default because it sends a real managed chord to an
-//! explicitly identified foreground Windows Terminal window.
+//! Every test in this file is `#[ignore]`d by default because it inspects
+//! desktop-wide state or sends a real managed chord to an explicitly
+//! identified foreground Windows Terminal window. Run them explicitly with:
+//!
+//! ```text
+//! cargo test --test live_bridge -- --ignored
+//! ```
+//!
+//! Environment variables:
+//!
+//! - `WINTERMINAL_E2E_ACTION` (required by
+//!   `dispatch_bridge_action_from_environment`): the action to dispatch, e.g.
+//!   `focus-left`, `split-right`, `new-tab`, `activate-tab-0`. The test panics
+//!   when it is missing or names an unsupported action.
+//! - `WINTERMINAL_E2E_HWND` (required by `native_pane_geometry_from_environment`,
+//!   optional elsewhere): decimal HWND of the dedicated test window. When the
+//!   dispatch test leaves it unset, the current foreground window is used and
+//!   must be a Windows Terminal window.
+//! - `WINTERMINAL_E2E_EXPECTED_TITLE` (optional): when set, the dispatch test
+//!   polls until the target window title contains this fragment (5s deadline).
+//! - `WINTERMINAL_E2E_EXPECTED_PANES` (optional): expected pane count for the
+//!   geometry test; defaults to `2`. The divider assertion only runs when the
+//!   expected count is greater than `1`.
 
 use std::env;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use winterminalp::keymap::binding_for_action;
 use winterminalp::pane_layout::PaneLayout;
@@ -36,10 +57,17 @@ fn managed_bridge_chords_are_available_as_global_hotkeys() {
         if binding.bridge_chord.shift {
             modifiers |= MOD_SHIFT;
         }
-        let virtual_key =
-            u32::from(VK_F1.0) + u32::from(binding.bridge_chord.function_key.saturating_sub(1));
-        // SAFETY: the generated id is unique for this process and virtual_key
-        // is a valid function-key code; no pointers are passed.
+        let function_key = binding.bridge_chord.function_key;
+        assert!(
+            (13..=24).contains(&function_key),
+            "{} ({}) uses function key F{function_key}; the production range check in \
+             `function_virtual_key` (src/platform/windows/input.rs) only accepts F13-F24",
+            binding.action_id,
+            binding.bridge_chord
+        );
+        let virtual_key = u32::from(VK_F1.0) + u32::from(function_key - 1);
+        // SAFETY: the generated id is unique for this process and function_key
+        // was range-checked to F13-F24 above; no pointers are passed.
         let registered = unsafe {
             RegisterHotKey(None, id, HOT_KEY_MODIFIERS(modifiers.0), virtual_key).is_ok()
         };
@@ -91,12 +119,19 @@ fn dispatch_bridge_action_from_environment() {
 
     assert!(receipt.sent >= 2);
     if let Ok(expected_title) = env::var("WINTERMINAL_E2E_EXPECTED_TITLE") {
-        thread::sleep(Duration::from_millis(400));
-        let title = window_title(target.hwnd);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let title = loop {
+            let title = window_title(target.hwnd);
+            if title.contains(&expected_title) || Instant::now() >= deadline {
+                break title;
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
         println!("WINTERMINAL_E2E_TARGET_TITLE={title}");
         assert!(
             title.contains(&expected_title),
-            "target title {title:?} did not contain {expected_title:?}"
+            "target title did not contain {expected_title:?} within 5s of polling; \
+             actual title: {title:?}"
         );
     }
 }
@@ -129,7 +164,12 @@ fn native_pane_geometry_from_environment() {
     println!("WINTERMINAL_E2E_PANE_COUNT={}", layout.panes().len());
     println!("WINTERMINAL_E2E_DIVIDER_COUNT={}", layout.dividers().len());
     assert_eq!(layout.panes().len(), expected_panes);
-    assert!(!layout.dividers().is_empty());
+    if expected_panes > 1 {
+        assert!(
+            !layout.dividers().is_empty(),
+            "expected at least one divider for {expected_panes} panes"
+        );
+    }
     let focused_panes = layout
         .panes()
         .iter()

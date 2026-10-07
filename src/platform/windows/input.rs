@@ -22,9 +22,13 @@ pub struct InputDispatch {
 /// Sends a managed Windows Terminal bridge chord to an unchanged foreground
 /// target.
 ///
-/// This function never activates a window. It revalidates HWND, PID, process
-/// creation time, and channel immediately before `SendInput`. Modifiers already
-/// held by the user are never released; extra held modifiers fail closed.
+/// This function never activates a window. Checks run in order of increasing
+/// volatility — plan, identity, foreground, modifier state — so the most
+/// volatile facts are verified last: HWND, PID, process creation time, and
+/// channel are validated first, then the foreground HWND is re-checked, then
+/// the physical modifier and target-key state is re-read against what the
+/// plan assumed. Modifiers already held by the user are never released; any
+/// state drift fails closed before `SendInput`.
 pub fn send_bridge_chord(
     target: WindowIdentity,
     chord: BridgeChord,
@@ -38,7 +42,8 @@ pub fn send_bridge_chord(
 /// Used for hidden bridge function keys. Only modifiers this call synthesizes
 /// are released; modifiers already held by the user are preserved, extra held
 /// modifiers fail closed, and a target key that is already physically held is
-/// rejected before any input is injected.
+/// rejected before any input is injected and re-checked immediately before
+/// `SendInput`.
 fn send_key_chord(
     target: WindowIdentity,
     virtual_key: VIRTUAL_KEY,
@@ -55,7 +60,9 @@ fn send_key_chord(
 /// re-injects, so the normal "target key already held" guard would always fail.
 /// That physical key-down and its matching key-up are consumed by the
 /// controller before reaching the target, so the injected chord is still the
-/// only complete key transition the target observes.
+/// only complete key transition the target observes. The target-key guard is
+/// the only check relaxed; identity, foreground, and modifier re-checks still
+/// run before `SendInput`.
 pub fn send_literal_chord(
     target: WindowIdentity,
     virtual_key: VIRTUAL_KEY,
@@ -66,6 +73,14 @@ pub fn send_literal_chord(
     send_chord(target, virtual_key, ctrl, alt, shift, false)
 }
 
+/// Shared dispatch path for bridge and literal chords.
+///
+/// Checks run from slow/stable to fast/volatile: plan, identity validation,
+/// foreground HWND, then physical modifier state — each re-verified after the
+/// preceding slow step so the most volatile facts are confirmed immediately
+/// before `SendInput`. A change occurring after the final re-check can still
+/// race the injection itself; that residual window is inherent to user-mode
+/// `SendInput`.
 fn send_chord(
     target: WindowIdentity,
     virtual_key: VIRTUAL_KEY,
@@ -77,6 +92,8 @@ fn send_chord(
     let snapshot = ModifierSnapshot::capture(virtual_key);
     let plan = plan_chord_events(virtual_key, ctrl, alt, shift, snapshot, check_target_key)?;
 
+    validate_window_identity(target)?;
+
     let actual_foreground = foreground_hwnd();
     if actual_foreground != target.hwnd {
         return Err(PlatformError::TargetNotForeground {
@@ -84,7 +101,8 @@ fn send_chord(
             actual: actual_foreground,
         });
     }
-    validate_window_identity(target)?;
+
+    recheck_modifier_state(virtual_key, snapshot, check_target_key)?;
 
     let inputs = plan.to_inputs();
     let expected = input_count(inputs.len())?;
@@ -152,6 +170,51 @@ impl ModifierSnapshot {
             target_key: key_is_down(target_key),
         }
     }
+}
+
+/// Re-reads the physical keyboard state and fails closed when it drifted from
+/// the snapshot the input plan was built on.
+fn recheck_modifier_state(
+    virtual_key: VIRTUAL_KEY,
+    planned: ModifierSnapshot,
+    check_target_key: bool,
+) -> PlatformResult<()> {
+    let fresh = ModifierSnapshot::capture(virtual_key);
+    compare_modifier_state(virtual_key, planned, fresh, check_target_key)
+}
+
+/// Decides whether `fresh` still matches every assumption `plan` was built on.
+///
+/// A modifier that was not held when the plan was made and is held now would
+/// be clobbered or leak into the chord, so it fails with
+/// [`PlatformError::UnexpectedModifierHeld`]. A modifier the plan relied on
+/// being held (no down event was planned for it) that is now released fails
+/// with [`PlatformError::ModifierReleased`]. The target key is only compared
+/// when the plan requires it to be free (`check_target_key`), because literal
+/// replay intentionally allows it to be held.
+fn compare_modifier_state(
+    virtual_key: VIRTUAL_KEY,
+    planned: ModifierSnapshot,
+    fresh: ModifierSnapshot,
+    check_target_key: bool,
+) -> PlatformResult<()> {
+    for (was, now, name) in [
+        (planned.control, fresh.control, ModifierKey::Control),
+        (planned.alt, fresh.alt, ModifierKey::Alt),
+        (planned.shift, fresh.shift, ModifierKey::Shift),
+        (planned.windows, fresh.windows, ModifierKey::Windows),
+    ] {
+        if was && !now {
+            return Err(PlatformError::ModifierReleased(name));
+        }
+        if !was && now {
+            return Err(PlatformError::UnexpectedModifierHeld(name));
+        }
+    }
+    if check_target_key && fresh.target_key {
+        return Err(PlatformError::TargetKeyHeld(virtual_key.0));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,7 +363,7 @@ fn function_virtual_key(function_key: u8) -> PlatformResult<VIRTUAL_KEY> {
     Ok(VIRTUAL_KEY(VK_F1.0 + u16::from(function_key - 1)))
 }
 
-fn key_is_down(virtual_key: VIRTUAL_KEY) -> bool {
+pub(crate) fn key_is_down(virtual_key: VIRTUAL_KEY) -> bool {
     // SAFETY: GetAsyncKeyState accepts any virtual-key code by value and has no
     // pointer or ownership requirements.
     unsafe { GetAsyncKeyState(i32::from(virtual_key.0)) < 0 }
@@ -461,6 +524,92 @@ mod tests {
             ),
             Err(PlatformError::UnexpectedModifierHeld(ModifierKey::Shift))
         ));
+    }
+
+    #[test]
+    fn modifier_recheck_accepts_unchanged_state() {
+        let planned = ModifierSnapshot {
+            control: true,
+            shift: true,
+            ..ModifierSnapshot::default()
+        };
+
+        assert!(compare_modifier_state(fkey(13), planned, planned, true).is_ok());
+        assert!(
+            compare_modifier_state(
+                fkey(13),
+                ModifierSnapshot::default(),
+                ModifierSnapshot::default(),
+                true
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn modifier_recheck_reports_newly_held_modifier() {
+        let fresh = ModifierSnapshot {
+            control: true,
+            ..ModifierSnapshot::default()
+        };
+
+        assert!(matches!(
+            compare_modifier_state(fkey(13), ModifierSnapshot::default(), fresh, true),
+            Err(PlatformError::UnexpectedModifierHeld(ModifierKey::Control))
+        ));
+    }
+
+    #[test]
+    fn modifier_recheck_reports_newly_held_windows_key() {
+        let fresh = ModifierSnapshot {
+            windows: true,
+            ..ModifierSnapshot::default()
+        };
+
+        assert!(matches!(
+            compare_modifier_state(fkey(13), ModifierSnapshot::default(), fresh, true),
+            Err(PlatformError::UnexpectedModifierHeld(ModifierKey::Windows))
+        ));
+    }
+
+    #[test]
+    fn modifier_recheck_reports_released_expected_modifier() {
+        let planned = ModifierSnapshot {
+            alt: true,
+            ..ModifierSnapshot::default()
+        };
+
+        assert!(matches!(
+            compare_modifier_state(fkey(13), planned, ModifierSnapshot::default(), true),
+            Err(PlatformError::ModifierReleased(ModifierKey::Alt))
+        ));
+    }
+
+    #[test]
+    fn modifier_recheck_reports_target_key_pressed_after_plan() {
+        let fresh = ModifierSnapshot {
+            target_key: true,
+            ..ModifierSnapshot::default()
+        };
+
+        assert!(matches!(
+            compare_modifier_state(
+                VIRTUAL_KEY(u16::from(b'B')),
+                ModifierSnapshot::default(),
+                fresh,
+                true
+            ),
+            Err(PlatformError::TargetKeyHeld(_))
+        ));
+        assert!(
+            compare_modifier_state(
+                VIRTUAL_KEY(u16::from(b'B')),
+                ModifierSnapshot::default(),
+                fresh,
+                false
+            )
+            .is_ok()
+        );
     }
 
     #[test]

@@ -137,11 +137,37 @@ new_tab = "t"
 shutdown = "q"
 ```
 
-Prefix 必须包含 `Ctrl` 或 `Alt`。`Escape` 与系统保留组合（`Alt+Tab`、`Alt+F4`、
-`Ctrl+Escape`、Windows 键组合）不能绑定。两个动作不能使用同一 chord。可选动作可以设为
+Prefix 必须包含 `Ctrl` 或 `Alt`。`Escape` 与系统保留组合（`Alt+Tab`、`Ctrl+Tab`、
+`Ctrl+Shift+Tab`、`Alt+F4`、`Alt+Escape`、`Ctrl+Escape`、`Ctrl+Shift+T`、
+`Ctrl+Shift+W`、Windows 键组合）不能绑定。两个动作不能使用同一 chord。可选动作可以设为
 `"disabled"`。修改快捷键无需重新执行 `winter install`。
 
+所有配置键、默认值与允许范围：
+
+| 键 | 默认值 | 范围 / 说明 |
+|---|---|---|
+| `schema_version` | `2` | 配置 schema；旧版 `1` 文件可加载并在内存中迁移 |
+| `prefix_timeout_ms` | `1500` | `250`–`5000`；Prefix 超时时间 |
+| `launch_terminal_on_start` | `true` | 布尔值；控制器启动时打开原生 Windows Terminal 窗口 |
+| `prefix` | `"ctrl+b"` | 必须包含 `ctrl` 或 `alt` |
+| `shortcuts` | 见上文 | 动作名 → chord 或 `"disabled"` 的映射 |
+| `mouse_resize.enabled` | `true` | 布尔值；启用原生分隔线拖动 |
+| `mouse_resize.divider_hit_slop_px` | `8` | `0`–`32` |
+| `mouse_resize.geometry_poll_interval_ms` | `100` | `50`–`1000` |
+
 完整参考见 [`docs/SHORTCUTS.md`](docs/SHORTCUTS.md)。
+
+## 退出码
+
+`plan`、`install`、`uninstall` 和 `doctor` 会在 stdout 输出 JSON 报告；
+`winter doctor` 返回 `{ schema_version, healthy, config: { path, ok, error },
+integration }`。
+
+| 码 | 含义 |
+|---|---|
+| `0` | 成功；命令完成且结果健康 |
+| `1` | 硬失败（I/O 错误、不支持的配置等） |
+| `2` | 需要处理：`winter plan` 无法安装桥接时；`winter doctor` 配置无效或桥接未就绪时 |
 
 ## 安全与隐私
 

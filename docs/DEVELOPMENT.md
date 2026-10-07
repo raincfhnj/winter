@@ -14,10 +14,9 @@
 ## 常用命令
 
 ```powershell
-cargo build
-cargo test
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets
 ```
 
 开发期以前台模式运行控制器：

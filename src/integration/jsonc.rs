@@ -20,8 +20,6 @@ pub(crate) struct DesiredKeybinding {
 
 #[derive(Debug)]
 pub(crate) struct SettingsEdit {
-    pub existing_binding_count: usize,
-    pub matching_binding_count: usize,
     pub additions: Vec<ManagedKeybindingManifest>,
     pub conflicts: Vec<IntegrationConflict>,
     pub replacement: Option<Vec<u8>>,
@@ -33,6 +31,17 @@ pub(crate) struct RemovalEdit {
     pub preserved_binding_count: usize,
     pub retained: Vec<ManagedKeybindingManifest>,
     pub replacement: Option<Vec<u8>>,
+}
+
+/// Read-only validation and conflict analysis for the root `keybindings`
+/// array: counts and conflicts without document mutation or serialization.
+#[derive(Debug)]
+pub struct KeybindingAnalysis {
+    pub conflicts: Vec<IntegrationConflict>,
+    pub existing_binding_count: usize,
+    pub bindings_to_add: usize,
+    pub managed_binding_count: usize,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -95,12 +104,10 @@ pub(crate) fn validate_desired_bindings(bindings: &[DesiredKeybinding]) -> AppRe
     Ok(())
 }
 
-pub(crate) fn merge_keybindings(
-    raw: &[u8],
-    desired: &[DesiredKeybinding],
-) -> AppResult<SettingsEdit> {
-    let document = parse_document(raw)?;
-    let root_object = document.root.object_value().ok_or_else(|| {
+/// Extracts the root `keybindings` array elements together with any shape
+/// conflicts that make the document unusable for merging.
+fn keybinding_elements(root: &CstRootNode) -> AppResult<(Vec<CstNode>, Vec<IntegrationConflict>)> {
+    let root_object = root.object_value().ok_or_else(|| {
         AppError::InvalidConfiguration("settings root must be an object".to_owned())
     })?;
     let duplicate_keybinding_properties = root_object
@@ -115,119 +122,180 @@ pub(crate) fn merge_keybindings(
         })
         .count();
     if duplicate_keybinding_properties > 1 {
-        return Ok(SettingsEdit {
-            existing_binding_count: 0,
-            matching_binding_count: 0,
-            additions: Vec::new(),
-            conflicts: vec![conflict(
+        return Ok((
+            Vec::new(),
+            vec![conflict(
                 ConflictKind::InvalidSettingsShape,
                 None,
                 None,
                 "settings contains duplicate root keybindings properties",
             )],
-            replacement: None,
-        });
+        ));
     }
-
     let elements = match root_object.get("keybindings") {
         Some(_) => match root_object.array_value("keybindings") {
             Some(array) => array.elements(),
             None => {
-                return Ok(SettingsEdit {
-                    existing_binding_count: 0,
-                    matching_binding_count: 0,
-                    additions: Vec::new(),
-                    conflicts: vec![conflict(
+                return Ok((
+                    Vec::new(),
+                    vec![conflict(
                         ConflictKind::InvalidSettingsShape,
                         None,
                         None,
                         "root keybindings must be an array",
                     )],
-                    replacement: None,
-                });
+                ));
             }
         },
         None => Vec::new(),
     };
-    let existing_binding_count = elements.len();
-    let (existing, mut conflicts) = parse_existing_bindings(elements);
+    Ok((elements, Vec::new()))
+}
 
+struct KeybindingScan {
+    existing_binding_count: usize,
+    additions: Vec<ManagedKeybindingManifest>,
+    matching_binding_count: usize,
+    conflicts: Vec<IntegrationConflict>,
+    warnings: Vec<String>,
+}
+
+/// Validates the existing `keybindings` entries against the managed set and
+/// classifies every desired binding as present, conflicting, or to add.
+///
+/// Builds a single index pass over the existing entries so each desired
+/// binding resolves in constant time.
+fn scan_keybindings(elements: Vec<CstNode>, desired: &[DesiredKeybinding]) -> KeybindingScan {
+    let existing_binding_count = elements.len();
+    let desired_ids: HashSet<&str> = desired
+        .iter()
+        .map(|binding| binding.canonical_id.as_str())
+        .collect();
+    let (existing, mut conflicts, warnings) = parse_existing_bindings(elements, &desired_ids);
+
+    let mut first_by_id: HashMap<&str, usize> = HashMap::with_capacity(existing.len());
+    let mut first_by_chord: HashMap<&str, usize> = HashMap::with_capacity(existing.len());
+    let mut existing_pairs: HashSet<(&str, &str)> = HashSet::with_capacity(existing.len());
+    for (index, binding) in existing.iter().enumerate() {
+        if let Some(canonical_id) = binding.canonical_id.as_deref() {
+            first_by_id.entry(canonical_id).or_insert(index);
+            existing_pairs.insert((canonical_id, binding.canonical_chord.as_str()));
+        }
+        first_by_chord
+            .entry(binding.canonical_chord.as_str())
+            .or_insert(index);
+    }
+
+    let mut matching_binding_count = 0;
     let mut additions = Vec::new();
-    let mut present = Vec::new();
     for managed in desired {
-        let same_id: Vec<_> = existing
-            .iter()
-            .filter(|binding| {
-                binding.canonical_id.as_deref() == Some(managed.canonical_id.as_str())
-            })
-            .collect();
-        let same_chord: Vec<_> = existing
-            .iter()
-            .filter(|binding| binding.canonical_chord == managed.canonical_chord)
-            .collect();
-        let equivalent = existing.iter().any(|binding| {
-            binding.canonical_id.as_deref() == Some(managed.canonical_id.as_str())
-                && binding.canonical_chord == managed.canonical_chord
-                && binding.has_only_id_and_keys
-        });
-        if equivalent {
-            present.push(to_manifest_binding(managed));
+        let canonical_id = managed.canonical_id.as_str();
+        let canonical_chord = managed.canonical_chord.as_str();
+        if existing_pairs.contains(&(canonical_id, canonical_chord)) {
+            matching_binding_count += 1;
             continue;
         }
-        if !same_id.is_empty() {
+        if first_by_id.contains_key(canonical_id) {
             conflicts.push(conflict(
                 ConflictKind::SameIdDifferentBinding,
-                Some(managed.canonical_id.clone()),
-                Some(managed.canonical_chord.clone()),
+                Some(canonical_id.to_owned()),
+                Some(canonical_chord.to_owned()),
                 format!(
-                    "managed id {} already exists with a different chord or definition",
-                    managed.canonical_id
+                    "managed id {canonical_id} already exists with a different chord or definition"
                 ),
             ));
             continue;
         }
-        if !same_chord.is_empty() {
-            let occupant = same_chord[0]
+        if let Some(&index) = first_by_chord.get(canonical_chord) {
+            let occupant = existing[index]
                 .canonical_id
                 .as_deref()
                 .unwrap_or("an unmanaged keybinding");
             conflicts.push(conflict(
                 ConflictKind::SameChordDifferentBinding,
-                Some(managed.canonical_id.clone()),
-                Some(managed.canonical_chord.clone()),
-                format!(
-                    "managed chord {} is already assigned to {}",
-                    managed.canonical_chord, occupant
-                ),
+                Some(canonical_id.to_owned()),
+                Some(canonical_chord.to_owned()),
+                format!("managed chord {canonical_chord} is already assigned to {occupant}"),
             ));
             continue;
         }
         additions.push(to_manifest_binding(managed));
     }
     deduplicate_conflicts(&mut conflicts);
-    if !conflicts.is_empty() || additions.is_empty() {
+    KeybindingScan {
+        existing_binding_count,
+        additions,
+        matching_binding_count,
+        conflicts,
+        warnings,
+    }
+}
+
+pub(crate) fn merge_keybindings(
+    raw: &[u8],
+    desired: &[DesiredKeybinding],
+) -> AppResult<SettingsEdit> {
+    let document = parse_document(raw)?;
+    let (elements, shape_conflicts) = keybinding_elements(&document.root)?;
+    if !shape_conflicts.is_empty() {
         return Ok(SettingsEdit {
-            existing_binding_count,
-            matching_binding_count: present.len(),
-            additions,
-            conflicts,
+            additions: Vec::new(),
+            conflicts: shape_conflicts,
+            replacement: None,
+        });
+    }
+    let scan = scan_keybindings(elements, desired);
+    if !scan.conflicts.is_empty() || scan.additions.is_empty() {
+        return Ok(SettingsEdit {
+            additions: scan.additions,
+            conflicts: scan.conflicts,
             replacement: None,
         });
     }
 
+    let root_object = document.root.object_value().ok_or_else(|| {
+        AppError::InvalidConfiguration("settings root must be an object".to_owned())
+    })?;
     let array = root_object
         .array_value_or_create("keybindings")
         .ok_or_else(|| AppError::InvalidConfiguration("keybindings is not an array".to_owned()))?;
-    for addition in &additions {
+    for addition in &scan.additions {
         array.append(value_to_cst(&addition.definition)?);
     }
     let replacement = serialize_document(&document);
     Ok(SettingsEdit {
-        existing_binding_count,
-        matching_binding_count: present.len(),
-        additions,
-        conflicts,
+        additions: scan.additions,
+        conflicts: scan.conflicts,
         replacement: Some(replacement),
+    })
+}
+
+/// Validates and analyzes the root `keybindings` array without mutating or
+/// serializing the settings document, so read-only commands skip the full
+/// document re-serialization that [`merge_keybindings`] pays when it appends
+/// bindings.
+pub fn analyze_keybindings(
+    raw: &[u8],
+    desired: &[DesiredKeybinding],
+) -> AppResult<KeybindingAnalysis> {
+    let document = parse_document(raw)?;
+    let (elements, shape_conflicts) = keybinding_elements(&document.root)?;
+    if !shape_conflicts.is_empty() {
+        return Ok(KeybindingAnalysis {
+            conflicts: shape_conflicts,
+            existing_binding_count: 0,
+            bindings_to_add: 0,
+            managed_binding_count: 0,
+            warnings: Vec::new(),
+        });
+    }
+    let scan = scan_keybindings(elements, desired);
+    Ok(KeybindingAnalysis {
+        existing_binding_count: scan.existing_binding_count,
+        bindings_to_add: scan.additions.len(),
+        managed_binding_count: scan.matching_binding_count,
+        conflicts: scan.conflicts,
+        warnings: scan.warnings,
     })
 }
 
@@ -252,7 +320,12 @@ pub(crate) fn remove_managed_keybindings(
             replacement: None,
         });
     };
-    let (existing, parse_conflicts) = parse_existing_bindings(array.elements());
+    let managed_ids: HashSet<&str> = managed
+        .iter()
+        .map(|record| record.canonical_id.as_str())
+        .collect();
+    let (existing, parse_conflicts, _warnings) =
+        parse_existing_bindings(array.elements(), &managed_ids);
     if !parse_conflicts.is_empty() {
         return Err(AppError::SettingsConflict(
             "settings contains malformed keybindings; managed entries were retained".to_owned(),
@@ -331,19 +404,26 @@ fn serialize_document(document: &ParsedDocument) -> Vec<u8> {
     bytes
 }
 
+/// Parses every root `keybindings` element, splitting them into usable
+/// bindings, malformed entries that belong to a managed action (a conflict,
+/// because merging must not clobber them), and warnings for malformed entries
+/// outside the managed set, which are inert and skipped.
 fn parse_existing_bindings(
     elements: Vec<CstNode>,
-) -> (Vec<ExistingKeybinding>, Vec<IntegrationConflict>) {
+    desired_ids: &HashSet<&str>,
+) -> (
+    Vec<ExistingKeybinding>,
+    Vec<IntegrationConflict>,
+    Vec<String>,
+) {
     let mut parsed = Vec::new();
     let mut conflicts = Vec::new();
+    let mut warnings = Vec::new();
     for node in elements {
         let Some(value) = node.to_serde_value() else {
-            conflicts.push(conflict(
-                ConflictKind::MalformedKeybinding,
-                None,
-                None,
-                "keybindings contains a value that cannot be represented as JSON",
-            ));
+            warnings.push(
+                "ignored unmanaged keybinding: value cannot be represented as JSON".to_owned(),
+            );
             continue;
         };
         match parse_binding_definition(&value) {
@@ -357,22 +437,39 @@ fn parse_existing_bindings(
                     });
                 }
             }
-            Err(message) => conflicts.push(conflict(
-                ConflictKind::MalformedKeybinding,
-                None,
-                None,
-                message,
-            )),
+            Err(message) => {
+                if references_desired_id(&value, desired_ids) {
+                    conflicts.push(conflict(
+                        ConflictKind::MalformedKeybinding,
+                        None,
+                        None,
+                        message,
+                    ));
+                } else {
+                    warnings.push(format!("ignored unmanaged keybinding: {message}"));
+                }
+            }
         }
     }
-    (parsed, conflicts)
+    (parsed, conflicts, warnings)
+}
+
+/// Whether the entry declares one of the managed action ids, even when the
+/// rest of the entry fails to parse.
+fn references_desired_id(value: &Value, desired_ids: &HashSet<&str>) -> bool {
+    value
+        .as_object()
+        .and_then(|object| object.get("id"))
+        .and_then(Value::as_str)
+        .and_then(|id| normalize_id(id).ok())
+        .is_some_and(|id| desired_ids.contains(id.as_str()))
 }
 
 /// Parses one root `keybindings` entry.
 ///
 /// Returns the optional managed `id`, every chord declared by `keys` (a string
 /// or an array of strings), and whether the entry is a bare `{id, keys}` object
-/// with a single string chord that WinTerminalP is allowed to own or remove.
+/// with a single string chord that WinTerminalP is allowed to remove.
 fn parse_binding_definition(value: &Value) -> Result<(Option<String>, Vec<String>, bool), String> {
     let object = value
         .as_object()
@@ -415,26 +512,31 @@ fn normalize_id(id: &str) -> Result<String, String> {
     Ok(id.to_ascii_lowercase())
 }
 
+/// Normalizes a chord to canonical `modifier+...+key` order.
+///
+/// A run of empty parts produced by splitting on `+` means the literal `+`
+/// key (`ctrl++`, `+`), which canonicalizes to `plus` (VK_OEM_PLUS).
 fn normalize_chord(chord: &str) -> Result<String, String> {
     let chord = chord.trim().to_ascii_lowercase();
     if chord.is_empty() {
         return Err("keybinding chord cannot be empty".to_owned());
     }
-    let aliases: HashMap<&str, &str> = HashMap::from([
-        ("control", "ctrl"),
-        ("windows", "win"),
-        ("escape", "esc"),
-        ("return", "enter"),
-        ("pageup", "pgup"),
-        ("pagedown", "pgdn"),
-    ]);
     let mut modifiers = HashSet::new();
     let mut key = None;
+    let mut previous_part_was_empty = false;
     for part in chord.split('+').map(str::trim) {
         if part.is_empty() {
-            return Err(format!("invalid keybinding chord {chord}"));
+            if previous_part_was_empty {
+                continue;
+            }
+            previous_part_was_empty = true;
+            if key.replace("plus").is_some() {
+                return Err(format!("keybinding chord {chord} contains multiple keys"));
+            }
+            continue;
         }
-        let normalized = aliases.get(part).copied().unwrap_or(part);
+        previous_part_was_empty = false;
+        let normalized = normalize_chord_token(part);
         if matches!(normalized, "ctrl" | "shift" | "alt" | "win") {
             if !modifiers.insert(normalized) {
                 return Err(format!("duplicate modifier in keybinding chord {chord}"));
@@ -452,6 +554,20 @@ fn normalize_chord(chord: &str) -> Result<String, String> {
     }
     canonical.push(key);
     Ok(canonical.join("+"))
+}
+
+/// Canonicalizes one already-lowercased chord token without allocating.
+fn normalize_chord_token(part: &str) -> &str {
+    match part {
+        "control" => "ctrl",
+        "windows" => "win",
+        "escape" => "esc",
+        "return" => "enter",
+        "pageup" => "pgup",
+        "pagedown" => "pgdn",
+        "oemplus" => "plus",
+        other => other,
+    }
 }
 
 fn to_manifest_binding(binding: &DesiredKeybinding) -> ManagedKeybindingManifest {
@@ -496,14 +612,25 @@ fn conflict(
 }
 
 fn deduplicate_conflicts(conflicts: &mut Vec<IntegrationConflict>) {
-    let mut seen = HashSet::new();
-    conflicts.retain(|conflict| {
-        seen.insert((
-            conflict.kind,
-            conflict.action_id.clone(),
-            conflict.keys.clone(),
-            conflict.message.clone(),
-        ))
+    let unique: Vec<bool> = {
+        let mut seen = HashSet::new();
+        conflicts
+            .iter()
+            .map(|conflict| {
+                seen.insert((
+                    conflict.kind,
+                    conflict.action_id.as_deref(),
+                    conflict.keys.as_deref(),
+                    conflict.message.as_str(),
+                ))
+            })
+            .collect()
+    };
+    let mut index = 0;
+    conflicts.retain(|_| {
+        let keep = unique[index];
+        index += 1;
+        keep
     });
 }
 
@@ -534,7 +661,9 @@ mod tests {
         let second = merge_keybindings(&replacement, &bindings).expect("second merge should work");
         assert!(second.conflicts.is_empty());
         assert!(second.replacement.is_none());
-        assert_eq!(second.matching_binding_count, 1);
+        let second_analysis =
+            analyze_keybindings(&replacement, &bindings).expect("second analysis should work");
+        assert_eq!(second_analysis.managed_binding_count, 1);
     }
 
     #[test]
@@ -630,5 +759,241 @@ mod tests {
                 .iter()
                 .any(|conflict| conflict.kind == ConflictKind::MalformedKeybinding)
         );
+    }
+
+    #[test]
+    fn analyze_matches_merge_counts_and_conflicts() {
+        let desired_bindings = [
+            desired("WinTerminalP.SplitLeft", "ctrl+f13"),
+            desired("WinTerminalP.SplitRight", "ctrl+f14"),
+        ];
+        let fixtures: &[&[u8]] = &[
+            br#"{}"#,
+            br#"{"keybindings":[]}"#,
+            br#"{"keybindings":[{"id":"WinTerminalP.SplitLeft","keys":"ctrl+f13"}]}"#,
+            br#"{"keybindings":[{"id":"WinTerminalP.SplitLeft","keys":"ctrl+f14"},{"id":"User.Action","keys":"ctrl+alt+f14"}]}"#,
+            br#"{"keybindings":[{"id":"WinTerminalP.SplitLeft","keys":"ctrl+f13","command":"unbound"}]}"#,
+            br#"{"keybindings":[{"id":"WinTerminalP.SplitLeft"},{"id":"User.Junk","keys":[]}]}"#,
+            br#"{"keybindings":[42,"junk"]}"#,
+            br#"{ "keybindings": [], "keybindings": [] }"#,
+            br#"{"keybindings":{}}"#,
+        ];
+        for source in fixtures {
+            let merged =
+                merge_keybindings(source, &desired_bindings).expect("fixture should merge");
+            let analyzed =
+                analyze_keybindings(source, &desired_bindings).expect("fixture should analyze");
+            assert_eq!(
+                analyzed.bindings_to_add,
+                merged.additions.len(),
+                "additions for {source:?}"
+            );
+            assert_eq!(
+                analyzed.conflicts, merged.conflicts,
+                "conflicts for {source:?}"
+            );
+        }
+
+        assert!(merge_keybindings(b"[1]", &desired_bindings).is_err());
+        assert!(analyze_keybindings(b"[1]", &desired_bindings).is_err());
+        assert!(merge_keybindings(b"{", &desired_bindings).is_err());
+        assert!(analyze_keybindings(b"{", &desired_bindings).is_err());
+    }
+
+    #[test]
+    fn unmanaged_malformed_entries_warn_instead_of_blocking() {
+        let source = br#"{
+  "keybindings": [
+    42,
+    "nonsense",
+    { "command": "x" },
+    { "id": "User.Junk" },
+    { "id": "User.Junk", "keys": [] },
+    { "id": "User.Junk", "keys": 7 }
+  ]
+}"#;
+        let bindings = [desired("WinTerminalP.SplitLeft", "ctrl+f13")];
+
+        let edit =
+            merge_keybindings(source, &bindings).expect("unmanaged junk must not block install");
+        assert!(edit.conflicts.is_empty());
+        let replacement = edit.replacement.expect("binding should be appended");
+        let text = std::str::from_utf8(&replacement).expect("result should be UTF-8");
+        assert!(text.contains("\"nonsense\""));
+
+        let analysis = analyze_keybindings(source, &bindings).expect("analysis should complete");
+        assert_eq!(analysis.existing_binding_count, 6);
+        assert_eq!(analysis.managed_binding_count, 0);
+        assert_eq!(analysis.warnings.len(), 6);
+        assert!(
+            analysis
+                .warnings
+                .iter()
+                .all(|warning| warning.starts_with("ignored unmanaged keybinding: "))
+        );
+        assert_eq!(analysis.bindings_to_add, 1);
+        assert!(analysis.conflicts.is_empty());
+    }
+
+    #[test]
+    fn malformed_managed_entries_still_conflict() {
+        let source = br#"{
+  "keybindings": [
+    { "id": "WinTerminalP.SplitLeft" },
+    { "id": "WinTerminalP.SplitRight", "keys": [] },
+    { "id": "WinTerminalP.SplitRight", "keys": 7 },
+    { "id": "User.Junk" }
+  ]
+}"#;
+        let bindings = [
+            desired("WinTerminalP.SplitLeft", "ctrl+f13"),
+            desired("WinTerminalP.SplitRight", "ctrl+f14"),
+        ];
+
+        let edit = merge_keybindings(source, &bindings).expect("analysis should complete");
+        assert!(edit.replacement.is_none());
+        assert_eq!(
+            edit.conflicts
+                .iter()
+                .filter(|conflict| conflict.kind == ConflictKind::MalformedKeybinding)
+                .count(),
+            3
+        );
+
+        let analysis = analyze_keybindings(source, &bindings).expect("analysis should complete");
+        assert_eq!(analysis.conflicts.len(), 3);
+        assert_eq!(analysis.warnings.len(), 1);
+    }
+
+    #[test]
+    fn literal_plus_chords_normalize_to_the_plus_key() {
+        assert_eq!(
+            normalize_chord("ctrl++").expect("ctrl++ should parse"),
+            "ctrl+plus"
+        );
+        assert_eq!(normalize_chord("+").expect("+ should parse"), "plus");
+        assert_eq!(
+            normalize_chord("ctrl+shift++").expect("ctrl+shift++ should parse"),
+            "ctrl+shift+plus"
+        );
+        assert_eq!(
+            normalize_chord("Ctrl+OEMPLUS").expect("oemplus alias should parse"),
+            "ctrl+plus"
+        );
+        assert_eq!(
+            normalize_chord("ctrl+plus").expect("ctrl+plus should parse"),
+            "ctrl+plus"
+        );
+        assert!(normalize_chord("ctrl++ctrl").is_err());
+        assert!(normalize_chord("+a+").is_err());
+    }
+
+    #[test]
+    fn ctrl_plus_plus_collides_with_the_canonical_plus_chord() {
+        let source = br#"{"keybindings":[{"id":"User.Plus","keys":"ctrl++"}]}"#;
+        let bindings = [desired("WinTerminalP.SplitLeft", "ctrl+plus")];
+
+        let edit = merge_keybindings(source, &bindings).expect("analysis should complete");
+        assert!(edit.replacement.is_none());
+        assert!(
+            edit.conflicts
+                .iter()
+                .any(|conflict| conflict.kind == ConflictKind::SameChordDifferentBinding)
+        );
+    }
+
+    #[test]
+    fn extra_properties_do_not_block_a_managed_entry_with_matching_keys() {
+        let bindings = [desired("WinTerminalP.SplitLeft", "ctrl+f13")];
+        let source = br#"{"keybindings":[{"id":"WinTerminalP.SplitLeft","keys":"ctrl+f13","command":"unbound","userNote":true}]}"#;
+
+        let edit = merge_keybindings(source, &bindings).expect("analysis should complete");
+        assert!(edit.conflicts.is_empty());
+        assert_eq!(edit.additions.len(), 0);
+        assert!(edit.replacement.is_none());
+        let analysis = analyze_keybindings(source, &bindings).expect("analysis should complete");
+        assert_eq!(analysis.managed_binding_count, 1);
+        assert_eq!(analysis.bindings_to_add, 0);
+
+        let source =
+            br#"{"keybindings":[{"id":"WinTerminalP.SplitLeft","keys":"ctrl+f14","command":"unbound"}]}"#;
+        let edit = merge_keybindings(source, &bindings).expect("analysis should complete");
+        assert!(edit.replacement.is_none());
+        assert_eq!(
+            edit.conflicts
+                .iter()
+                .filter(|conflict| conflict.kind == ConflictKind::SameIdDifferentBinding)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn index_lookup_preserves_first_match_selection() {
+        let bindings = [desired("WinTerminalP.SplitLeft", "ctrl+f13")];
+
+        let source = br#"{"keybindings":[
+            {"id":"WinTerminalP.SplitLeft","keys":"ctrl+f14"},
+            {"id":"WinTerminalP.SplitLeft","keys":"ctrl+f13"}
+        ]}"#;
+        let edit = merge_keybindings(source, &bindings).expect("analysis should complete");
+        assert!(edit.conflicts.is_empty());
+        assert!(edit.replacement.is_none());
+        let analysis = analyze_keybindings(source, &bindings).expect("analysis should complete");
+        assert_eq!(analysis.managed_binding_count, 1);
+
+        let source = br#"{"keybindings":[
+            {"id":"WinTerminalP.SplitLeft","keys":"ctrl+f15"},
+            {"id":"WinTerminalP.SplitLeft","keys":"ctrl+f16"}
+        ]}"#;
+        let edit = merge_keybindings(source, &bindings).expect("analysis should complete");
+        assert_eq!(
+            edit.conflicts
+                .iter()
+                .filter(|conflict| conflict.kind == ConflictKind::SameIdDifferentBinding)
+                .count(),
+            1
+        );
+
+        let source = br#"{"keybindings":[
+            {"id":"User.First","keys":"ctrl+f13"},
+            {"id":"User.Second","keys":"CTRL + F13"}
+        ]}"#;
+        let edit = merge_keybindings(source, &bindings).expect("analysis should complete");
+        let conflict = edit
+            .conflicts
+            .iter()
+            .find(|conflict| conflict.kind == ConflictKind::SameChordDifferentBinding)
+            .expect("chord conflict should be reported");
+        assert_eq!(
+            conflict.action_id.as_deref(),
+            Some("winterminalp.splitleft")
+        );
+        assert!(
+            conflict.message.contains("user.first"),
+            "message was: {}",
+            conflict.message
+        );
+        assert!(!conflict.message.contains("user.second"));
+    }
+
+    #[test]
+    fn removal_skips_unmanaged_junk_but_still_blocks_managed_malformed_entries() {
+        let records = [to_manifest_binding(&desired(
+            "WinTerminalP.SplitLeft",
+            "ctrl+f13",
+        ))];
+        let source =
+            br#"{"keybindings":[{"id":"User.Junk"},{"id":"WinTerminalP.SplitLeft","keys":"ctrl+f13"}]}"#;
+        let edit = remove_managed_keybindings(source, &records)
+            .expect("unmanaged junk must not block removal");
+        assert_eq!(edit.removed_binding_count, 1);
+        let replacement = edit.replacement.expect("one binding should be removed");
+        let text = std::str::from_utf8(&replacement).expect("result should be UTF-8");
+        assert!(text.contains("User.Junk"));
+        assert!(!text.contains("SplitLeft"));
+
+        let source = br#"{"keybindings":[{"id":"WinTerminalP.SplitLeft"}]}"#;
+        assert!(remove_managed_keybindings(source, &records).is_err());
     }
 }

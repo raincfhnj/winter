@@ -9,7 +9,7 @@
 | Windows Terminal | Stable 1.24.11911.0 |
 | 集成状态 | 已安装，`doctor.healthy = true` |
 | 托管绑定 | 29，冲突 0 |
-| 短命令 | `%CARGO_HOME%\bin\winter.exe`，已在 PATH |
+| 短命令 | 已确认 Cargo bin 目录在 PATH 上，可直接运行 `winter --help` |
 | 用户现有 Terminal | 保留；几何/步长探针均使用独立命名窗口并按精确 HWND 清理 |
 
 ## 1. 自动化质量门

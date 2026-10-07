@@ -22,8 +22,8 @@ use crate::{AppError, AppResult, TerminalChannel};
 
 pub use discovery::discover_targets;
 use jsonc::{
-    DesiredKeybinding, desired_keybinding, merge_keybindings, remove_managed_keybindings,
-    validate_desired_bindings,
+    DesiredKeybinding, analyze_keybindings, desired_keybinding, merge_keybindings,
+    remove_managed_keybindings, validate_desired_bindings,
 };
 use manifest::{
     FragmentManifest, IntegrationManifest, LoadedManifest, ManagedKeybindingManifest,
@@ -38,6 +38,7 @@ pub use types::*;
 struct FragmentPreparation {
     desired_value: Value,
     desired_bytes: Vec<u8>,
+    semantically_equal: bool,
     current: Option<FileSnapshot>,
     report: FragmentReport,
 }
@@ -93,6 +94,11 @@ pub fn plan(config: &IntegrationConfig) -> AppResult<PlanReport> {
 }
 
 /// Installs the action fragment and bridge keybindings using compare-and-swap writes.
+///
+/// A failure on one channel (unreadable or invalid settings, keybinding
+/// conflicts) is recorded on that target's report entry and never blocks the
+/// remaining channels; install only fails when the fragment step fails or
+/// every target fails.
 pub fn install(config: &IntegrationConfig) -> AppResult<InstallReport> {
     let desired = desired_keybindings()?;
     let targets = validated_targets(config)?;
@@ -111,26 +117,25 @@ pub fn install(config: &IntegrationConfig) -> AppResult<InstallReport> {
         ));
     }
 
-    // Preflight every channel before any file is written.
-    let mut preparations = Vec::with_capacity(targets.len());
-    let mut conflict_messages = Vec::new();
-    for target in targets {
-        let snapshot = read_snapshot(&target.settings_path)?;
-        let edit = merge_keybindings(&snapshot.bytes, &desired)
-            .map_err(|error| settings_context(&target.settings_path, error))?;
-        conflict_messages.extend(
-            edit.conflicts.iter().map(|conflict| {
-                format!("{}: {}", target.settings_path.display(), conflict.message)
-            }),
-        );
-        preparations.push(TargetPreparation {
-            target,
-            snapshot,
-            edit,
-        });
-    }
-    if !conflict_messages.is_empty() {
-        return Err(AppError::SettingsConflict(conflict_messages.join("; ")));
+    let preflight = targets
+        .into_iter()
+        .map(|target| preflight_target(&target, &desired))
+        .collect::<Vec<_>>();
+    let failed_reports = preflight
+        .iter()
+        .filter_map(|entry| match entry {
+            TargetPreflight::Failed(report) => Some(report),
+            TargetPreflight::Ready(_) => None,
+        })
+        .collect::<Vec<_>>();
+    if failed_reports.len() == preflight.len() && !preflight.is_empty() {
+        return Err(AppError::SettingsConflict(
+            failed_reports
+                .iter()
+                .filter_map(|report| report.message.clone())
+                .collect::<Vec<_>>()
+                .join("; "),
+        ));
     }
 
     let mut applied = Vec::new();
@@ -138,14 +143,17 @@ pub fn install(config: &IntegrationConfig) -> AppResult<InstallReport> {
         let mut next_manifest = loaded_manifest.manifest.clone();
         let installed_fragment_report =
             install_fragment(config, fragment, &mut next_manifest, &mut applied)?;
-        let mut target_reports = Vec::with_capacity(preparations.len());
-        for preparation in preparations {
-            target_reports.push(install_target(
-                config,
-                preparation,
-                &mut next_manifest,
-                &mut applied,
-            )?);
+        let mut target_reports = Vec::with_capacity(preflight.len());
+        for entry in preflight {
+            match entry {
+                TargetPreflight::Ready(preparation) => target_reports.push(install_target(
+                    config,
+                    preparation,
+                    &mut next_manifest,
+                    &mut applied,
+                )?),
+                TargetPreflight::Failed(report) => target_reports.push(report),
+            }
         }
 
         if next_manifest != loaded_manifest.manifest {
@@ -180,14 +188,72 @@ pub fn install(config: &IntegrationConfig) -> AppResult<InstallReport> {
     }
 }
 
+enum TargetPreflight {
+    Ready(TargetPreparation),
+    Failed(TargetInstallReport),
+}
+
+fn preflight_target(
+    target: &TerminalSettingsTarget,
+    desired: &[DesiredKeybinding],
+) -> TargetPreflight {
+    let failed = |status: ChangeStatus, before_sha256: Option<String>, message: String| {
+        let after_sha256 = before_sha256.clone();
+        TargetPreflight::Failed(TargetInstallReport {
+            channel: target.channel,
+            settings_path: target.settings_path.clone(),
+            status,
+            added_binding_count: 0,
+            backup_path: None,
+            before_sha256,
+            after_sha256,
+            message: Some(message),
+        })
+    };
+    let snapshot = match read_snapshot(&target.settings_path) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return failed(ChangeStatus::Skipped, None, error.to_string()),
+    };
+    let before_sha256 = Some(snapshot.sha256.clone());
+    let edit = match merge_keybindings(&snapshot.bytes, desired) {
+        Ok(edit) => edit,
+        Err(error) => {
+            let error = settings_context(&target.settings_path, error);
+            return failed(ChangeStatus::Conflict, before_sha256, error.to_string());
+        }
+    };
+    if !edit.conflicts.is_empty() {
+        return failed(
+            ChangeStatus::Conflict,
+            before_sha256,
+            format!(
+                "{}: {}",
+                target.settings_path.display(),
+                edit.conflicts
+                    .iter()
+                    .map(|conflict| conflict.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        );
+    }
+    TargetPreflight::Ready(TargetPreparation {
+        target: target.clone(),
+        snapshot,
+        edit,
+    })
+}
+
 /// Removes only definitions that still semantically match the installation manifest.
+///
+/// Pre-flight validates every read-only decision before any file is mutated;
+/// unexpected mid-execution failures are persisted to the manifest and reported
+/// through `issues` instead of aborting halfway. `Err` is reserved for
+/// pre-flight and manifest-persistence failures.
 pub fn uninstall(config: &IntegrationConfig) -> AppResult<UninstallReport> {
     let loaded = load_manifest(&config.manifest_path())?;
-    // Shell cleanup is independent of the Terminal manifest, but it runs only
-    // after the manifest loads so a corrupt manifest cannot leave a half-undone
-    // uninstall that reported failure.
-    let shell_integration = shell::uninstall(config);
     if loaded.sha256.is_none() {
+        let shell_integration = shell::uninstall(config);
         return Ok(UninstallReport {
             schema_version: INTEGRATION_SCHEMA_VERSION,
             fragment_status: ChangeStatus::Missing,
@@ -195,18 +261,72 @@ pub fn uninstall(config: &IntegrationConfig) -> AppResult<UninstallReport> {
             shell_integration,
             manifest_path: config.manifest_path(),
             manifest_retained: false,
+            issues: Vec::new(),
         });
     }
 
-    let mut retained_manifest = IntegrationManifest::default();
-    let fragment_status = uninstall_fragment(config, &loaded.manifest, &mut retained_manifest)?;
-    let mut target_reports = Vec::with_capacity(loaded.manifest.targets.len());
+    let fragment_plan = plan_uninstall_fragment(&loaded.manifest)?;
+    let mut target_plans = Vec::with_capacity(loaded.manifest.targets.len());
     for target in &loaded.manifest.targets {
-        let (report, retained) = uninstall_target(config, target)?;
-        if let Some(retained) = retained {
-            retained_manifest.targets.push(retained);
+        target_plans.push(plan_uninstall_target(target)?);
+    }
+
+    let shell_integration = shell::uninstall(config);
+    let mut retained_manifest = IntegrationManifest::default();
+    let mut issues = Vec::new();
+
+    let fragment_status = match execute_uninstall_fragment(
+        config,
+        &loaded.manifest,
+        fragment_plan,
+        &mut retained_manifest,
+    ) {
+        Ok(status) => status,
+        Err(error) => {
+            retained_manifest.fragment = loaded.manifest.fragment.clone();
+            issues.push(format!("action fragment: {error}"));
+            ChangeStatus::Skipped
         }
-        target_reports.push(report);
+    };
+
+    let mut target_reports = Vec::with_capacity(loaded.manifest.targets.len());
+    for (target, plan) in loaded.manifest.targets.iter().zip(target_plans) {
+        let executed = match plan {
+            Some(plan) => execute_uninstall_target(config, target, plan),
+            None => Ok((
+                TargetUninstallReport {
+                    channel: target.channel,
+                    settings_path: target.settings_path.clone(),
+                    status: ChangeStatus::Missing,
+                    removed_binding_count: 0,
+                    preserved_binding_count: 0,
+                    backup_path: None,
+                    message: None,
+                },
+                None,
+            )),
+        };
+        match executed {
+            Ok((report, retained)) => {
+                if let Some(retained) = retained {
+                    retained_manifest.targets.push(retained);
+                }
+                target_reports.push(report);
+            }
+            Err(error) => {
+                issues.push(format!("{}: {error}", target.settings_path.display()));
+                retained_manifest.targets.push(target.clone());
+                target_reports.push(TargetUninstallReport {
+                    channel: target.channel,
+                    settings_path: target.settings_path.clone(),
+                    status: ChangeStatus::Skipped,
+                    removed_binding_count: 0,
+                    preserved_binding_count: 0,
+                    backup_path: None,
+                    message: Some(error.to_string()),
+                });
+            }
+        }
     }
 
     let manifest_retained =
@@ -228,6 +348,7 @@ pub fn uninstall(config: &IntegrationConfig) -> AppResult<UninstallReport> {
         shell_integration,
         manifest_path: config.manifest_path(),
         manifest_retained,
+        issues,
     })
 }
 
@@ -251,7 +372,7 @@ pub fn doctor(config: &IntegrationConfig) -> AppResult<DoctorReport> {
     for recorded in &loaded_manifest.manifest.targets {
         if !targets
             .iter()
-            .any(|target| target.settings_path == recorded.settings_path)
+            .any(|target| path_key(&target.settings_path) == path_key(&recorded.settings_path))
         {
             targets.push(TerminalSettingsTarget {
                 channel: recorded.channel,
@@ -284,24 +405,29 @@ pub fn doctor(config: &IntegrationConfig) -> AppResult<DoctorReport> {
     let mut target_reports = Vec::with_capacity(targets.len());
     for target in targets {
         match read_optional_snapshot(&target.settings_path) {
-            Ok(Some(snapshot)) => match merge_keybindings(&snapshot.bytes, &desired) {
-                Ok(edit) => {
-                    if !edit.conflicts.is_empty() {
+            Ok(Some(snapshot)) => match analyze_keybindings(&snapshot.bytes, &desired) {
+                Ok(analysis) => {
+                    if !analysis.conflicts.is_empty() {
                         issues.push(format!(
                             "{} has {} integration conflict(s)",
                             target.settings_path.display(),
-                            edit.conflicts.len()
+                            analysis.conflicts.len()
                         ));
                     }
+                    let warnings = analysis.warnings;
                     target_reports.push(DoctorTargetReport {
                         channel: target.channel,
                         settings_path: target.settings_path,
                         initialized: true,
                         readable: true,
                         valid_jsonc: true,
-                        managed_binding_count: edit.matching_binding_count,
-                        conflicts: edit.conflicts,
-                        message: None,
+                        managed_binding_count: analysis.managed_binding_count,
+                        conflicts: analysis.conflicts,
+                        message: if warnings.is_empty() {
+                            None
+                        } else {
+                            Some(warnings.join("; "))
+                        },
                     });
                 }
                 Err(error) => {
@@ -416,7 +542,7 @@ fn prepare_fragment(
     let owned = manifest
         .fragment
         .as_ref()
-        .filter(|record| record.path == path)
+        .filter(|record| path_key(&record.path) == path_key(&path))
         .filter(|record| {
             current
                 .as_ref()
@@ -449,6 +575,7 @@ fn prepare_fragment(
     Ok(FragmentPreparation {
         desired_value,
         desired_bytes,
+        semantically_equal,
         current,
         report,
     })
@@ -492,14 +619,25 @@ fn install_fragment(
             report.current_sha256 = Some(installed_sha256);
         }
         ChangeStatus::Unchanged => {
-            let current_hash = preparation
+            let current_sha256 = preparation
                 .current
                 .as_ref()
                 .map(|current| current.sha256.clone());
-            // Adopt nothing that existed independently; carry ownership only when the old manifest proves it.
-            manifest.fragment = old_record.filter(|record| {
-                record.path == report.path
-                    && current_hash.as_deref() == Some(record.installed_sha256.as_str())
+            manifest.fragment = old_record.and_then(|mut record| {
+                if path_key(&record.path) != path_key(&report.path) {
+                    return None;
+                }
+                let hash_matches =
+                    current_sha256.as_deref() == Some(record.installed_sha256.as_str());
+                if !hash_matches && !preparation.semantically_equal {
+                    return None;
+                }
+                if !hash_matches {
+                    if let Some(current_sha256) = current_sha256 {
+                        record.installed_sha256 = current_sha256;
+                    }
+                }
+                Some(record)
             });
         }
         ChangeStatus::Conflict => {
@@ -516,7 +654,6 @@ fn install_fragment(
             ));
         }
     }
-    // Keep the generated semantic value alive as an explicit validation artifact.
     debug_assert!(!contains_forbidden_keybinding_field(
         &preparation.desired_value
     ));
@@ -531,25 +668,25 @@ fn plan_target(
     let old_managed_count = manifest
         .targets
         .iter()
-        .find(|record| record.settings_path == target.settings_path)
+        .find(|record| path_key(&record.settings_path) == path_key(&target.settings_path))
         .map_or(0, |record| record.managed_keybindings.len());
     match read_snapshot(&target.settings_path)
-        .and_then(|snapshot| merge_keybindings(&snapshot.bytes, desired))
+        .and_then(|snapshot| analyze_keybindings(&snapshot.bytes, desired))
     {
-        Ok(edit) => TargetPlan {
+        Ok(analysis) => TargetPlan {
             channel: target.channel,
             settings_path: target.settings_path.clone(),
-            status: if !edit.conflicts.is_empty() {
+            status: if !analysis.conflicts.is_empty() {
                 ChangeStatus::Conflict
-            } else if edit.additions.is_empty() {
+            } else if analysis.bindings_to_add == 0 {
                 ChangeStatus::Unchanged
             } else {
                 ChangeStatus::Update
             },
-            existing_binding_count: edit.existing_binding_count,
-            bindings_to_add: edit.additions.len(),
-            managed_binding_count: edit.matching_binding_count.max(old_managed_count),
-            conflicts: edit.conflicts,
+            existing_binding_count: analysis.existing_binding_count,
+            bindings_to_add: analysis.bindings_to_add,
+            managed_binding_count: analysis.managed_binding_count.max(old_managed_count),
+            conflicts: analysis.conflicts,
         },
         Err(error) => TargetPlan {
             channel: target.channel,
@@ -577,7 +714,9 @@ fn install_target(
     let old_record = manifest
         .targets
         .iter()
-        .find(|record| record.settings_path == preparation.target.settings_path)
+        .find(|record| {
+            path_key(&record.settings_path) == path_key(&preparation.target.settings_path)
+        })
         .cloned();
     let before_sha256 = preparation.snapshot.sha256.clone();
     let mut backup_path = None;
@@ -611,9 +750,9 @@ fn install_target(
         .map_or_else(Vec::new, |record| record.managed_keybindings.clone());
     owned.extend(preparation.edit.additions.iter().cloned());
     deduplicate_managed_records(&mut owned);
-    manifest
-        .targets
-        .retain(|record| record.settings_path != preparation.target.settings_path);
+    manifest.targets.retain(|record| {
+        path_key(&record.settings_path) != path_key(&preparation.target.settings_path)
+    });
     if !owned.is_empty() {
         let backup = new_backup
             .or_else(|| old_record.as_ref().map(|record| record.backup.clone()))
@@ -637,8 +776,9 @@ fn install_target(
         status,
         added_binding_count: preparation.edit.additions.len(),
         backup_path,
-        before_sha256,
-        after_sha256,
+        before_sha256: Some(before_sha256),
+        after_sha256: Some(after_sha256),
+        message: None,
     })
 }
 
@@ -656,13 +796,12 @@ fn apply_install_change(
             Ok(installed_sha256)
         }
         Err(error) => {
-            // `atomic_replace` verifies after MoveFileExW. If only that read-back failed,
-            // register the applied bytes so the outer transaction still restores them.
-            if read_optional_snapshot(path)
-                .ok()
-                .flatten()
-                .is_some_and(|snapshot| snapshot.sha256 == replacement_sha256)
-            {
+            let applied_state = match read_optional_snapshot(path) {
+                Ok(None) => false,
+                Ok(Some(snapshot)) => snapshot.sha256 == replacement_sha256,
+                Err(_) => true,
+            };
+            if applied_state {
                 applied.push(undo_operation(path, before, replacement_sha256));
             }
             Err(error)
@@ -741,54 +880,77 @@ fn run_before_target_write_hook(path: &Path) {
 #[cfg(not(test))]
 fn run_before_target_write_hook(_path: &Path) {}
 
-fn uninstall_fragment(
+enum FragmentUninstallPlan {
+    Missing,
+    Preserved,
+    Remove(FileSnapshot),
+}
+
+fn plan_uninstall_fragment(manifest: &IntegrationManifest) -> AppResult<FragmentUninstallPlan> {
+    let Some(fragment) = manifest.fragment.as_ref() else {
+        return Ok(FragmentUninstallPlan::Missing);
+    };
+    let Some(snapshot) = read_optional_snapshot(&fragment.path)? else {
+        return Ok(FragmentUninstallPlan::Missing);
+    };
+    if snapshot.sha256 != fragment.installed_sha256 {
+        return Ok(FragmentUninstallPlan::Preserved);
+    }
+    Ok(FragmentUninstallPlan::Remove(snapshot))
+}
+
+fn execute_uninstall_fragment(
     config: &IntegrationConfig,
     installed: &IntegrationManifest,
+    plan: FragmentUninstallPlan,
     retained: &mut IntegrationManifest,
 ) -> AppResult<ChangeStatus> {
     let Some(fragment) = installed.fragment.as_ref() else {
         return Ok(ChangeStatus::Missing);
     };
-    let Some(snapshot) = read_optional_snapshot(&fragment.path)? else {
-        return Ok(ChangeStatus::Missing);
-    };
-    if snapshot.sha256 != fragment.installed_sha256 {
-        retained.fragment = Some(fragment.clone());
-        return Ok(ChangeStatus::Preserved);
-    }
-    create_backup(
-        &config.state_dir,
-        "fragment-uninstall",
-        &fragment.path,
-        &snapshot,
-    )?;
-    if remove_if_hash(&fragment.path, &fragment.installed_sha256)? {
-        Ok(ChangeStatus::Removed)
-    } else {
-        retained.fragment = Some(fragment.clone());
-        Ok(ChangeStatus::Preserved)
+    match plan {
+        FragmentUninstallPlan::Missing => Ok(ChangeStatus::Missing),
+        FragmentUninstallPlan::Preserved => {
+            retained.fragment = Some(fragment.clone());
+            Ok(ChangeStatus::Preserved)
+        }
+        FragmentUninstallPlan::Remove(snapshot) => {
+            create_backup(
+                &config.state_dir,
+                "fragment-uninstall",
+                &fragment.path,
+                &snapshot,
+            )?;
+            if remove_if_hash(&fragment.path, &fragment.installed_sha256)? {
+                Ok(ChangeStatus::Removed)
+            } else {
+                retained.fragment = Some(fragment.clone());
+                Ok(ChangeStatus::Preserved)
+            }
+        }
     }
 }
 
-fn uninstall_target(
-    config: &IntegrationConfig,
-    installed: &TargetManifest,
-) -> AppResult<(TargetUninstallReport, Option<TargetManifest>)> {
+struct TargetUninstallPlan {
+    snapshot: FileSnapshot,
+    edit: jsonc::RemovalEdit,
+}
+
+fn plan_uninstall_target(installed: &TargetManifest) -> AppResult<Option<TargetUninstallPlan>> {
     let Some(snapshot) = read_optional_snapshot(&installed.settings_path)? else {
-        return Ok((
-            TargetUninstallReport {
-                channel: installed.channel,
-                settings_path: installed.settings_path.clone(),
-                status: ChangeStatus::Missing,
-                removed_binding_count: 0,
-                preserved_binding_count: 0,
-                backup_path: None,
-            },
-            None,
-        ));
+        return Ok(None);
     };
     let edit = remove_managed_keybindings(&snapshot.bytes, &installed.managed_keybindings)
         .map_err(|error| settings_context(&installed.settings_path, error))?;
+    Ok(Some(TargetUninstallPlan { snapshot, edit }))
+}
+
+fn execute_uninstall_target(
+    config: &IntegrationConfig,
+    installed: &TargetManifest,
+    plan: TargetUninstallPlan,
+) -> AppResult<(TargetUninstallReport, Option<TargetManifest>)> {
+    let TargetUninstallPlan { snapshot, edit } = plan;
     let mut backup_path = None;
     let mut after_sha256 = snapshot.sha256.clone();
     if let Some(replacement) = edit.replacement.as_ref() {
@@ -799,6 +961,7 @@ fn uninstall_target(
             &snapshot,
         )?;
         backup_path = Some(backup.backup_path.clone());
+        run_before_target_write_hook(&installed.settings_path);
         after_sha256 = atomic_replace(
             &installed.settings_path,
             Some(&snapshot.sha256),
@@ -831,6 +994,7 @@ fn uninstall_target(
             removed_binding_count: edit.removed_binding_count,
             preserved_binding_count: edit.preserved_binding_count,
             backup_path,
+            message: None,
         },
         retained,
     ))
@@ -838,16 +1002,21 @@ fn uninstall_target(
 
 fn validated_targets(config: &IntegrationConfig) -> AppResult<Vec<TerminalSettingsTarget>> {
     let targets = discover_targets(config);
+    ensure_distinct_targets(&targets)?;
+    Ok(targets)
+}
+
+fn ensure_distinct_targets(targets: &[TerminalSettingsTarget]) -> AppResult<()> {
     let mut paths = HashSet::new();
-    for target in &targets {
-        if !paths.insert(target.settings_path.clone()) {
+    for target in targets {
+        if !paths.insert(path_key(&target.settings_path)) {
             return Err(AppError::InvalidConfiguration(format!(
                 "duplicate Windows Terminal settings target {}",
                 target.settings_path.display()
             )));
         }
     }
-    Ok(targets)
+    Ok(())
 }
 
 fn parse_fragment_value(raw: &[u8]) -> AppResult<Value> {
@@ -1103,5 +1272,411 @@ mod tests {
         );
         assert!(!config.fragment_path().exists());
         assert!(!config.manifest_path().exists());
+    }
+
+    fn read_manifest_value(config: &IntegrationConfig) -> Value {
+        let bytes = fs::read(config.manifest_path()).expect("manifest should be readable");
+        serde_json::from_slice(&bytes).expect("manifest should be valid JSON")
+    }
+
+    #[test]
+    fn install_retains_fragment_ownership_after_an_external_semantic_rewrite() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        stable_settings(temp.path(), b"{}\n");
+        let config = IntegrationConfig::new(
+            temp.path(),
+            temp.path().join("state"),
+            temp.path().join("documents"),
+        );
+        install(&config).expect("first install should succeed");
+
+        let fragment_path = config.fragment_path();
+        let original = fs::read(&fragment_path).expect("fragment should be readable");
+        let value: Value = serde_json::from_slice(&original).expect("fragment should parse");
+        let rewritten = serde_json::to_vec(&value).expect("fragment should serialize");
+        assert_ne!(rewritten, original, "rewrite must change the byte hash");
+        fs::write(&fragment_path, &rewritten).expect("external rewrite should be written");
+
+        let second = install(&config).expect("second install should succeed");
+        assert_eq!(second.fragment.status, ChangeStatus::Unchanged);
+
+        let manifest = read_manifest_value(&config);
+        assert!(
+            manifest["fragment"].is_object(),
+            "fragment ownership record must survive an external semantic rewrite"
+        );
+        assert_eq!(
+            manifest["fragment"]["installedSha256"],
+            json!(sha256_hex(&rewritten))
+        );
+
+        let report = uninstall(&config).expect("uninstall should succeed");
+        assert_eq!(report.fragment_status, ChangeStatus::Removed);
+        assert!(!fragment_path.exists(), "uninstall should remove the file");
+        assert!(!config.manifest_path().exists());
+    }
+
+    #[test]
+    fn install_never_adopts_a_preexisting_unmanaged_fragment() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        stable_settings(temp.path(), b"{}\n");
+        let config = IntegrationConfig::new(
+            temp.path(),
+            temp.path().join("state"),
+            temp.path().join("documents"),
+        );
+        let (_, desired_bytes) = desired_fragment().expect("fragment should be generated");
+        fs::create_dir_all(
+            config
+                .fragment_path()
+                .parent()
+                .expect("fragment should have a parent"),
+        )
+        .expect("fragment directory should be created");
+        fs::write(config.fragment_path(), &desired_bytes)
+            .expect("pre-existing identical fragment should be written");
+
+        let report = install(&config).expect("install should succeed");
+        assert_eq!(report.fragment.status, ChangeStatus::Unchanged);
+
+        let manifest = read_manifest_value(&config);
+        assert!(
+            manifest["fragment"].is_null(),
+            "an independently created fragment must never be adopted"
+        );
+
+        let uninstall_report = uninstall(&config).expect("uninstall should succeed");
+        assert_eq!(uninstall_report.fragment_status, ChangeStatus::Missing);
+        assert!(
+            config.fragment_path().exists(),
+            "a never-managed fragment must be left in place"
+        );
+    }
+
+    #[test]
+    fn install_continues_when_one_target_settings_are_invalid() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let stable_path = channel_settings(
+            temp.path(),
+            "Microsoft.WindowsTerminal_8wekyb3d8bbwe",
+            b"{\r\n  // stable user bytes\r\n}\r\n",
+        );
+        let preview_original = b"{ this is not valid jsonc\n";
+        let preview_path = channel_settings(
+            temp.path(),
+            "Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe",
+            preview_original,
+        );
+        let config = IntegrationConfig::new(
+            temp.path(),
+            temp.path().join("state"),
+            temp.path().join("documents"),
+        );
+
+        let report = install(&config).expect("one broken target must not abort the install");
+
+        assert_eq!(report.targets.len(), 2);
+        let stable = report
+            .targets
+            .iter()
+            .find(|target| target.channel == TerminalChannel::Stable)
+            .expect("stable target should be reported");
+        assert_eq!(stable.status, ChangeStatus::Update);
+        assert_eq!(stable.added_binding_count, managed_bindings().len());
+        assert!(stable.message.is_none());
+        assert!(stable.before_sha256.is_some());
+        let preview = report
+            .targets
+            .iter()
+            .find(|target| target.channel == TerminalChannel::Preview)
+            .expect("preview target should be reported");
+        assert_eq!(preview.status, ChangeStatus::Conflict);
+        assert!(preview.message.is_some());
+        assert_eq!(preview.added_binding_count, 0);
+
+        let stable_text = fs::read_to_string(&stable_path).expect("stable should be readable");
+        assert!(stable_text.contains("User.WinTerminalP."));
+        assert_eq!(
+            fs::read(&preview_path).expect("preview should remain readable"),
+            preview_original,
+            "the failing target must not be modified"
+        );
+        assert!(config.fragment_path().is_file());
+        let manifest = read_manifest_value(&config);
+        assert_eq!(
+            manifest["targets"]
+                .as_array()
+                .expect("targets should be an array")
+                .len(),
+            1,
+            "only the healthy target should be recorded"
+        );
+    }
+
+    #[test]
+    fn install_fails_without_writes_when_every_target_fails() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let settings_path = stable_settings(temp.path(), b"{ this is not valid jsonc\n");
+        let config = IntegrationConfig::new(
+            temp.path(),
+            temp.path().join("state"),
+            temp.path().join("documents"),
+        );
+        let before = fs::read(&settings_path).expect("settings should be readable");
+
+        let result = install(&config);
+
+        assert!(matches!(result, Err(AppError::SettingsConflict(_))));
+        assert_eq!(
+            fs::read(settings_path).expect("settings should remain readable"),
+            before
+        );
+        assert!(!config.fragment_path().exists());
+        assert!(!config.manifest_path().exists());
+    }
+
+    #[test]
+    fn uninstall_persists_progress_when_a_target_fails_midway() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let stable_path = channel_settings(
+            temp.path(),
+            "Microsoft.WindowsTerminal_8wekyb3d8bbwe",
+            b"{\r\n  // stable user bytes\r\n}\r\n",
+        );
+        let preview_path = channel_settings(
+            temp.path(),
+            "Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe",
+            b"{\n  // preview user bytes\n}\n",
+        );
+        let config = IntegrationConfig::new(
+            temp.path(),
+            temp.path().join("state"),
+            temp.path().join("documents"),
+        );
+        install(&config).expect("install should succeed");
+
+        let failing_path_for_callback = preview_path.clone();
+        BEFORE_TARGET_WRITE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |path| {
+                if path_key(path) == path_key(&failing_path_for_callback) {
+                    let mut bytes = fs::read(path).expect("concurrent fixture should be readable");
+                    bytes.extend_from_slice(b"\n// concurrent edit\n");
+                    fs::write(path, bytes).expect("concurrent fixture change should be written");
+                }
+            }));
+        });
+        let result = uninstall(&config);
+        BEFORE_TARGET_WRITE_HOOK.with(|hook| *hook.borrow_mut() = None);
+
+        let report = result.expect("mid-way failure must be reported, not returned as Err");
+        assert_eq!(report.targets.len(), 2);
+        assert_eq!(report.fragment_status, ChangeStatus::Removed);
+        assert!(!config.fragment_path().exists());
+        assert!(report.manifest_retained);
+        assert!(
+            !report.issues.is_empty(),
+            "the failed step must be described in issues"
+        );
+
+        let stable_report = report
+            .targets
+            .iter()
+            .find(|target| target.channel == TerminalChannel::Stable)
+            .expect("stable target should be reported");
+        assert_eq!(stable_report.status, ChangeStatus::Removed);
+        let preview_report = report
+            .targets
+            .iter()
+            .find(|target| target.channel == TerminalChannel::Preview)
+            .expect("preview target should be reported");
+        assert_eq!(preview_report.status, ChangeStatus::Skipped);
+        assert!(preview_report.message.is_some());
+
+        let stable_text = fs::read_to_string(&stable_path).expect("stable should be readable");
+        assert!(
+            !stable_text.contains("User.WinTerminalP."),
+            "the earlier removal must be persisted"
+        );
+        let preview_text = fs::read_to_string(&preview_path).expect("preview should be readable");
+        assert!(
+            preview_text.contains("User.WinTerminalP."),
+            "the failed target must keep its bindings"
+        );
+
+        let manifest = read_manifest_value(&config);
+        assert!(
+            manifest["fragment"].is_null(),
+            "fragment removal must persist"
+        );
+        let retained = manifest["targets"]
+            .as_array()
+            .expect("targets should be an array");
+        assert_eq!(retained.len(), 1, "only the failed target must be retained");
+        assert_eq!(
+            path_key(Path::new(
+                retained[0]["settingsPath"]
+                    .as_str()
+                    .expect("settingsPath should be a string")
+            )),
+            path_key(&preview_path)
+        );
+    }
+
+    #[test]
+    fn uninstall_pre_flight_failure_mutates_nothing() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let stable_path = channel_settings(
+            temp.path(),
+            "Microsoft.WindowsTerminal_8wekyb3d8bbwe",
+            b"{\r\n  // stable user bytes\r\n}\r\n",
+        );
+        let preview_path = channel_settings(
+            temp.path(),
+            "Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe",
+            b"{\n  // preview user bytes\n}\n",
+        );
+        let config = IntegrationConfig::new(
+            temp.path(),
+            temp.path().join("state"),
+            temp.path().join("documents"),
+        );
+        install(&config).expect("install should succeed");
+        let manifest_before =
+            fs::read(config.manifest_path()).expect("manifest should be readable");
+        fs::write(&preview_path, b"{ this is not valid jsonc\n")
+            .expect("corrupt fixture should be written");
+
+        let result = uninstall(&config);
+
+        assert!(
+            matches!(
+                result,
+                Err(AppError::Settings { .. } | AppError::SettingsConflict(_))
+            ),
+            "a predictable pre-flight error must abort the uninstall"
+        );
+        assert!(
+            config.fragment_path().is_file(),
+            "the fragment must survive an aborted pre-flight"
+        );
+        assert_eq!(
+            fs::read(config.manifest_path()).expect("manifest should be readable"),
+            manifest_before,
+            "the manifest must be untouched after an aborted pre-flight"
+        );
+        let stable_text = fs::read_to_string(&stable_path).expect("stable should be readable");
+        assert!(
+            stable_text.contains("User.WinTerminalP."),
+            "no target may be mutated before pre-flight succeeds"
+        );
+    }
+
+    #[test]
+    fn path_key_is_case_and_separator_insensitive() {
+        assert_eq!(
+            path_key(Path::new(r"C:\Users\Me\AppData\Local")),
+            path_key(Path::new(r"c:\users\me\appdata\LOCAL"))
+        );
+        assert_eq!(
+            path_key(Path::new("C:/Users/Me/AppData")),
+            path_key(Path::new(r"C:\Users\Me\AppData"))
+        );
+        assert_eq!(
+            path_key(Path::new(r"\\?\C:\Temp\file.json")),
+            path_key(Path::new(r"c:\temp\FILE.json"))
+        );
+        assert_ne!(
+            path_key(Path::new(r"C:\Temp\a.json")),
+            path_key(Path::new(r"C:\Temp\b.json"))
+        );
+    }
+
+    #[test]
+    fn duplicate_targets_differing_only_by_case_are_rejected() {
+        let targets = vec![
+            TerminalSettingsTarget {
+                channel: TerminalChannel::Stable,
+                settings_path: PathBuf::from(r"C:\Users\Me\settings.json"),
+            },
+            TerminalSettingsTarget {
+                channel: TerminalChannel::Preview,
+                settings_path: PathBuf::from(r"c:\users\me\SETTINGS.JSON"),
+            },
+        ];
+        let error =
+            ensure_distinct_targets(&targets).expect_err("case-only duplicates must be rejected");
+        assert!(matches!(error, AppError::InvalidConfiguration(_)));
+    }
+
+    #[test]
+    fn ownership_survives_a_localappdata_casing_change() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        stable_settings(temp.path(), b"{}\n");
+        let config = IntegrationConfig::new(
+            temp.path(),
+            temp.path().join("state"),
+            temp.path().join("documents"),
+        );
+        install(&config).expect("first install should succeed");
+
+        let manifest_path = config.manifest_path();
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).expect("manifest should be readable"))
+                .expect("manifest should parse");
+        manifest["fragment"]["path"] = Value::String(
+            manifest["fragment"]["path"]
+                .as_str()
+                .unwrap()
+                .to_uppercase(),
+        );
+        for record in manifest["targets"].as_array_mut().expect("targets array") {
+            record["settingsPath"] =
+                Value::String(record["settingsPath"].as_str().unwrap().to_uppercase());
+        }
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("manifest should serialize"),
+        )
+        .expect("re-cased manifest should be written");
+
+        let second = install(&config).expect("install after casing change should succeed");
+        assert_eq!(second.fragment.status, ChangeStatus::Unchanged);
+
+        let saved = read_manifest_value(&config);
+        assert!(
+            saved["fragment"].is_object(),
+            "fragment ownership must survive a casing change"
+        );
+        assert_eq!(
+            saved["targets"]
+                .as_array()
+                .expect("targets should be an array")
+                .len(),
+            1,
+            "target ownership must survive a casing change"
+        );
+
+        let report = uninstall(&config).expect("uninstall should succeed");
+        assert_eq!(report.fragment_status, ChangeStatus::Removed);
+        assert_eq!(report.targets[0].status, ChangeStatus::Removed);
+        assert!(!config.fragment_path().exists());
+        assert!(!config.manifest_path().exists());
+    }
+
+    #[test]
+    fn undo_registration_is_conservative_when_the_state_cannot_be_read() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let path = temp.path().join("unreadable-as-file");
+        fs::create_dir(&path).expect("directory fixture should be created");
+        let mut applied = Vec::new();
+
+        let result = apply_install_change(&path, None, b"{}", &mut applied);
+
+        assert!(result.is_err());
+        assert_eq!(
+            applied.len(),
+            1,
+            "an unknown applied state must still register an undo operation"
+        );
     }
 }

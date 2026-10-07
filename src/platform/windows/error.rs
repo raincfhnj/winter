@@ -49,6 +49,9 @@ pub enum PlatformError {
     #[error("the low-level input hook thread panicked")]
     HookThreadPanicked,
 
+    #[error("the low-level input hook thread did not exit within the shutdown timeout")]
+    HookShutdownTimeout,
+
     #[error(
         "the target window is not the foreground window (expected {expected:#x}, actual {actual:#x})"
     )]
@@ -65,6 +68,11 @@ pub enum PlatformError {
 
     #[error("unexpected physical {0} modifier is held; refusing to alter user keyboard state")]
     UnexpectedModifierHeld(ModifierKey),
+
+    #[error(
+        "expected physical {0} modifier is no longer held; keyboard state changed before injection"
+    )]
+    ModifierReleased(ModifierKey),
 
     #[error("target key (virtual key {0:#x}) is already physically held")]
     TargetKeyHeld(u16),

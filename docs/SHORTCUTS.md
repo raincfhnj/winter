@@ -86,7 +86,7 @@ winter
 规则：
 
 - Prefix 必须包含 `ctrl` 或 `alt`，避免普通输入被拦截。
-- `Escape`、`Alt+Tab`、`Alt+F4`、`Ctrl+Escape` 和 Windows 键组合不能绑定。
+- `Escape`、`Alt+Tab`、`Ctrl+Tab`、`Ctrl+Shift+Tab`、`Alt+F4`、`Alt+Escape`、`Ctrl+Escape`、`Ctrl+Shift+T`、`Ctrl+Shift+W` 和 Windows 键组合不能绑定。
 - 两个动作不能使用同一 chord；启动时会报告冲突动作名。
 - 可把非必要动作设为 `"disabled"`；`shutdown` 必须保留一个键位。
 - 用户快捷键只改变 Rust Prefix 映射，不修改隐藏 Action Bridge，因此无需重新执行 `winter install`。

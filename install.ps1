@@ -4,15 +4,25 @@
 
 .DESCRIPTION
     Builds the release binaries, installs the `winter` command into the Cargo
-    bin directory (which is already on PATH), and installs the Windows Terminal
-    integration. Run this once after cloning. Afterwards `winter` works from any
-    shell and keeps working across reboots.
+    bin directory, and installs the Windows Terminal integration. Run this once
+    after cloning. Afterwards `winter` works from any shell and keeps working
+    across reboots.
+
+    The script never edits the persisted (User/Machine) PATH: it only reloads
+    it into the current process so the freshly installed binaries can be
+    located, and warns when the install directory is not persisted.
 
 .EXAMPLE
     PS> .\install.ps1
 #>
 [CmdletBinding()]
 param()
+
+Set-StrictMode -Version Latest
+# Keep native-command exit codes observable through $LASTEXITCODE instead of
+# turning them into errors, so the friendly `throw`s below keep working under
+# PowerShell 7.3+ profiles that set $ErrorActionPreference = 'Stop'.
+$PSNativeCommandUseErrorActionPreference = $false
 
 $ErrorActionPreference = 'Stop'
 
@@ -33,14 +43,49 @@ finally {
     Pop-Location
 }
 
-$cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
-$winterExe = Join-Path $cargoBin 'winter.exe'
-if (-not (Test-Path -LiteralPath $winterExe)) {
-    throw "winter.exe was not found in $cargoBin"
+# This shell may have started before the Cargo bin directory was persisted to
+# PATH; reload the persisted User+Machine PATH into this process so the fresh
+# install can be located. The persisted PATH itself is never modified.
+$persistedUserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+$persistedMachinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+$env:Path = (@($env:Path, $persistedUserPath, $persistedMachinePath) | Where-Object { $_ }) -join ';'
+
+$winterCommand = Get-Command winter.exe -ErrorAction SilentlyContinue
+$winterExe = if ($winterCommand) { $winterCommand.Source } else { $null }
+
+if (-not $winterExe) {
+    # PATH lookup failed; fall back to cargo's own install list plus the
+    # directory that hosts the cargo executable.
+    $installedBins = @(cargo install --list 2>$null) | ForEach-Object { "$_".Trim() }
+    $cargoCommand = Get-Command cargo -ErrorAction SilentlyContinue
+    if ($cargoCommand) {
+        $winterCandidate = Join-Path (Split-Path -Parent $cargoCommand.Source) 'winter.exe'
+        if (($installedBins -contains 'winter.exe') -and (Test-Path -LiteralPath $winterCandidate)) {
+            $winterExe = $winterCandidate
+        }
+    }
 }
 
-if (($env:Path -split ';') -notcontains $cargoBin) {
-    Write-Warning "$cargoBin is not on your PATH. Add it and restart your shell before running 'winter'."
+if (-not $winterExe) {
+    throw "winter.exe was not found. Ensure the Cargo bin directory is on PATH, then re-run '.\install.ps1'."
+}
+
+# Without winterd.exe, `winter launch` falls back to a foreground controller
+# and the hidden background daemon silently degrades; treat that as an error.
+$winterdExe = Join-Path (Split-Path -Parent $winterExe) 'winterd.exe'
+if (-not (Test-Path -LiteralPath $winterdExe)) {
+    throw "winterd.exe was not found next to $winterExe; the hidden background controller would silently degrade. Re-run '.\install.ps1' or 'cargo install --path . --bins --locked --force'."
+}
+
+# Warn when the install directory is missing from the persisted PATH (User or
+# Machine), so new shells will still be able to run 'winter'.
+$winterDir = (Split-Path -Parent $winterExe).TrimEnd('\')
+$pathEntries = @($persistedUserPath, $persistedMachinePath) |
+    Where-Object { $_ } |
+    ForEach-Object { $_ -split ';' } |
+    ForEach-Object { $_.Trim().TrimEnd('\') }
+if ($pathEntries -notcontains $winterDir) {
+    Write-Warning "$winterDir is not on your persisted PATH. Add it and restart your shell before running 'winter'."
 }
 
 Write-Host 'Installing the Windows Terminal integration...' -ForegroundColor Cyan

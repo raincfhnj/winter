@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -6,6 +6,23 @@ use crate::TerminalChannel;
 
 pub const INTEGRATION_SCHEMA_VERSION: u32 = 1;
 pub const MINIMUM_FRAGMENT_VERSION: &str = "1.21";
+
+/// Case-insensitive ownership key for a filesystem path.
+///
+/// Windows paths compare case-insensitively, so every ownership record match
+/// and target deduplication uses this key instead of byte-wise `PathBuf`
+/// equality, which would drop records when `LOCALAPPDATA` casing changes
+/// between runs.
+#[must_use]
+pub(crate) fn path_key(path: &Path) -> String {
+    let normalized = path.to_string_lossy().replace('/', r"\");
+    let trimmed = normalized.strip_prefix(r"\\?\").unwrap_or(&normalized);
+    let unescaped = match trimmed.strip_prefix(r"UNC\") {
+        Some(rest) => format!(r"\\{rest}"),
+        None => trimmed.to_owned(),
+    };
+    unescaped.to_lowercase()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntegrationConfig {
@@ -130,9 +147,6 @@ pub enum ConflictKind {
     SameChordDifferentBinding,
     MalformedKeybinding,
     InvalidSettingsShape,
-    UnmanagedFragment,
-    ConcurrentModification,
-    InvalidManifest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,8 +201,9 @@ pub struct TargetInstallReport {
     pub status: ChangeStatus,
     pub added_binding_count: usize,
     pub backup_path: Option<PathBuf>,
-    pub before_sha256: String,
-    pub after_sha256: String,
+    pub before_sha256: Option<String>,
+    pub after_sha256: Option<String>,
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,6 +225,7 @@ pub struct TargetUninstallReport {
     pub removed_binding_count: usize,
     pub preserved_binding_count: usize,
     pub backup_path: Option<PathBuf>,
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,6 +237,7 @@ pub struct UninstallReport {
     pub shell_integration: Vec<ShellIntegrationReport>,
     pub manifest_path: PathBuf,
     pub manifest_retained: bool,
+    pub issues: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

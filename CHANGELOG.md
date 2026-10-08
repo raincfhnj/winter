@@ -45,6 +45,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Action metadata now lives in a single registry (`src/registry.rs`): the
+  prefix shortcut specs and the managed bridge bindings are derived from one
+  const table, with compile-time assertions replacing the runtime count checks
+  that previously kept two hand-written tables in sync.
+- Key names, display spelling, and the forward/reverse virtual-key maps are
+  unified in one canonical table (`src/keys.rs`), guarded by compile-time
+  uniqueness checks and whole-table round-trip/inverse property tests.
+- The `integration` module is split into `fragment`, `targets`, `rollback`,
+  and `helpers` submodules; the public `plan`/`install`/`uninstall`/`doctor`
+  surface is unchanged.
+- `winterd` parses arguments with clap: `--help`/`--version` now work, and
+  invalid daemon arguments are logged to `last-error.log` with exit 1 exactly
+  as before.
+- The error model is unified: `AppError::Platform` preserves the
+  `PlatformError` source chain, `OperationIncomplete` distinguishes tool-side
+  incompleteness from user-resolvable `SettingsConflict`, and the action
+  worker uses a typed `WorkerError` while keeping its stringly report fields.
 - Input dispatch re-validates the foreground window identity immediately
   before `SendInput`, closing the gap between validation and injection.
 - Low-level hooks are supervised by a panic/shutdown watchdog that fail-opens

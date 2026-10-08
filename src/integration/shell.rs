@@ -60,9 +60,10 @@ fn profile_targets(config: &IntegrationConfig) -> [(ShellKind, PathBuf); 2] {
     ]
 }
 
-/// Plans both profiles. Per-profile failures are reported as conflicts instead
-/// of aborting the whole command, so a broken profile never blocks the
-/// Terminal action bridge.
+/// Plans both profiles. Per-profile failures are reported on that profile's
+/// entry — content conflicts as `Conflict`, environmental I/O failures as
+/// `Skipped` — instead of aborting the whole command, so a broken profile
+/// never blocks the Terminal action bridge.
 pub(crate) fn plan(config: &IntegrationConfig) -> Vec<ShellIntegrationReport> {
     profile_targets(config)
         .into_iter()
@@ -286,14 +287,28 @@ fn report(
     }
 }
 
+/// Builds the per-profile failure report, never returning `Err` to callers.
+///
+/// Classification: environmental failures — [`AppError::Io`] (locked file,
+/// permission denied, disk full), [`AppError::Platform`], and
+/// [`AppError::Native`] (the `MoveFileExW` replace step) — map to
+/// [`ChangeStatus::Skipped`], because nothing in the profile content
+/// conflicts; the operation simply could not run. Everything else
+/// ([`AppError::SettingsConflict`] compare-and-swap races, [`AppError::Settings`]
+/// encoding/symlink refusals) keeps the historical `Conflict` so the user
+/// inspects and resolves the content itself.
+///
+/// `error.to_string()` is the `AppError` `Display`, whose `{source}` rendering
+/// already carries the top-level source-chain message for `Io`/`Platform`, so
+/// the environmental diagnosis is preserved verbatim.
 fn shell_error(shell: ShellKind, path: &Path, error: AppError) -> ShellIntegrationReport {
-    report(
-        shell,
-        path,
-        ChangeStatus::Conflict,
-        None,
-        Some(error.to_string()),
-    )
+    let status = match &error {
+        AppError::Io { .. } | AppError::Platform { .. } | AppError::Native(_) => {
+            ChangeStatus::Skipped
+        }
+        _ => ChangeStatus::Conflict,
+    };
+    report(shell, path, status, None, Some(error.to_string()))
 }
 
 fn skipped_or(status: ChangeStatus, path: &Path) -> ChangeStatus {
@@ -656,6 +671,85 @@ mod tests {
             "the injected block must not double carriage returns"
         );
         assert!(text.contains(&managed_block("\r\n")));
+    }
+
+    #[test]
+    fn environmental_read_failure_is_reported_as_skipped_not_conflict() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let config = config_with(temp.path());
+        let profile_dir = config.documents_dir.join("WindowsPowerShell");
+        fs::create_dir_all(&profile_dir).expect("profile directory should be created");
+        let profile = profile_dir.join("Microsoft.PowerShell_profile.ps1");
+        // A directory at the profile path makes every read fail with a
+        // permission-denied I/O error, which is environmental, not a conflict.
+        fs::create_dir(&profile).expect("profile path should become a directory");
+
+        for (label, reports) in [
+            ("plan", plan(&config)),
+            ("install", install(&config)),
+            ("uninstall", uninstall(&config)),
+        ] {
+            let windows = windows_report(&reports);
+            assert_eq!(
+                windows.status,
+                ChangeStatus::Skipped,
+                "{label} must classify an I/O failure as skipped, not conflict"
+            );
+            let message = windows
+                .message
+                .as_deref()
+                .expect("environmental failure should be explained");
+            assert!(
+                message.contains("I/O operation")
+                    && message.contains("read integration file")
+                    && message.contains(&profile.display().to_string()),
+                "{label} should carry the AppError::Io display verbatim, got: {message}"
+            );
+            assert!(
+                windows.backup_path.is_none(),
+                "{label} must not report a backup for a failed read"
+            );
+        }
+        assert!(
+            profile.is_dir(),
+            "an unreadable profile must survive untouched"
+        );
+    }
+
+    #[test]
+    fn environmental_backup_failure_during_install_is_reported_as_skipped() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let config = config_with(temp.path());
+        let profile_dir = config.documents_dir.join("WindowsPowerShell");
+        fs::create_dir_all(&profile_dir).expect("profile directory should be created");
+        let profile = profile_dir.join("Microsoft.PowerShell_profile.ps1");
+        fs::write(&profile, "Set-Alias ll Get-ChildItem\n").expect("profile should be written");
+        let before = fs::read(&profile).expect("profile should be readable");
+        // A regular file where the state directory belongs makes backup
+        // creation fail with an I/O error before the profile is rewritten.
+        fs::write(&config.state_dir, "not a directory").expect("state file should be written");
+
+        let report = install(&config);
+        let windows = windows_report(&report);
+        assert_eq!(
+            windows.status,
+            ChangeStatus::Skipped,
+            "a backup I/O failure is environmental, not a content conflict"
+        );
+        let message = windows
+            .message
+            .as_deref()
+            .expect("environmental failure should be explained");
+        assert!(
+            message.contains("I/O operation")
+                && message.contains("create integration backup directory"),
+            "message should carry the AppError::Io display verbatim, got: {message}"
+        );
+        assert_eq!(
+            fs::read(&profile).expect("profile should remain readable"),
+            before,
+            "a profile must not be rewritten when its backup cannot be created"
+        );
     }
 
     #[test]

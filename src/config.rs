@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::prefix::{
     KeyChord, LogicalKey, PrefixConfig, default_prefix_chord, is_reserved_system_chord,
@@ -32,8 +32,10 @@ pub struct MouseResizeConfig {
     ///
     /// 8px matches the grab tolerance users expect from native window borders
     /// while staying below the smallest pane's half-width.
+    #[serde(deserialize_with = "deserialize_divider_hit_slop_px")]
     pub divider_hit_slop_px: u8,
     /// Refresh cadence for the disposable native pane geometry snapshot.
+    #[serde(deserialize_with = "deserialize_geometry_poll_interval_ms")]
     pub geometry_poll_interval_ms: u64,
 }
 
@@ -49,6 +51,9 @@ impl Default for MouseResizeConfig {
 
 impl MouseResizeConfig {
     fn validate(self) -> AppResult<()> {
+        if !self.enabled {
+            return Ok(());
+        }
         if self.divider_hit_slop_px > MAX_DIVIDER_HIT_SLOP_PX {
             return Err(AppError::InvalidConfiguration(format!(
                 "mouse_resize.divider_hit_slop_px must be between 0 and {MAX_DIVIDER_HIT_SLOP_PX}"
@@ -68,6 +73,30 @@ impl MouseResizeConfig {
     pub const fn geometry_poll_interval(self) -> Duration {
         Duration::from_millis(self.geometry_poll_interval_ms)
     }
+}
+
+fn deserialize_divider_hit_slop_px<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = i64::deserialize(deserializer)?;
+    u8::try_from(value).map_err(|_| {
+        serde::de::Error::custom(format!(
+            "mouse_resize.divider_hit_slop_px must be between 0 and {MAX_DIVIDER_HIT_SLOP_PX}"
+        ))
+    })
+}
+
+fn deserialize_geometry_poll_interval_ms<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = i64::deserialize(deserializer)?;
+    u64::try_from(value).map_err(|_| {
+        serde::de::Error::custom(format!(
+            "mouse_resize.geometry_poll_interval_ms must be between {MIN_PANE_GEOMETRY_POLL_INTERVAL_MS} and {MAX_PANE_GEOMETRY_POLL_INTERVAL_MS}"
+        ))
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -503,6 +532,71 @@ mod tests {
                 .expect_err("overly frequent geometry polling must fail")
                 .to_string()
                 .contains("geometry_poll_interval_ms")
+        );
+    }
+
+    #[test]
+    fn disabled_mouse_resize_ignores_out_of_range_settings() {
+        let config = ControllerConfig {
+            mouse_resize: MouseResizeConfig {
+                enabled: false,
+                divider_hit_slop_px: u8::MAX,
+                geometry_poll_interval_ms: MAX_PANE_GEOMETRY_POLL_INTERVAL_MS + 1,
+            },
+            ..ControllerConfig::default()
+        };
+
+        config
+            .validate()
+            .expect("a disabled feature must not range-check its settings");
+        config
+            .prefix_config()
+            .expect("chord compilation must agree with scalar validation");
+
+        let parsed: ControllerConfig = toml::from_str(
+            "schema_version = 2\n[mouse_resize]\nenabled = false\ndivider_hit_slop_px = 200\ngeometry_poll_interval_ms = 5\n",
+        )
+        .expect("representable dummy values must deserialize");
+        parsed
+            .validate()
+            .expect("a disabled feature must accept dummy values from TOML");
+    }
+
+    #[test]
+    fn enabled_mouse_resize_still_range_checks_representable_values() {
+        let config: ControllerConfig =
+            toml::from_str("schema_version = 2\n[mouse_resize]\ndivider_hit_slop_px = 100\n")
+                .expect("values within u8 must deserialize");
+
+        assert!(
+            config
+                .validate()
+                .expect_err("slop above the documented maximum must fail while enabled")
+                .to_string()
+                .contains("divider_hit_slop_px must be between 0 and 32")
+        );
+    }
+
+    #[test]
+    fn out_of_range_mouse_resize_values_report_documented_bounds() {
+        let slop_error = toml::from_str::<ControllerConfig>(
+            "schema_version = 2\n[mouse_resize]\ndivider_hit_slop_px = 400\n",
+        )
+        .expect_err("values beyond u8 must be rejected");
+        let slop_message = slop_error.to_string();
+        assert!(
+            slop_message.contains("divider_hit_slop_px must be between 0 and 32"),
+            "unexpected message: {slop_message}"
+        );
+
+        let poll_error = toml::from_str::<ControllerConfig>(
+            "schema_version = 2\n[mouse_resize]\ngeometry_poll_interval_ms = -1\n",
+        )
+        .expect_err("negative poll intervals must be rejected");
+        let poll_message = poll_error.to_string();
+        assert!(
+            poll_message.contains("geometry_poll_interval_ms must be between 50 and 1000"),
+            "unexpected message: {poll_message}"
         );
     }
 

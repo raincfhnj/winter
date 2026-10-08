@@ -2,12 +2,17 @@
 //!
 //! Covers the documented report contract of `winter doctor`:
 //! `{ schema_version, healthy, config: { path, ok, error }, integration }`,
-//! with exit codes `0` = healthy, `2` = needs attention, `1` = hard failure.
-//! Every test redirects `LOCALAPPDATA` to a fresh temporary directory so the
-//! real user configuration and Windows Terminal settings are never touched;
-//! no test here requires a running Windows Terminal.
+//! with exit codes `0` = healthy, `2` = needs attention, `1` = hard failure;
+//! the documented `winter plan` contract (`0` ready, `2` not installable,
+//! stdout a single JSON plan); plus `winter config --path` and
+//! `winter --version`. Every test that touches configuration redirects
+//! `LOCALAPPDATA` to a fresh temporary directory so the real user
+//! configuration and Windows Terminal settings are never touched; no test
+//! here requires a running Windows Terminal.
 
+use std::ffi::OsStr;
 use std::fs;
+use std::path::Path;
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -88,4 +93,88 @@ fn doctor_accepts_a_fresh_config_directory() {
         report["integration"].is_object(),
         "doctor must include an integration object: {report}"
     );
+}
+
+#[test]
+fn plan_in_a_fresh_environment_reports_not_installable_json() {
+    let temp = tempdir().expect("temporary directory should be created");
+
+    // Documented contract (`winter plan --help`): 0 ready, 2 not installable,
+    // 1 failure. Target discovery (src/integration/discovery.rs) only probes
+    // under LOCALAPPDATA, so an empty redirect can never yield a channel and
+    // the real outcome here is exit 2 with a JSON plan on stdout.
+    let assert = Command::cargo_bin("winter")
+        .expect("winter binary should build")
+        .env("LOCALAPPDATA", temp.path())
+        .arg("plan")
+        .assert()
+        .code(2);
+
+    let report: Value =
+        serde_json::from_slice(&assert.get_output().stdout).expect("plan stdout should be JSON");
+    assert_eq!(
+        report["schemaVersion"].as_u64(),
+        Some(1),
+        "plan must declare the integration schema version: {report}"
+    );
+    assert_eq!(
+        report["canInstall"],
+        Value::Bool(false),
+        "a fresh environment without channels cannot install: {report}"
+    );
+    assert!(
+        report["targets"].as_array().is_some_and(Vec::is_empty),
+        "no channel can be discovered under a fresh LOCALAPPDATA: {report}"
+    );
+    assert!(
+        report["issues"].as_array().is_some_and(|issues| {
+            issues.iter().any(|issue| {
+                issue
+                    .as_str()
+                    .is_some_and(|text| text.contains("no initialized Windows Terminal"))
+            })
+        }),
+        "the missing-channel reason must be reported: {report}"
+    );
+}
+
+#[test]
+fn config_path_prints_a_file_under_the_redirected_local_app_data() {
+    let temp = tempdir().expect("temporary directory should be created");
+
+    let assert = Command::cargo_bin("winter")
+        .expect("winter binary should build")
+        .env("LOCALAPPDATA", temp.path())
+        .args(["config", "--path"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    let printed = Path::new(stdout.trim());
+    assert!(
+        printed.starts_with(temp.path()),
+        "--path must resolve inside the redirected LOCALAPPDATA: {printed:?}"
+    );
+    assert_eq!(
+        printed.file_name(),
+        Some(OsStr::new("config.toml")),
+        "the printed path must be the configuration file: {printed:?}"
+    );
+    assert_eq!(
+        printed.parent().and_then(Path::file_name),
+        Some(OsStr::new("WinTerminalP")),
+        "the configuration file must live in the WinTerminalP directory: {printed:?}"
+    );
+}
+
+#[test]
+fn version_exits_zero_and_prints_the_cargo_version() {
+    Command::cargo_bin("winter")
+        .expect("winter binary should build")
+        .arg("--version")
+        .assert()
+        .success()
+        // `env!("CARGO_PKG_VERSION")` is read from the same Cargo.toml the
+        // clap `version` attribute embeds in the binary.
+        .stdout(predicate::str::contains(env!("CARGO_PKG_VERSION")));
 }

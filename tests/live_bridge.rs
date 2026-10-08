@@ -97,6 +97,10 @@ fn combined_input_hooks_install_and_stop() {
 #[test]
 #[ignore = "requires a dedicated foreground Terminal window"]
 fn dispatch_bridge_action_from_environment() {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_CONTROL, VK_MENU, VK_SHIFT,
+    };
+
     let action_name =
         env::var("WINTERMINAL_E2E_ACTION").expect("WINTERMINAL_E2E_ACTION must be set");
     let action = parse_action(&action_name).expect("unsupported live bridge action");
@@ -117,7 +121,35 @@ fn dispatch_bridge_action_from_environment() {
     let receipt = send_bridge_chord(target, binding.bridge_chord)
         .expect("bridge chord should be inserted into the unchanged foreground target");
 
-    assert!(receipt.sent >= 2);
+    // `plan_chord_events` (src/platform/windows/input.rs) synthesizes a
+    // key-down plus key-up for every required chord modifier that is not
+    // already physically held, then the target key down/up, then releases
+    // only the modifiers it synthesized. Every managed bridge chord uses two
+    // or three of ctrl/alt/shift, so with no modifiers held the plan is 6 or
+    // 8 events; each already-held required modifier removes its down/up pair.
+    // Reading the same physical state `send_bridge_chord` snapshots keeps the
+    // expected count exact even when the operator holds a required modifier.
+    let chord = binding.bridge_chord;
+    let mut synthesized_modifiers = 0_u32;
+    for (required, virtual_key) in [
+        (chord.ctrl, VK_CONTROL),
+        (chord.alt, VK_MENU),
+        (chord.shift, VK_SHIFT),
+    ] {
+        if !required {
+            continue;
+        }
+        // SAFETY: GetAsyncKeyState takes a virtual-key code by value and has
+        // no pointer or ownership requirements.
+        if unsafe { GetAsyncKeyState(i32::from(virtual_key.0)) } >= 0 {
+            synthesized_modifiers += 1;
+        }
+    }
+    let expected_events = synthesized_modifiers * 2 + 2;
+    assert_eq!(
+        receipt.sent, expected_events,
+        "dispatched event count must match the planner's plan for {chord:?}"
+    );
     if let Ok(expected_title) = env::var("WINTERMINAL_E2E_EXPECTED_TITLE") {
         let deadline = Instant::now() + Duration::from_secs(5);
         let title = loop {
@@ -236,18 +268,139 @@ fn parse_direction(value: &str) -> Option<Direction> {
 mod tests {
     use super::*;
 
+    /// Every literal string form `parse_action` accepts, paired with the
+    /// exact [`TerminalAction`] it must produce. Together with the
+    /// direction families and the `activate-tab-0..9` loop below this covers
+    /// every reachable branch of the parser against the production action set
+    /// in `src/registry.rs`, and each parsed action must still resolve to a
+    /// managed bridge binding (the same lookup the dispatch test performs).
     #[test]
-    fn parses_supported_probe_actions() {
-        assert_eq!(
-            parse_action("split-left"),
-            Some(TerminalAction::SplitPane {
-                direction: Direction::Left,
-            })
-        );
-        assert_eq!(
-            parse_action("activate-tab-9"),
-            Some(TerminalAction::ActivateTab { index: 9 })
-        );
-        assert_eq!(parse_action("activate-tab-10"), None);
+    fn parses_every_supported_probe_action() {
+        let literal_cases: &[(&str, TerminalAction)] = &[
+            ("new-tab", TerminalAction::NewTab),
+            ("next-tab", TerminalAction::NextTab),
+            ("previous-tab", TerminalAction::PreviousTab),
+            ("close-pane", TerminalAction::ClosePane),
+            ("toggle-zoom", TerminalAction::TogglePaneZoom),
+            (
+                "split-left",
+                TerminalAction::SplitPane {
+                    direction: Direction::Left,
+                },
+            ),
+            (
+                "split-right",
+                TerminalAction::SplitPane {
+                    direction: Direction::Right,
+                },
+            ),
+            (
+                "split-up",
+                TerminalAction::SplitPane {
+                    direction: Direction::Up,
+                },
+            ),
+            (
+                "split-down",
+                TerminalAction::SplitPane {
+                    direction: Direction::Down,
+                },
+            ),
+            (
+                "focus-left",
+                TerminalAction::FocusPane {
+                    direction: Direction::Left,
+                },
+            ),
+            (
+                "focus-right",
+                TerminalAction::FocusPane {
+                    direction: Direction::Right,
+                },
+            ),
+            (
+                "focus-up",
+                TerminalAction::FocusPane {
+                    direction: Direction::Up,
+                },
+            ),
+            (
+                "focus-down",
+                TerminalAction::FocusPane {
+                    direction: Direction::Down,
+                },
+            ),
+            (
+                "resize-left",
+                TerminalAction::ResizePane {
+                    direction: Direction::Left,
+                },
+            ),
+            (
+                "resize-right",
+                TerminalAction::ResizePane {
+                    direction: Direction::Right,
+                },
+            ),
+            (
+                "resize-up",
+                TerminalAction::ResizePane {
+                    direction: Direction::Up,
+                },
+            ),
+            (
+                "resize-down",
+                TerminalAction::ResizePane {
+                    direction: Direction::Down,
+                },
+            ),
+        ];
+        for &(input, expected) in literal_cases {
+            assert_eq!(parse_action(input), Some(expected), "input {input:?}");
+            assert!(
+                binding_for_action(expected).is_some(),
+                "{input:?} must resolve to a managed bridge binding"
+            );
+        }
+        for index in 0..=9_u8 {
+            let expected = TerminalAction::ActivateTab { index };
+            let input = format!("activate-tab-{index}");
+            assert_eq!(parse_action(&input), Some(expected), "input {input:?}");
+            assert!(
+                binding_for_action(expected).is_some(),
+                "{input:?} must resolve to a managed bridge binding"
+            );
+        }
+    }
+
+    /// Pins every fall-through branch of `parse_action`: the direction probe
+    /// after `split_once('-')`, the `activate-tab-` strip_prefix fallback, and
+    /// the registry actions this env-var probe deliberately does not expose.
+    #[test]
+    fn rejects_unsupported_probe_action_forms() {
+        for input in [
+            // Direction probe: the prefix matches but the suffix is not a
+            // bare left/right/up/down direction.
+            "split-diagonal",
+            "focus-pane-left",
+            "rename-tab",
+            // `activate-tab-` prefix fallback: index missing, non-numeric, or
+            // outside the supported 0..=9 range.
+            "activate-tab-",
+            "activate-tab-x",
+            "activate-tab-10",
+            // No hyphen at all: the name falls through the strip_prefix
+            // fallback untouched ("zoom" is the registry name suffix; only
+            // "toggle-zoom" is accepted above).
+            "newtab",
+            "zoom",
+            // Registry actions without a probe string form: the bridge keeps
+            // them installed, and shutdown is never bridged at all
+            // (ActionCommand::Shutdown in src/registry.rs).
+            "send-prefix-literal",
+            "shutdown",
+        ] {
+            assert_eq!(parse_action(input), None, "{input:?} must be rejected");
+        }
     }
 }

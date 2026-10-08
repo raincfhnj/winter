@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::model::TerminalAction;
+use crate::prefix::{Modifiers, push_modifier_names};
 use crate::registry;
 
 const ACTION_ID_PREFIX: &str = "User.WinTerminalP.";
@@ -33,18 +34,16 @@ impl BridgeChord {
         }
     }
 
+    /// Returns the Windows Terminal `keys` spelling of this chord, e.g.
+    /// `ctrl+alt+shift+f13`. Bridge chords never carry the Windows modifier,
+    /// so the shared modifier builder runs with `windows` cleared.
     #[must_use]
     pub fn as_windows_terminal_key(self) -> String {
         let mut parts = Vec::with_capacity(4);
-        if self.ctrl {
-            parts.push("ctrl".to_owned());
-        }
-        if self.alt {
-            parts.push("alt".to_owned());
-        }
-        if self.shift {
-            parts.push("shift".to_owned());
-        }
+        push_modifier_names(
+            &mut parts,
+            Modifiers::new(self.ctrl, self.alt, self.shift, false),
+        );
         parts.push(format!("f{}", self.function_key));
         parts.join("+")
     }
@@ -127,6 +126,21 @@ pub fn managed_bindings() -> &'static [ManagedBinding] {
     &MANAGED_BINDINGS
 }
 
+/// Returns the managed bridge binding registered for `action`, or [`None`]
+/// when the registry has no bridge entry for it.
+///
+/// Load-bearing for install/doctor parity, not only for dispatch: the action
+/// worker resolves bridge chords through this table, and
+/// [`bridge_is_ready`](crate::bridge_is_ready) requires every target's
+/// installed `(id, chord)` count to equal the length of
+/// [`managed_bindings`]. Every registry row must therefore keep its binding
+/// even when the controller never dispatches the action through the bridge —
+/// most notably [`TerminalAction::SendPrefixLiteral`], which
+/// `HookDispatcher::on_keyboard` intercepts and rewrites into a literal
+/// prefix injection before the worker queue, so its bridge chord is inert
+/// for dispatch yet still installed. Dropping that row would leave existing
+/// installs with more installed bindings than this table expects and fail
+/// the doctor readiness check until reinstall.
 #[must_use]
 pub fn binding_for_action(action: TerminalAction) -> Option<&'static ManagedBinding> {
     MANAGED_BINDINGS

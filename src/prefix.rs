@@ -108,6 +108,31 @@ impl Modifiers {
     }
 }
 
+/// Appends the active modifier names to `parts` in the canonical chord
+/// order (`win+ctrl+alt+shift`), omitting inactive modifiers.
+///
+/// This is the single modifier-prefix builder shared by [`KeyChord`]'s
+/// [`Display`](fmt::Display) impl and
+/// [`BridgeChord::as_windows_terminal_key`](crate::keymap::BridgeChord::as_windows_terminal_key),
+/// so prefix chords and installed bridge keybindings are always spelled
+/// from the same modifier sequence. Callers that have no Windows modifier
+/// (bridge chords) pass `Modifiers::new(ctrl, alt, shift, false)`, which
+/// keeps their historical `ctrl+...` prefix byte-identical.
+pub(crate) fn push_modifier_names(parts: &mut Vec<String>, modifiers: Modifiers) {
+    if modifiers.windows {
+        parts.push("win".to_owned());
+    }
+    if modifiers.ctrl {
+        parts.push("ctrl".to_owned());
+    }
+    if modifiers.alt {
+        parts.push("alt".to_owned());
+    }
+    if modifiers.shift {
+        parts.push("shift".to_owned());
+    }
+}
+
 /// A user-configurable key chord after platform normalization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct KeyChord {
@@ -130,18 +155,7 @@ impl KeyChord {
 impl fmt::Display for KeyChord {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut parts = Vec::with_capacity(5);
-        if self.modifiers.windows {
-            parts.push("win".to_owned());
-        }
-        if self.modifiers.ctrl {
-            parts.push("ctrl".to_owned());
-        }
-        if self.modifiers.alt {
-            parts.push("alt".to_owned());
-        }
-        if self.modifiers.shift {
-            parts.push("shift".to_owned());
-        }
+        push_modifier_names(&mut parts, self.modifiers);
         parts.push(logical_key_name(self.key));
         formatter.write_str(&parts.join("+"))
     }
@@ -424,8 +438,12 @@ impl PrefixMachine {
             cancellation = Some(CancelReason::ForegroundChanged);
         }
 
-        // Injected bridge input is never interpreted as user input or added to
-        // the suppression ledger.
+        // Defense-in-depth, not a live production guard: the low-level hook
+        // filters injected events before handlers ever run, so `injected` is
+        // always false on this path outside unit tests that build events by
+        // hand. Should an injected event slip through anyway, it is passed
+        // through untouched: never interpreted as user input and never added
+        // to the suppression ledger.
         if event.injected {
             return PrefixOutcome::pass_through(cancellation);
         }

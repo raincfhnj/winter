@@ -155,10 +155,12 @@ mod tests {
             PaneGeometry {
                 bounds: ScreenRect::new(0, 0, 497, 800),
                 has_keyboard_focus: false,
+                title: String::new(),
             },
             PaneGeometry {
                 bounds: ScreenRect::new(503, 0, 1_000, 800),
                 has_keyboard_focus: false,
+                title: String::new(),
             },
         ])
         .divider_at(ScreenPoint::new(500, 400), 0)

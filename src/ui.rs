@@ -45,6 +45,15 @@ const MIN_MAP_HEIGHT: usize = 3;
 const INPUT_BATCH: usize = 32;
 /// Upper bound of input batches drained per poll.
 const INPUT_BATCH_LIMIT: u64 = 64;
+/// Frame width at which the two-zone sidebar layout replaces the legacy
+/// single-column layout.
+const TWO_ZONE_MIN_COLS: usize = 60;
+/// Narrowest allowed left sidebar.
+const SIDEBAR_MIN_WIDTH: usize = 24;
+/// Widest allowed left sidebar.
+const SIDEBAR_MAX_WIDTH: usize = 34;
+/// Full-width banner shown at the top of an offline frame.
+const OFFLINE_BANNER: &str = "!! CONTROLLER OFFLINE \u{2014} start it with 'winter run' !!";
 
 const EDGE_UP: u8 = 1;
 const EDGE_RIGHT: u8 = 2;
@@ -289,11 +298,24 @@ fn window_size(output: HANDLE) -> Option<(usize, usize)> {
 
 /// Renders one complete dashboard frame without any ANSI sequences.
 ///
-/// The output never contains more than `rows` lines and no line ever
-/// exceeds `cols` columns. A missing, stale, stopped, or pane-less state
-/// falls back to placeholder text plus an offline banner instead of a pane
-/// map. Degenerate sizes (0x0, 1x1, columns below 10) never panic.
+/// Terminals with `cols >= 60` get a tmux-style two-zone frame: a left
+/// status sidebar, a `│` gutter column, and the proportional pane map on
+/// the right, optionally under a full-width offline banner. Narrower
+/// terminals keep the legacy single-column layout. The output never
+/// contains more than `rows` lines and no line ever exceeds `cols`
+/// columns. A missing, stale, stopped, or pane-less state falls back to
+/// placeholder text plus an offline banner instead of a pane map.
+/// Degenerate sizes (0x0, 1x1, columns below 10) never panic.
 pub fn render(state: Option<&DashboardState>, age_ms: u64, cols: usize, rows: usize) -> String {
+    if cols >= TWO_ZONE_MIN_COLS {
+        render_two_zone(state, age_ms, cols, rows)
+    } else {
+        render_narrow(state, age_ms, cols, rows)
+    }
+}
+
+/// Legacy single-column frame used below [`TWO_ZONE_MIN_COLS`] columns.
+fn render_narrow(state: Option<&DashboardState>, age_ms: u64, cols: usize, rows: usize) -> String {
     let (prefix, terminal, mouse) = match state {
         Some(state) => (
             if state.prefix_armed { "ARMED" } else { "idle" },
@@ -317,7 +339,7 @@ pub fn render(state: Option<&DashboardState>, age_ms: u64, cols: usize, rows: us
 
     let offline = is_offline(state, age_ms);
     if offline {
-        lines.push("!! CONTROLLER OFFLINE \u{2014} start it with 'winter run' !!".to_owned());
+        lines.push(OFFLINE_BANNER.to_owned());
     }
 
     let pane_count = state.map_or(0, |state| state.panes.len());
@@ -346,6 +368,249 @@ pub fn render(state: Option<&DashboardState>, age_ms: u64, cols: usize, rows: us
     lines.push(placeholder(offline, pane_count));
     lines.push(footer);
     fit(lines, cols, rows)
+}
+
+/// Two-zone frame: sidebar, `│` gutter, and the pane map zone, placed
+/// under a full-width offline banner whenever the controller is offline.
+fn render_two_zone(
+    state: Option<&DashboardState>,
+    age_ms: u64,
+    cols: usize,
+    rows: usize,
+) -> String {
+    let sidebar_width = (cols / 3).clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+    let right_width = cols - sidebar_width - 1;
+    let offline = is_offline(state, age_ms);
+
+    let mut frame: Vec<String> = Vec::new();
+    if offline {
+        frame.push(OFFLINE_BANNER.to_owned());
+    }
+    let budget = rows.saturating_sub(frame.len());
+    let sidebar = fit_sidebar(sidebar_lines(state, age_ms, sidebar_width), budget);
+    let right = right_zone_lines(state, age_ms, offline, right_width, budget);
+
+    let height = sidebar.len().max(right.len());
+    for index in 0..height {
+        let left = sidebar.get(index).map(String::as_str).unwrap_or("");
+        let zone = right.get(index).map(String::as_str).unwrap_or("");
+        frame.push(format!(
+            "{}\u{2502}{}",
+            pad(left, sidebar_width),
+            pad(zone, right_width)
+        ));
+    }
+    fit(frame, cols, rows)
+}
+
+/// Right zone content: pane map (or placeholder), legend, and the footer,
+/// every line cut to `width` and never more than `rows` lines.
+fn right_zone_lines(
+    state: Option<&DashboardState>,
+    age_ms: u64,
+    offline: bool,
+    width: usize,
+    rows: usize,
+) -> Vec<String> {
+    let mut lines = vec![String::new()];
+    let pane_count = state.map_or(0, |state| state.panes.len());
+    let mapped = state
+        .filter(|state| !offline && !state.panes.is_empty() && width >= MIN_MAP_COLS)
+        .and_then(|state| {
+            let map_height = rows.saturating_sub(lines.len() + 5);
+            let map_width = width.saturating_sub(2);
+            if map_height < MIN_MAP_HEIGHT || map_width < 3 {
+                return None;
+            }
+            let map = draw_map(&state.panes, map_width, map_height);
+            (map.len() == map_height).then_some(map)
+        });
+    if let Some(map) = mapped {
+        lines.extend(map);
+        lines.push("* = focused pane".to_owned());
+    } else {
+        lines.push(placeholder(offline, pane_count));
+    }
+    lines.push(format!(
+        "{pane_count} panes \u{B7} refreshed {age_ms}ms ago"
+    ));
+    fit_lines(lines, width, rows)
+}
+
+/// Builds the left sidebar: header, controller section, pane list, bottom
+/// rule, and quit hint. Every line is cut to `width`; row budgeting is
+/// the job of [`fit_sidebar`].
+fn sidebar_lines(state: Option<&DashboardState>, age_ms: u64, width: usize) -> Vec<String> {
+    let offline = is_offline(state, age_ms);
+    let mut lines = vec!["winter ui".to_owned()];
+    lines.push(section_rule(
+        "\u{2500}\u{2500} controller \u{2500}\u{2500}",
+        width,
+    ));
+
+    let uptime = match state
+        .filter(|_| !offline)
+        .and_then(DashboardState::uptime_ms)
+    {
+        Some(elapsed) => format_uptime(elapsed),
+        None if offline => "OFFLINE \u{2190}".to_owned(),
+        None => "unknown".to_owned(),
+    };
+    lines.push(sidebar_row("online", &uptime, width));
+
+    let (prefix, hook, mouse, terminal, actions) = match state {
+        Some(state) => {
+            let hook = if !state.hook_active {
+                "INACTIVE!".to_owned()
+            } else if state.hook_panics > 0 {
+                format!("{} panics!", state.hook_panics)
+            } else {
+                "ok".to_owned()
+            };
+            (
+                if state.prefix_armed { "ARMED" } else { "idle" },
+                hook,
+                if state.mouse_resize_enabled {
+                    "on"
+                } else {
+                    "off"
+                },
+                if state.terminal_present {
+                    "connected"
+                } else {
+                    "missing"
+                },
+                format!(
+                    "{} / {} fail / {} drop",
+                    state.dispatched_actions, state.failed_actions, state.dropped_actions
+                ),
+            )
+        }
+        None => (
+            "idle",
+            "INACTIVE!".to_owned(),
+            "off",
+            "missing",
+            "0 / 0 fail / 0 drop".to_owned(),
+        ),
+    };
+    lines.push(sidebar_row("prefix", prefix, width));
+    lines.push(sidebar_row("hook", &hook, width));
+    lines.push(sidebar_row("mouse", mouse, width));
+    lines.push(sidebar_row("terminal", terminal, width));
+    lines.push(sidebar_row("actions", &actions, width));
+    if let Some(error) = state.and_then(|state| state.last_dispatch_error.as_deref()) {
+        lines.push(truncate(&format!("err: {error}"), width));
+    }
+
+    lines.push(section_rule(
+        "\u{2500}\u{2500} panes \u{2500}\u{2500}",
+        width,
+    ));
+    if let Some(state) = state {
+        for (index, pane) in state.panes.iter().enumerate() {
+            let marker = if pane.focused { '*' } else { ' ' };
+            let title = if pane.title.is_empty() {
+                "-"
+            } else {
+                pane.title.as_str()
+            };
+            let number = index + 1;
+            lines.push(truncate(&format!(" {number} {marker}{title}"), width));
+        }
+    }
+    lines.push("\u{2500}".repeat(width));
+    lines.push("q quit".to_owned());
+    lines
+}
+
+/// Shrinks a full sidebar to `rows` lines by dropping sections bottom-up
+/// while keeping the header, the pane list, and the quit hint as long as
+/// possible; as a last resort even those give way so the budget holds.
+fn fit_sidebar(lines: Vec<String>, rows: usize) -> Vec<String> {
+    let mut out = lines;
+    // The bottom rule first.
+    if out.len() > rows && out.len() >= 2 && is_rule(&out[out.len() - 2]) {
+        out.remove(out.len() - 2);
+    }
+    // Controller rows, from the bottom of the section up.
+    while out.len() > rows {
+        let Some(panes) = out.iter().position(|line| line.starts_with("── panes")) else {
+            break;
+        };
+        if panes <= 2 {
+            break;
+        }
+        out.remove(panes - 1);
+    }
+    // The controller section header.
+    if out.len() > rows
+        && out
+            .get(1)
+            .is_some_and(|line| line.starts_with("── controller"))
+    {
+        out.remove(1);
+    }
+    // Pane entries, from the last one up.
+    while out.len() > rows {
+        let Some(panes) = out.iter().position(|line| line.starts_with("── panes")) else {
+            break;
+        };
+        if out.len() <= panes + 2 {
+            break;
+        }
+        out.remove(panes + 1);
+    }
+    // The pane section header, then the quit hint, then the header.
+    if out.len() > rows
+        && let Some(panes) = out.iter().position(|line| line.starts_with("── panes"))
+    {
+        out.remove(panes);
+    }
+    while out.len() > rows {
+        out.pop();
+    }
+    out
+}
+
+/// One `label   value` sidebar line cut to `width`.
+fn sidebar_row(label: &str, value: &str, width: usize) -> String {
+    truncate(&format!("{label:<8} {value}"), width)
+}
+
+/// `── title ──` padded (or cut) with `─` to exactly `width` characters.
+fn section_rule(title: &str, width: usize) -> String {
+    title
+        .chars()
+        .chain(std::iter::repeat_n('\u{2500}', width))
+        .take(width)
+        .collect()
+}
+
+/// True for a line made only of `─` characters (the section bottom rule).
+fn is_rule(line: &str) -> bool {
+    !line.is_empty() && line.chars().all(|character| character == '\u{2500}')
+}
+
+/// Human-readable controller uptime: `7s`, `3m 12s`, or `1h 2m 3s`.
+fn format_uptime(ms: u64) -> String {
+    let total = ms / 1000;
+    let (hours, minutes, seconds) = (total / 3600, (total % 3600) / 60, total % 60);
+    if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// Cuts `line` to `width` characters and pads it back to `width`.
+fn pad(line: &str, width: usize) -> String {
+    let mut padded = truncate(line, width);
+    let missing = width.saturating_sub(padded.chars().count());
+    padded.extend(std::iter::repeat_n(' ', missing));
+    padded
 }
 
 /// True when the state is absent, stale, or the controller has stopped.
@@ -558,12 +823,16 @@ const fn edge_char(bits: u8) -> char {
 
 /// Trims lines to `rows` and every line to `cols`, then joins them.
 fn fit(lines: Vec<String>, cols: usize, rows: usize) -> String {
+    fit_lines(lines, cols, rows).join("\n")
+}
+
+/// Trims lines to `rows` and every line to `cols`.
+fn fit_lines(lines: Vec<String>, cols: usize, rows: usize) -> Vec<String> {
     lines
         .into_iter()
         .take(rows)
         .map(|line| truncate(&line, cols))
-        .collect::<Vec<String>>()
-        .join("\n")
+        .collect()
 }
 
 /// Cuts a line to at most `cols` characters.
@@ -586,6 +855,13 @@ mod tests {
             prefix_armed: true,
             mouse_resize_enabled: true,
             terminal_present: true,
+            controller_started_unix_ms: unix_ms_now().saturating_sub(192_000),
+            hook_active: true,
+            hook_panics: 2,
+            dispatched_actions: 128,
+            failed_actions: 1,
+            dropped_actions: 2,
+            last_dispatch_error: Some("injection failed".to_owned()),
             panes: vec![
                 DashboardPane {
                     x: 0,
@@ -593,6 +869,7 @@ mod tests {
                     width: 40,
                     height: 12,
                     focused: false,
+                    title: "root:~".to_owned(),
                 },
                 DashboardPane {
                     x: 40,
@@ -600,6 +877,7 @@ mod tests {
                     width: 40,
                     height: 12,
                     focused: true,
+                    title: "agent-build".to_owned(),
                 },
                 DashboardPane {
                     x: 0,
@@ -607,6 +885,7 @@ mod tests {
                     width: 80,
                     height: 12,
                     focused: false,
+                    title: String::new(),
                 },
             ],
             dividers: Vec::new(),
@@ -618,22 +897,43 @@ mod tests {
         let frame = render(Some(&fixture()), 5, 100, 30);
 
         assert!(frame.contains("winter ui"), "missing header: {frame}");
-        assert!(frame.contains("prefix: ARMED"), "missing prefix: {frame}");
         assert!(
-            frame.contains("terminal: connected"),
+            frame.contains("\u{2500}\u{2500} controller \u{2500}\u{2500}"),
+            "missing controller rule: {frame}"
+        );
+        assert!(frame.contains("3m 12s"), "missing uptime: {frame}");
+        assert!(frame.contains("prefix   ARMED"), "missing prefix: {frame}");
+        assert!(frame.contains("2 panics"), "missing hook alarm: {frame}");
+        assert!(frame.contains("mouse    on"), "missing mouse: {frame}");
+        assert!(
+            frame.contains("terminal connected"),
             "missing terminal: {frame}"
         );
         assert!(
-            frame.contains("mouse resize: on"),
-            "missing mouse resize: {frame}"
+            frame.contains("128 / 1 fail / 2 drop"),
+            "missing action counters: {frame}"
         );
+        assert!(
+            frame.contains("err: injection failed"),
+            "missing dispatch error: {frame}"
+        );
+        assert!(
+            frame.contains("\u{2500}\u{2500} panes \u{2500}\u{2500}"),
+            "missing panes rule: {frame}"
+        );
+        assert!(frame.contains(" 1  root:~"), "missing pane 1: {frame}");
+        assert!(
+            frame.contains(" 2 *agent-build"),
+            "missing focused pane: {frame}"
+        );
+        assert!(frame.contains(" 3  -"), "missing dash title: {frame}");
+        assert!(frame.contains("q quit"), "missing quit hint: {frame}");
         assert!(
             frame.contains("* = focused pane"),
             "missing legend: {frame}"
         );
-        assert!(frame.contains("3 panes"), "missing pane count: {frame}");
         assert!(
-            frame.contains("refreshed 5ms ago \u{2014} q to quit"),
+            frame.contains("3 panes \u{B7} refreshed 5ms ago"),
             "missing footer: {frame}"
         );
         assert!(!frame.contains("CONTROLLER OFFLINE"), "live: {frame}");
@@ -661,6 +961,86 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_titles_are_dashed_and_cut_to_the_width() {
+        let mut state = fixture();
+        state.panes[0].title.clear();
+        state.panes[1].title = "a-very-long-pane-title-that-overflows-the-sidebar".to_owned();
+        let lines = sidebar_lines(Some(&state), 5, SIDEBAR_MIN_WIDTH);
+
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.chars().count() <= SIDEBAR_MIN_WIDTH),
+            "a sidebar line exceeded the width: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line == " 1  -"),
+            "an empty title must render as a dash: {lines:?}"
+        );
+        let long = lines
+            .iter()
+            .find(|line| line.starts_with(" 2 "))
+            .expect("the focused pane entry should exist");
+        assert_eq!(
+            long.chars().count(),
+            SIDEBAR_MIN_WIDTH,
+            "the long title must be cut to the width: {long:?}"
+        );
+        assert!(
+            long.contains("*a-very-long"),
+            "the focus marker must survive truncation: {long:?}"
+        );
+    }
+
+    #[test]
+    fn drops_sidebar_sections_bottom_up_when_rows_are_scarce() {
+        let frame = render(Some(&fixture()), 5, 100, 7);
+
+        let lines: Vec<&str> = frame.split('\n').collect();
+        assert_eq!(lines.len(), 7, "row budget exceeded: {frame}");
+        assert!(frame.contains("winter ui"), "missing header: {frame}");
+        assert!(
+            frame.contains("\u{2500}\u{2500} panes \u{2500}\u{2500}"),
+            "the pane section must survive: {frame}"
+        );
+        assert!(frame.contains("q quit"), "missing quit hint: {frame}");
+        assert!(
+            lines.iter().all(|line| line.chars().count() <= 100),
+            "a line exceeded the column budget: {frame}"
+        );
+    }
+
+    #[test]
+    fn renders_the_legacy_single_column_layout_below_sixty_columns() {
+        let frame = render(Some(&fixture()), 5, 50, 30);
+
+        assert!(
+            !frame.contains("\u{2500}\u{2500} controller \u{2500}\u{2500}"),
+            "no sidebar below 60 columns: {frame}"
+        );
+        assert!(
+            frame.contains("winter ui  prefix: ARMED"),
+            "missing legacy status line: {frame}"
+        );
+        assert!(
+            frame.contains("* = focused pane"),
+            "missing legend: {frame}"
+        );
+        assert!(frame.contains("3 panes"), "missing pane count: {frame}");
+        assert!(
+            frame.contains("refreshed 5ms ago \u{2014} q to quit"),
+            "missing footer: {frame}"
+        );
+
+        let lines: Vec<&str> = frame.split('\n').collect();
+        assert!(lines.len() <= 30, "row budget exceeded: {}", lines.len());
+        assert!(
+            lines.iter().all(|line| line.chars().count() <= 50),
+            "a line exceeded the column budget: {frame}"
+        );
+    }
+
+    #[test]
     fn renders_offline_banner_without_a_state_file() {
         let frame = render(None, 0, 100, 30);
 
@@ -668,11 +1048,30 @@ mod tests {
             frame.contains("!! CONTROLLER OFFLINE \u{2014} start it with 'winter run' !!"),
             "missing offline banner: {frame}"
         );
-        assert!(frame.contains("winter ui"), "missing header: {frame}");
-        assert!(frame.contains("prefix: idle"), "missing header: {frame}");
         assert!(
-            frame.contains("terminal: not found"),
-            "missing header: {frame}"
+            frame.starts_with("!! CONTROLLER OFFLINE"),
+            "the banner must be the top line: {frame}"
+        );
+        assert!(
+            frame.contains("\u{2500}\u{2500} controller \u{2500}\u{2500}"),
+            "missing controller rule: {frame}"
+        );
+        assert!(
+            frame.contains("online   OFFLINE"),
+            "the sidebar must show OFFLINE: {frame}"
+        );
+        assert!(frame.contains("prefix   idle"), "missing prefix: {frame}");
+        assert!(
+            frame.contains("terminal missing"),
+            "missing terminal: {frame}"
+        );
+        assert!(frame.contains("q quit"), "missing quit hint: {frame}");
+
+        let lines: Vec<&str> = frame.split('\n').collect();
+        assert!(lines.len() <= 30, "row budget exceeded: {}", lines.len());
+        assert!(
+            lines.iter().all(|line| line.chars().count() <= 100),
+            "a line exceeded the column budget: {frame}"
         );
     }
 

@@ -1,5 +1,12 @@
 use std::time::Duration;
 
+#[cfg(target_os = "windows")]
+use std::sync::Arc;
+#[cfg(target_os = "windows")]
+use std::sync::RwLock;
+#[cfg(target_os = "windows")]
+use std::sync::atomic::{AtomicBool, AtomicU64};
+
 use serde::{Deserialize, Serialize};
 
 use crate::integration::{ChangeStatus, DoctorReport};
@@ -74,6 +81,45 @@ pub fn bridge_is_ready(report: &DoctorReport) -> bool {
         })
 }
 
+/// Shared sources behind every live field of [`DashboardState`](crate::dashboard::DashboardState).
+///
+/// One instance is created per `run()` and fanned out by `Arc` clone to the
+/// three writers/readers: the hook dispatcher stores `prefix_armed` and
+/// `dropped`, the action worker owns `dispatched`/`failed`/`last_error`, the
+/// watchdog mirrors `hook_active`/`hook_panics`, and the desktop observer
+/// reads every slot once per tick. All accesses are relaxed atomics (or a
+/// short-lived `RwLock` read for the last error), so a tick never blocks a
+/// hot path.
+#[cfg(target_os = "windows")]
+#[derive(Clone, Debug)]
+pub(crate) struct DashboardTelemetry {
+    /// Unix time of controller start; `0` means unknown.
+    pub started_unix_ms: u64,
+    pub prefix_armed: Arc<AtomicBool>,
+    pub hook_active: Arc<AtomicBool>,
+    pub hook_panics: Arc<AtomicU64>,
+    pub dispatched: Arc<AtomicU64>,
+    pub failed: Arc<AtomicU64>,
+    pub dropped: Arc<AtomicU64>,
+    pub last_error: Arc<RwLock<Option<String>>>,
+}
+
+#[cfg(target_os = "windows")]
+impl Default for DashboardTelemetry {
+    fn default() -> Self {
+        Self {
+            started_unix_ms: 0,
+            prefix_armed: Arc::new(AtomicBool::new(false)),
+            hook_active: Arc::new(AtomicBool::new(true)),
+            hook_panics: Arc::new(AtomicU64::new(0)),
+            dispatched: Arc::new(AtomicU64::new(0)),
+            failed: Arc::new(AtomicU64::new(0)),
+            dropped: Arc::new(AtomicU64::new(0)),
+            last_error: Arc::new(RwLock::new(None)),
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
 mod implementation {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -98,7 +144,10 @@ mod implementation {
     use super::desktop::{DesktopCache, DesktopSnapshot};
     use super::keyboard::KeyboardNormalizer;
     use super::pointer::PointerDragState;
-    use super::{AppError, AppResult, ControllerConfig, ControllerOptions, ControllerRunReport};
+    use super::{
+        AppError, AppResult, ControllerConfig, ControllerOptions, ControllerRunReport,
+        DashboardTelemetry,
+    };
 
     const MIN_FOREGROUND_POLL_INTERVAL: Duration = Duration::from_millis(5);
     const MAX_FOREGROUND_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -110,6 +159,7 @@ mod implementation {
         config: &ControllerConfig,
         options: ControllerOptions,
     ) -> AppResult<ControllerRunReport> {
+        let started_unix_ms = dashboard::unix_ms_now();
         let dpi_active = enable_per_monitor_dpi_awareness();
         validate_options(options)?;
         if !is_current_process_elevated().map_err(map_platform_error)? {
@@ -127,16 +177,22 @@ mod implementation {
             let _child = launch_windows_terminal().map_err(map_platform_error)?;
         }
 
-        let prefix_armed = Arc::new(AtomicBool::new(false));
+        let action_worker = ActionWorker::start(options.action_queue_capacity)?;
+        let worker_telemetry = action_worker.telemetry();
+        let telemetry = DashboardTelemetry {
+            started_unix_ms,
+            dispatched: Arc::clone(&worker_telemetry.dispatched),
+            failed: Arc::clone(&worker_telemetry.failed),
+            last_error: Arc::clone(&worker_telemetry.last_error),
+            ..DashboardTelemetry::default()
+        };
         let desktop_cache = DesktopCache::start(
             options.foreground_poll_interval,
             config.mouse_resize,
-            Arc::clone(&prefix_armed),
+            telemetry.clone(),
         )?;
         let cached_desktop = desktop_cache.shared();
-        let dropped_actions = Arc::new(AtomicU64::new(0));
 
-        let action_worker = ActionWorker::start(options.action_queue_capacity)?;
         let (shutdown_sender, shutdown_receiver) = mpsc::sync_channel(1);
 
         let prefix_runtime = config.prefix_config()?;
@@ -144,13 +200,13 @@ mod implementation {
         let mut dispatcher = HookDispatcher {
             prefix: PrefixMachine::new(prefix_runtime),
             prefix_chord,
-            prefix_armed: Arc::clone(&prefix_armed),
+            prefix_armed: Arc::clone(&telemetry.prefix_armed),
             normalizer: KeyboardNormalizer::default(),
             pending_shutdown_key: None,
             pointer_drag: PointerDragState::default(),
             worker_sender: action_worker.sender(),
             shutdown_sender,
-            dropped_actions_for_hook: Arc::clone(&dropped_actions),
+            dropped_actions_for_hook: Arc::clone(&telemetry.dropped),
             mouse_resize_enabled: config.mouse_resize.enabled,
             divider_hit_slop_px: i32::from(config.mouse_resize.divider_hit_slop_px),
             snapshots: DesktopSnapshotSource::new(cached_desktop),
@@ -191,7 +247,12 @@ mod implementation {
             }
         };
 
-        let shutdown_result = wait_for_shutdown(&shutdown_receiver, &hook);
+        let shutdown_result = wait_for_shutdown(
+            &shutdown_receiver,
+            SHUTDOWN_WATCHDOG_POLL_INTERVAL,
+            || (hook.is_handler_active(), hook.handler_panic_count()),
+            &telemetry,
+        );
 
         let hook_result = hook.stop().map_err(map_platform_error);
         let cache_result = desktop_cache.stop();
@@ -211,7 +272,7 @@ mod implementation {
         Ok(ControllerRunReport {
             dispatched_actions: report.dispatched_actions,
             failed_actions: report.failed_actions,
-            dropped_actions: dropped_actions.load(Ordering::Relaxed),
+            dropped_actions: telemetry.dropped.load(Ordering::Relaxed),
             last_dispatch_error: report.last_dispatch_error,
             pane_geometry_errors: cache_report.pane_geometry_errors,
             last_pane_geometry_error: cache_report.last_pane_geometry_error,
@@ -219,21 +280,33 @@ mod implementation {
         })
     }
 
-    /// Waits for the shutdown handshake while polling hook health, so a
-    /// disabled handler (panic) or a silently removed hook cannot leave the
-    /// controller parked in a blocking receive forever.
-    fn wait_for_shutdown(receiver: &mpsc::Receiver<()>, hook: &InputHook) -> AppResult<()> {
+    /// Waits for the shutdown handshake while mirroring hook health into the
+    /// shared telemetry on every iteration, so a disabled handler (panic) or a
+    /// silently removed hook cannot leave the controller parked in a blocking
+    /// receive forever — and `winter ui` observes `hook_active`/`hook_panics`
+    /// live instead of only at the next failure.
+    ///
+    /// `health` yields `(handler_active, panic_count)` and `poll_interval` is
+    /// the watchdog cadence; both are parameters so tests can drive the loop
+    /// without installing process-global hooks.
+    fn wait_for_shutdown(
+        receiver: &mpsc::Receiver<()>,
+        poll_interval: Duration,
+        mut health: impl FnMut() -> (bool, u64),
+        telemetry: &DashboardTelemetry,
+    ) -> AppResult<()> {
         loop {
-            match receiver.recv_timeout(SHUTDOWN_WATCHDOG_POLL_INTERVAL) {
+            let (active, panics) = health();
+            telemetry.hook_active.store(active, Ordering::Relaxed);
+            telemetry.hook_panics.store(panics, Ordering::Relaxed);
+            if !active || panics > 0 {
+                return Err(AppError::Native(format!(
+                    "input hook handler was disabled (panics: {panics})"
+                )));
+            }
+            match receiver.recv_timeout(poll_interval) {
                 Ok(()) => return Ok(()),
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    let panics = hook.handler_panic_count();
-                    if !hook.is_handler_active() || panics > 0 {
-                        return Err(AppError::Native(format!(
-                            "input hook handler was disabled (panics: {panics})"
-                        )));
-                    }
-                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     return Err(AppError::Native(
                         "controller shutdown channel disconnected unexpectedly".to_owned(),
@@ -696,10 +769,12 @@ mod implementation {
                 PaneGeometry {
                     bounds: ScreenRect::new(0, 0, 497, 800),
                     has_keyboard_focus: false,
+                    title: String::new(),
                 },
                 PaneGeometry {
                     bounds: ScreenRect::new(503, 0, 1_000, 800),
                     has_keyboard_focus: false,
+                    title: String::new(),
                 },
             ])
             .divider_at(ScreenPoint::new(500, 400), 0)
@@ -769,6 +844,71 @@ mod implementation {
                 already_running,
                 AppError::ControllerAlreadyRunning
             ));
+        }
+
+        #[test]
+        fn watchdog_mirrors_hook_health_on_every_iteration_until_unhealthy() {
+            let (sender, receiver) = mpsc::sync_channel::<()>(1);
+            let telemetry = DashboardTelemetry::default();
+            let polls = Arc::new(AtomicU64::new(0));
+            let health = {
+                let polls = Arc::clone(&polls);
+                move || {
+                    if polls.fetch_add(1, Ordering::Relaxed) == 0 {
+                        (true, 0)
+                    } else {
+                        (false, 1)
+                    }
+                }
+            };
+
+            let error = wait_for_shutdown(&receiver, Duration::from_millis(2), health, &telemetry)
+                .expect_err("a disabled handler must fail the watchdog");
+            assert!(
+                error.to_string().contains("panics: 1"),
+                "the error must surface the mirrored panic count: {error}"
+            );
+            assert_eq!(polls.load(Ordering::Relaxed), 2);
+            assert!(!telemetry.hook_active.load(Ordering::Relaxed));
+            assert_eq!(telemetry.hook_panics.load(Ordering::Relaxed), 1);
+            drop(sender);
+        }
+
+        #[test]
+        fn watchdog_mirrors_health_before_reporting_the_shutdown_handshake() {
+            let (sender, receiver) = mpsc::sync_channel(1);
+            // Pre-seed the opposite value: only the mirror inside the loop can
+            // flip it back before the pending shutdown is observed.
+            let telemetry = DashboardTelemetry {
+                hook_active: Arc::new(AtomicBool::new(false)),
+                hook_panics: Arc::new(AtomicU64::new(7)),
+                ..DashboardTelemetry::default()
+            };
+            sender.send(()).expect("the shutdown handshake enqueues");
+
+            wait_for_shutdown(&receiver, Duration::from_secs(1), || (true, 0), &telemetry)
+                .expect("a healthy handler with a pending shutdown returns Ok");
+            assert!(telemetry.hook_active.load(Ordering::Relaxed));
+            assert_eq!(telemetry.hook_panics.load(Ordering::Relaxed), 0);
+        }
+
+        #[test]
+        fn watchdog_reports_a_disconnected_shutdown_channel() {
+            let (sender, receiver) = mpsc::sync_channel::<()>(1);
+            drop(sender);
+            let telemetry = DashboardTelemetry::default();
+
+            let error = wait_for_shutdown(
+                &receiver,
+                Duration::from_millis(2),
+                || (true, 0),
+                &telemetry,
+            )
+            .expect_err("a dropped sender must fail the watchdog");
+            assert!(
+                error.to_string().contains("disconnected"),
+                "unexpected error: {error}"
+            );
         }
     }
 }

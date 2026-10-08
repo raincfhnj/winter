@@ -195,6 +195,9 @@ fn native_pane_geometry_from_environment() {
 
     println!("WINTERMINAL_E2E_PANE_COUNT={}", layout.panes().len());
     println!("WINTERMINAL_E2E_DIVIDER_COUNT={}", layout.dividers().len());
+    for (index, pane) in layout.panes().iter().enumerate() {
+        println!("WINTERMINAL_E2E_PANE_{index}_TITLE={:?}", pane.title);
+    }
     assert_eq!(layout.panes().len(), expected_panes);
     if expected_panes > 1 {
         assert!(

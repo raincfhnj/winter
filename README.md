@@ -121,9 +121,13 @@ Manual equivalent: run the OLD version's `winter uninstall`, delete
 | `winter plan` / `winter install` / `winter uninstall` | Bridge lifecycle: preview the changes, install the fragment, hidden keybindings, and shell block, or remove only what Winter still owns |
 | `winter doctor` | Machine-readable JSON `{schema_version, healthy, config:{path, ok, error}, integration}` |
 
-Open `winter ui` in a pane to watch panes, focus, and prefix state live; `q`, `Q`,
-`Ctrl+C`, or `Esc` quits, and the dashboard shows `OFFLINE` when the controller is not
-running.
+Open `winter ui` in a pane for a tmux-style dashboard: a left sidebar shows
+controller status (uptime, prefix, hook health, action counters, last error)
+and the pane list with titles and the focused pane marked `*`, while the right
+side draws the pane map. Pane titles come from Windows Terminal, so rename a
+tab to label an agent's pane. `q`, `Q`, `Ctrl+C`, or `Esc` quits, and the
+dashboard shows `OFFLINE` when the controller is not running (the sidebar
+degrades to a single column below 60 columns).
 
 Exit statuses are listed under [Exit codes](#exit-codes). Scripts and agents should
 prefer the machine-readable outputs — `winter ui --once` and the JSON reports printed

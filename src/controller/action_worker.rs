@@ -1,4 +1,6 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -77,24 +79,76 @@ pub(super) struct WorkerReport {
     pub(super) last_dispatch_error: Option<String>,
 }
 
+/// Live dispatch counters shared between the worker thread, the controller,
+/// and the desktop observer.
+///
+/// The worker thread writes these slots; the observer reads them every
+/// dashboard tick; [`ActionWorker::stop`] builds the final
+/// [`WorkerReport`] from the same slots, so the live getters and the
+/// report can never disagree.
+#[derive(Clone, Debug, Default)]
+pub(super) struct WorkerTelemetry {
+    pub(super) dispatched: Arc<AtomicU64>,
+    pub(super) failed: Arc<AtomicU64>,
+    pub(super) last_error: Arc<RwLock<Option<String>>>,
+}
+
+impl WorkerTelemetry {
+    fn record_dispatched(&self, dispatched: u64) {
+        if dispatched > 0 {
+            self.dispatched.fetch_add(dispatched, Ordering::Relaxed);
+        }
+    }
+
+    fn record_failure(&self, error: String) {
+        self.failed.fetch_add(1, Ordering::Relaxed);
+        *self
+            .last_error
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+    }
+
+    pub(super) fn report(&self) -> WorkerReport {
+        WorkerReport {
+            dispatched_actions: self.dispatched.load(Ordering::Relaxed),
+            failed_actions: self.failed.load(Ordering::Relaxed),
+            last_dispatch_error: self
+                .last_error
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        }
+    }
+}
+
 pub(super) struct ActionWorker {
     sender: Option<SyncSender<WorkerMessage>>,
     join: Option<JoinHandle<AppResult<WorkerReport>>>,
+    telemetry: WorkerTelemetry,
 }
 
 impl ActionWorker {
     pub(super) fn start(capacity: usize) -> AppResult<Self> {
         let (sender, receiver) = mpsc::sync_channel(capacity);
+        let telemetry = WorkerTelemetry::default();
+        let worker_telemetry = telemetry.clone();
         let join = thread::Builder::new()
             .name("winter-action-worker".to_owned())
-            .spawn(move || Ok(run(receiver)))
+            .spawn(move || Ok(run(receiver, worker_telemetry)))
             .map_err(|error| {
                 AppError::Native(format!("failed to spawn action worker thread: {error}"))
             })?;
         Ok(Self {
             sender: Some(sender),
             join: Some(join),
+            telemetry,
         })
+    }
+
+    /// Cheap view over the shared counters; safe to read while the worker
+    /// thread is dispatching.
+    pub(super) fn telemetry(&self) -> &WorkerTelemetry {
+        &self.telemetry
     }
 
     pub(super) fn sender(&self) -> SyncSender<WorkerMessage> {
@@ -108,7 +162,7 @@ impl ActionWorker {
             request_stop(&sender, STOP_SEND_ATTEMPTS, STOP_SEND_INTERVAL);
         }
         let Some(join) = self.join.take() else {
-            return Ok(WorkerReport::default());
+            return Ok(self.telemetry.report());
         };
         join.join()
             .map_err(|_| AppError::Native("action worker thread panicked".to_owned()))?
@@ -140,8 +194,7 @@ fn request_stop(sender: &SyncSender<WorkerMessage>, attempts: usize, interval: D
     false
 }
 
-fn run(receiver: Receiver<WorkerMessage>) -> WorkerReport {
-    let mut report = WorkerReport::default();
+fn run(receiver: Receiver<WorkerMessage>, telemetry: WorkerTelemetry) -> WorkerReport {
     let mut accessibility = None;
     let mut last_focused = None;
     while let Ok(message) = receiver.recv() {
@@ -169,14 +222,11 @@ fn run(receiver: Receiver<WorkerMessage>) -> WorkerReport {
         };
 
         match result {
-            Ok(dispatched) => report.dispatched_actions += dispatched,
-            Err(error) => {
-                report.failed_actions += 1;
-                report.last_dispatch_error = Some(error.to_string());
-            }
+            Ok(dispatched) => telemetry.record_dispatched(dispatched),
+            Err(error) => telemetry.record_failure(error.to_string()),
         }
     }
-    report
+    telemetry.report()
 }
 
 fn dispatch_action(target: WindowIdentity, action: TerminalAction) -> Result<u64, WorkerError> {
@@ -262,7 +312,7 @@ mod tests {
     #[test]
     fn worker_loop_exits_when_all_senders_drop() {
         let (sender, receiver) = mpsc::sync_channel(4);
-        let join = thread::spawn(move || run(receiver));
+        let join = thread::spawn(move || run(receiver, WorkerTelemetry::default()));
         drop(sender);
         let report = join.join().expect("worker exits after disconnect");
         assert_eq!(report.dispatched_actions, 0);
@@ -272,7 +322,7 @@ mod tests {
     #[test]
     fn worker_loop_exits_on_the_stop_message() {
         let (sender, receiver) = mpsc::sync_channel(4);
-        let join = thread::spawn(move || run(receiver));
+        let join = thread::spawn(move || run(receiver, WorkerTelemetry::default()));
         sender
             .send(WorkerMessage::Stop)
             .expect("stop message enqueues");
@@ -288,6 +338,68 @@ mod tests {
         let report = worker.stop().expect("stop succeeds");
         assert_eq!(report.dispatched_actions, 0);
         assert_eq!(report.failed_actions, 0);
+    }
+
+    #[test]
+    fn worker_report_reads_the_shared_slots() {
+        let telemetry = WorkerTelemetry::default();
+        telemetry.record_dispatched(3);
+        telemetry.record_failure("boom".to_owned());
+
+        assert_eq!(telemetry.dispatched.load(Ordering::Relaxed), 3);
+        assert_eq!(telemetry.failed.load(Ordering::Relaxed), 1);
+        let report = telemetry.report();
+        assert_eq!(report.dispatched_actions, 3);
+        assert_eq!(report.failed_actions, 1);
+        assert_eq!(report.last_dispatch_error.as_deref(), Some("boom"));
+    }
+
+    /// A failing dispatch must be visible through the shared counters while
+    /// the worker is still running — before `stop` builds the final report.
+    #[test]
+    fn shared_counters_reflect_a_dispatch_before_stop() {
+        let worker = ActionWorker::start(4).expect("worker starts");
+        let telemetry = worker.telemetry().clone();
+        // The fake identity fails `validate_window_identity` before any input
+        // is injected, so the dispatch records a failure without touching the
+        // desktop.
+        worker
+            .sender()
+            .send(WorkerMessage::Dispatch {
+                target: WindowIdentity {
+                    hwnd: 42,
+                    process_id: 7,
+                    process_started_at_100ns: 9,
+                    channel: crate::model::TerminalChannel::Stable,
+                },
+                action: TerminalAction::NewTab,
+            })
+            .expect("queue accepts the dispatch");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while telemetry.failed.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            telemetry.failed.load(Ordering::Relaxed),
+            1,
+            "the failure must reach the shared counter before stop"
+        );
+        assert_eq!(telemetry.dispatched.load(Ordering::Relaxed), 0);
+        assert!(
+            telemetry
+                .last_error
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some(),
+            "the shared last-error slot must be filled while running"
+        );
+
+        let report = worker.stop().expect("stop succeeds");
+        assert_eq!(report.failed_actions, 1);
+        assert_eq!(report.dispatched_actions, 0);
+        assert!(report.last_dispatch_error.is_some());
     }
 
     #[test]

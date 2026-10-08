@@ -17,6 +17,8 @@ use crate::platform::windows::{
 };
 use crate::{AppError, AppResult};
 
+use super::DashboardTelemetry;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct DesktopSnapshot {
     pub terminal: Option<WindowIdentity>,
@@ -41,7 +43,7 @@ impl DesktopCache {
     pub(super) fn start(
         foreground_poll_interval: Duration,
         mouse_resize: MouseResizeConfig,
-        prefix_armed: Arc<AtomicBool>,
+        telemetry: DashboardTelemetry,
     ) -> AppResult<Self> {
         let value = Arc::new(RwLock::new(DesktopSnapshot::default()));
         let stopping = Arc::new(AtomicBool::new(false));
@@ -63,7 +65,7 @@ impl DesktopCache {
                     worker_last_error,
                     foreground_poll_interval,
                     mouse_resize,
-                    prefix_armed,
+                    telemetry,
                     ready_sender,
                 );
             })
@@ -131,8 +133,9 @@ impl Drop for DesktopCache {
 /// dashboard state file on every tick.
 ///
 /// Eight parameters by design — the four shared handles, the cadence, the
-/// mouse-resize config, the prefix flag, and the readiness channel — so the
-/// observer thread keeps a flat argument list instead of a wrapper struct.
+/// mouse-resize config, the live telemetry sources, and the readiness
+/// channel — so the observer thread keeps a flat argument list instead of a
+/// wrapper struct.
 #[allow(clippy::too_many_arguments)]
 fn run_observer(
     value: Arc<RwLock<DesktopSnapshot>>,
@@ -141,7 +144,7 @@ fn run_observer(
     last_pane_geometry_error: Arc<RwLock<Option<String>>>,
     foreground_poll_interval: Duration,
     mouse_resize: MouseResizeConfig,
-    prefix_armed: Arc<AtomicBool>,
+    telemetry: DashboardTelemetry,
     ready_sender: mpsc::SyncSender<Result<(), PlatformError>>,
 ) {
     let accessibility = if mouse_resize.enabled {
@@ -156,7 +159,7 @@ fn run_observer(
         None
     };
 
-    let mut dashboard = DashboardPublisher::new(prefix_armed, mouse_resize.enabled);
+    let mut dashboard = DashboardPublisher::new(telemetry, mouse_resize.enabled);
     let mut snapshot = DesktopSnapshot::default();
     let mut resolved_hwnd = 0;
     let mut last_geometry_refresh = Instant::now()
@@ -198,11 +201,12 @@ fn run_observer(
 
 /// Writes [`DashboardState`] to the state file from the observer thread.
 ///
-/// The input-hook path only stores the prefix flag; this side reads it once
-/// per tick, builds the DTO, and performs the write syscall only when the
-/// observable body changed since the last successful write.
+/// The hot paths (hook dispatcher, action worker, watchdog) only store into
+/// the shared telemetry slots; this side reads them once per tick, builds the
+/// DTO, and performs the write syscall only when the observable body changed
+/// since the last successful write.
 struct DashboardPublisher {
-    prefix_armed: Arc<AtomicBool>,
+    telemetry: DashboardTelemetry,
     mouse_resize_enabled: bool,
     path: Option<PathBuf>,
     last_written: Option<DashboardState>,
@@ -211,9 +215,9 @@ struct DashboardPublisher {
 impl DashboardPublisher {
     /// Resolves the dashboard path once; an unresolvable path disables
     /// publishing instead of failing the observer.
-    fn new(prefix_armed: Arc<AtomicBool>, mouse_resize_enabled: bool) -> Self {
+    fn new(telemetry: DashboardTelemetry, mouse_resize_enabled: bool) -> Self {
         Self {
-            prefix_armed,
+            telemetry,
             mouse_resize_enabled,
             path: dashboard_path().ok(),
             last_written: None,
@@ -221,32 +225,42 @@ impl DashboardPublisher {
     }
 
     /// Builds and publishes one tick's state; returns whether the file was
-    /// rewritten. Checked every tick so a prefix flip lands even when the
-    /// desktop snapshot itself is unchanged. Never fails: a write error is
-    /// housekeeping, retried on the next tick.
+    /// rewritten. Checked every tick so a counter or flag flip lands even
+    /// when the desktop snapshot itself is unchanged. Never fails: a write
+    /// error is housekeeping, retried on the next tick.
     fn publish(&mut self, snapshot: &DesktopSnapshot) -> bool {
-        let prefix_armed = self.prefix_armed.load(Ordering::Relaxed);
-        let state = build_dashboard_state(snapshot, prefix_armed, self.mouse_resize_enabled);
+        let state = build_dashboard_state(snapshot, &self.telemetry, self.mouse_resize_enabled);
         publish_if_changed(self.path.as_deref(), &state, &mut self.last_written)
     }
 }
 
-/// Builds the observable dashboard DTO from one desktop snapshot.
+/// Builds the observable dashboard DTO from one desktop snapshot plus the
+/// live telemetry slots.
 ///
 /// `focused` reads `PaneGeometry::has_keyboard_focus`, which the
-/// accessibility adapter populates and this is the first consumer of.
+/// accessibility adapter populates and this is the first consumer of;
+/// `title` is the same adapter's UIA `CurrentName` read. Every telemetry
+/// access is a cheap relaxed atomic load (the last error a short-lived
+/// `RwLock` read), so one tick never blocks a hot path.
 fn build_dashboard_state(
     snapshot: &DesktopSnapshot,
-    prefix_armed: bool,
+    telemetry: &DashboardTelemetry,
     mouse_resize_enabled: bool,
 ) -> DashboardState {
     DashboardState {
         schema_version: DASHBOARD_SCHEMA_VERSION,
         updated_unix_ms: unix_ms_now(),
         controller_running: true,
-        prefix_armed,
+        prefix_armed: telemetry.prefix_armed.load(Ordering::Relaxed),
         mouse_resize_enabled,
         terminal_present: snapshot.terminal.is_some(),
+        controller_started_unix_ms: telemetry.started_unix_ms,
+        hook_active: telemetry.hook_active.load(Ordering::Relaxed),
+        hook_panics: telemetry.hook_panics.load(Ordering::Relaxed),
+        dispatched_actions: telemetry.dispatched.load(Ordering::Relaxed),
+        failed_actions: telemetry.failed.load(Ordering::Relaxed),
+        dropped_actions: telemetry.dropped.load(Ordering::Relaxed),
+        last_dispatch_error: (*read_lock(&telemetry.last_error)).clone(),
         panes: snapshot
             .pane_layout
             .panes()
@@ -257,6 +271,7 @@ fn build_dashboard_state(
                 width: pane.bounds.width(),
                 height: pane.bounds.height(),
                 focused: pane.has_keyboard_focus,
+                title: pane.title.clone(),
             })
             .collect(),
         dividers: snapshot
@@ -442,14 +457,16 @@ mod tests {
 
     fn state_for(prefix_armed: bool, updated_unix_ms: u64) -> DashboardState {
         DashboardState {
-            schema_version: DASHBOARD_SCHEMA_VERSION,
             updated_unix_ms,
-            controller_running: true,
             prefix_armed,
-            mouse_resize_enabled: false,
-            terminal_present: false,
-            panes: Vec::new(),
-            dividers: Vec::new(),
+            ..DashboardState::empty(false)
+        }
+    }
+
+    fn telemetry(prefix_armed: bool) -> DashboardTelemetry {
+        DashboardTelemetry {
+            prefix_armed: Arc::new(AtomicBool::new(prefix_armed)),
+            ..DashboardTelemetry::default()
         }
     }
 
@@ -475,19 +492,22 @@ mod tests {
                 PaneGeometry {
                     bounds: ScreenRect::new(0, 0, 497, 1000),
                     has_keyboard_focus: false,
+                    title: String::new(),
                 },
                 PaneGeometry {
                     bounds: ScreenRect::new(503, 0, 1000, 497),
                     has_keyboard_focus: true,
+                    title: String::new(),
                 },
                 PaneGeometry {
                     bounds: ScreenRect::new(503, 503, 1000, 1000),
                     has_keyboard_focus: false,
+                    title: String::new(),
                 },
             ]),
         };
 
-        let state = build_dashboard_state(&snapshot, true, false);
+        let state = build_dashboard_state(&snapshot, &telemetry(true), false);
 
         assert_eq!(state.schema_version, DASHBOARD_SCHEMA_VERSION);
         assert!(state.controller_running);
@@ -503,6 +523,7 @@ mod tests {
                     width: 497,
                     height: 1000,
                     focused: false,
+                    title: String::new(),
                 },
                 DashboardPane {
                     x: 503,
@@ -510,6 +531,7 @@ mod tests {
                     width: 497,
                     height: 497,
                     focused: true,
+                    title: String::new(),
                 },
                 DashboardPane {
                     x: 503,
@@ -517,6 +539,7 @@ mod tests {
                     width: 497,
                     height: 497,
                     focused: false,
+                    title: String::new(),
                 },
             ]
         );
@@ -544,12 +567,68 @@ mod tests {
             ]
         );
 
-        let absent = build_dashboard_state(&DesktopSnapshot::default(), false, true);
+        let absent = build_dashboard_state(
+            &DesktopSnapshot::default(),
+            &DashboardTelemetry::default(),
+            true,
+        );
         assert!(!absent.terminal_present);
         assert!(absent.mouse_resize_enabled);
         assert!(!absent.prefix_armed);
         assert!(absent.panes.is_empty());
         assert!(absent.dividers.is_empty());
+    }
+
+    /// Every frozen telemetry field of `DashboardState` must be sourced from
+    /// the shared slots, including the pane titles the accessibility adapter
+    /// read via UIA `CurrentName`.
+    #[test]
+    fn dashboard_state_maps_titles_and_all_telemetry_counters() {
+        let started = 1_700_000_000_000;
+        let telemetry = DashboardTelemetry {
+            started_unix_ms: started,
+            hook_active: Arc::new(AtomicBool::new(false)),
+            hook_panics: Arc::new(AtomicU64::new(3)),
+            dispatched: Arc::new(AtomicU64::new(11)),
+            failed: Arc::new(AtomicU64::new(4)),
+            dropped: Arc::new(AtomicU64::new(2)),
+            last_error: Arc::new(RwLock::new(Some("injection refused".to_owned()))),
+            ..DashboardTelemetry::default()
+        };
+        let snapshot = DesktopSnapshot {
+            terminal: Some(WindowIdentity {
+                hwnd: 21,
+                process_id: 5,
+                process_started_at_100ns: 6,
+                channel: crate::model::TerminalChannel::Stable,
+            }),
+            pane_layout: PaneLayout::from_panes(vec![PaneGeometry {
+                bounds: ScreenRect::new(0, 0, 497, 800),
+                has_keyboard_focus: false,
+                title: "build: main".to_owned(),
+            }]),
+        };
+
+        let state = build_dashboard_state(&snapshot, &telemetry, true);
+
+        assert_eq!(state.controller_started_unix_ms, started);
+        assert!(
+            state.uptime_ms().is_some(),
+            "a known start time must yield a computable uptime"
+        );
+        assert!(!state.hook_active);
+        assert_eq!(state.hook_panics, 3);
+        assert_eq!(state.dispatched_actions, 11);
+        assert_eq!(state.failed_actions, 4);
+        assert_eq!(state.dropped_actions, 2);
+        assert_eq!(
+            state.last_dispatch_error.as_deref(),
+            Some("injection refused")
+        );
+        assert_eq!(state.panes.len(), 1);
+        assert_eq!(state.panes[0].title, "build: main");
+        assert!(state.mouse_resize_enabled);
+        assert!(state.terminal_present);
     }
 
     #[test]
@@ -579,9 +658,10 @@ mod tests {
     fn prefix_flip_is_written_even_when_the_snapshot_is_unchanged() {
         let temp = tempfile::tempdir().expect("temporary directory should be created");
         let path = temp.path().join(DASHBOARD_FILE_NAME);
-        let prefix_armed = Arc::new(AtomicBool::new(false));
+        let telemetry = telemetry(false);
+        let publisher_telemetry = telemetry.clone();
         let mut publisher = DashboardPublisher {
-            prefix_armed: Arc::clone(&prefix_armed),
+            telemetry: publisher_telemetry,
             mouse_resize_enabled: false,
             path: Some(path.clone()),
             last_written: None,
@@ -597,7 +677,7 @@ mod tests {
             "an unchanged tick must skip the write"
         );
 
-        prefix_armed.store(true, Ordering::Relaxed);
+        telemetry.prefix_armed.store(true, Ordering::Relaxed);
         assert!(
             publisher.publish(&snapshot),
             "a prefix flip must land even with a frozen snapshot"
@@ -605,6 +685,36 @@ mod tests {
 
         let stored = crate::dashboard::read_dashboard(&path).expect("valid dashboard JSON");
         assert!(stored.prefix_armed);
+        assert!(staging_leftovers(temp.path()).is_empty());
+    }
+
+    /// A live counter bump (as produced by a resize drag) changes the body,
+    /// so the body-compared write fires on the very next tick.
+    #[test]
+    fn counter_bumps_are_written_even_when_the_snapshot_is_unchanged() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let path = temp.path().join(DASHBOARD_FILE_NAME);
+        let telemetry = telemetry(false);
+        let publisher_telemetry = telemetry.clone();
+        let mut publisher = DashboardPublisher {
+            telemetry: publisher_telemetry,
+            mouse_resize_enabled: false,
+            path: Some(path.clone()),
+            last_written: None,
+        };
+        let snapshot = DesktopSnapshot::default();
+
+        assert!(publisher.publish(&snapshot));
+        assert!(!publisher.publish(&snapshot));
+
+        telemetry.dispatched.store(7, Ordering::Relaxed);
+        assert!(
+            publisher.publish(&snapshot),
+            "a dispatch counter bump must rewrite the state file"
+        );
+
+        let stored = crate::dashboard::read_dashboard(&path).expect("valid dashboard JSON");
+        assert_eq!(stored.dispatched_actions, 7);
         assert!(staging_leftovers(temp.path()).is_empty());
     }
 
@@ -722,6 +832,7 @@ mod tests {
         let layout = PaneLayout::from_panes(vec![PaneGeometry {
             bounds: ScreenRect::new(0, 0, 100, 100),
             has_keyboard_focus: false,
+            title: String::new(),
         }]);
 
         assert!(!apply_layout(&mut snapshot, PaneLayout::default()));

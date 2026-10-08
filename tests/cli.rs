@@ -199,6 +199,9 @@ fn ui_once_renders_a_fixture_dashboard() {
         .duration_since(UNIX_EPOCH)
         .expect("the clock must be past the Unix epoch")
         .as_millis() as u64;
+    // Deliberately legacy: no controller/hook/telemetry/title fields, so
+    // this also proves the pre-sidebar fixture JSON still parses through
+    // the serde defaults while rendering the sidebar layout.
     let state = serde_json::json!({
         "schemaVersion": 1,
         "updatedUnixMs": now,
@@ -230,9 +233,86 @@ fn ui_once_renders_a_fixture_dashboard() {
     assert!(stdout.contains("winter ui"), "missing header: {stdout}");
     assert!(stdout.contains("3 panes"), "missing pane count: {stdout}");
     assert!(
-        stdout.contains("prefix: ARMED"),
+        stdout.contains("prefix   ARMED"),
         "missing prefix state: {stdout}"
     );
+    assert!(stdout.contains("q quit"), "missing quit hint: {stdout}");
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "--once must not emit ANSI sequences: {stdout:?}"
+    );
+}
+
+#[test]
+fn ui_once_renders_the_sidebar_telemetry() {
+    let temp = tempdir().expect("temporary directory should be created");
+    let fixture = temp.path().join("dashboard.json");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the clock must be past the Unix epoch")
+        .as_millis() as u64;
+    let state = serde_json::json!({
+        "schemaVersion": 1,
+        "updatedUnixMs": now,
+        "controllerRunning": true,
+        "prefixArmed": true,
+        "mouseResizeEnabled": false,
+        "terminalPresent": true,
+        "controllerStartedUnixMs": now - 192_000,
+        "hookActive": true,
+        "hookPanics": 2,
+        "dispatchedActions": 128,
+        "failedActions": 1,
+        "droppedActions": 2,
+        "lastDispatchError": "injection failed",
+        "panes": [
+            { "x": 0, "y": 0, "width": 40, "height": 12, "focused": false, "title": "root:~" },
+            { "x": 40, "y": 0, "width": 40, "height": 12, "focused": true, "title": "agent-build" },
+            { "x": 0, "y": 12, "width": 80, "height": 12, "focused": false, "title": "" }
+        ],
+        "dividers": []
+    });
+    fs::write(
+        &fixture,
+        serde_json::to_vec(&state).expect("fixture dashboard should serialize"),
+    )
+    .expect("fixture dashboard should be written");
+
+    let assert = Command::cargo_bin("winter")
+        .expect("winter binary should build")
+        .args(["ui", "--once", "--path"])
+        .arg(&fixture)
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    assert!(
+        stdout.contains("\u{2500}\u{2500} controller \u{2500}\u{2500}"),
+        "missing controller rule: {stdout}"
+    );
+    assert!(
+        stdout.contains("\u{2500}\u{2500} panes \u{2500}\u{2500}"),
+        "missing panes rule: {stdout}"
+    );
+    assert!(
+        stdout.contains("prefix   ARMED"),
+        "missing prefix state: {stdout}"
+    );
+    assert!(stdout.contains("2 panics"), "missing hook alarm: {stdout}");
+    assert!(
+        stdout.contains("128 / 1 fail / 2 drop"),
+        "missing action counters: {stdout}"
+    );
+    assert!(
+        stdout.contains("err: injection failed"),
+        "missing dispatch error: {stdout}"
+    );
+    assert!(
+        stdout.contains(" 2 *agent-build"),
+        "missing focused pane title: {stdout}"
+    );
+    assert!(stdout.contains(" 3  -"), "missing dash title: {stdout}");
+    assert!(stdout.contains("q quit"), "missing quit hint: {stdout}");
     assert!(
         !stdout.contains('\u{1b}'),
         "--once must not emit ANSI sequences: {stdout:?}"

@@ -58,10 +58,15 @@ impl ScreenRect {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One native pane rectangle plus its optional UI Automation title.
+///
+/// The `title` is `String`, so this type is `Clone` but no longer `Copy`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneGeometry {
     pub bounds: ScreenRect,
     pub has_keyboard_focus: bool,
+    /// Pane/tab title as reported by UI Automation; empty when unavailable.
+    pub title: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,7 +191,9 @@ impl PaneLayout {
         let mut dividers = Vec::new();
         for first_index in 0..panes.len() {
             for second_index in (first_index + 1)..panes.len() {
-                if let Some(divider) = divider_between(panes[first_index], panes[second_index]) {
+                if let Some(divider) =
+                    divider_between(panes[first_index].bounds, panes[second_index].bounds)
+                {
                     dividers.push(divider);
                 }
             }
@@ -295,9 +302,8 @@ const fn coordinate_for_axis(axis: SplitAxis, point: ScreenPoint) -> i32 {
     }
 }
 
-fn divider_between(first: PaneGeometry, second: PaneGeometry) -> Option<PaneDivider> {
-    vertical_divider(first.bounds, second.bounds)
-        .or_else(|| horizontal_divider(first.bounds, second.bounds))
+fn divider_between(first: ScreenRect, second: ScreenRect) -> Option<PaneDivider> {
+    vertical_divider(first, second).or_else(|| horizontal_divider(first, second))
 }
 
 fn vertical_divider(first: ScreenRect, second: ScreenRect) -> Option<PaneDivider> {
@@ -392,6 +398,7 @@ mod tests {
         PaneGeometry {
             bounds: ScreenRect::new(left, top, right, bottom),
             has_keyboard_focus: false,
+            title: String::new(),
         }
     }
 
@@ -628,5 +635,16 @@ mod tests {
 
         assert_eq!(layout.panes().len(), 3);
         assert!(layout.dividers().is_empty());
+    }
+
+    #[test]
+    fn pane_titles_survive_layout_construction() {
+        let mut titled = pane(0, 0, 497, 800);
+        titled.title = "build: main".to_owned();
+        let layout = PaneLayout::from_panes(vec![titled, pane(503, 0, 1000, 800)]);
+
+        assert_eq!(layout.panes().len(), 2);
+        assert_eq!(layout.panes()[0].title, "build: main");
+        assert_eq!(layout.panes()[1].title, "");
     }
 }

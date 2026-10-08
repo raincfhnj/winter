@@ -32,12 +32,33 @@ pub struct DashboardState {
     pub prefix_armed: bool,
     pub mouse_resize_enabled: bool,
     pub terminal_present: bool,
+    /// Unix time of controller start; `0` when unknown (offline frame).
+    #[serde(default)]
+    pub controller_started_unix_ms: u64,
+    /// Whether the low-level input hook handler is still enabled.
+    #[serde(default = "default_true")]
+    pub hook_active: bool,
+    /// Panics caught in the hook handler since controller start.
+    #[serde(default)]
+    pub hook_panics: u64,
+    #[serde(default)]
+    pub dispatched_actions: u64,
+    #[serde(default)]
+    pub failed_actions: u64,
+    #[serde(default)]
+    pub dropped_actions: u64,
+    #[serde(default)]
+    pub last_dispatch_error: Option<String>,
     pub panes: Vec<DashboardPane>,
     pub dividers: Vec<DashboardDivider>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// One terminal pane rectangle in screen coordinates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DashboardPane {
     pub x: i32,
@@ -45,6 +66,10 @@ pub struct DashboardPane {
     pub width: i32,
     pub height: i32,
     pub focused: bool,
+    /// Pane/tab title as reported by UI Automation (profile name or a title
+    /// the user set); empty when unavailable.
+    #[serde(default)]
+    pub title: String,
 }
 
 /// One pane divider band in screen coordinates.
@@ -69,9 +94,24 @@ impl DashboardState {
             prefix_armed: false,
             mouse_resize_enabled,
             terminal_present: false,
+            controller_started_unix_ms: 0,
+            hook_active: true,
+            hook_panics: 0,
+            dispatched_actions: 0,
+            failed_actions: 0,
+            dropped_actions: 0,
+            last_dispatch_error: None,
             panes: Vec::new(),
             dividers: Vec::new(),
         }
+    }
+
+    /// Milliseconds since controller start, `None` when the start time is
+    /// unknown.
+    #[must_use]
+    pub fn uptime_ms(&self) -> Option<u64> {
+        (self.controller_started_unix_ms > 0)
+            .then(|| unix_ms_now().saturating_sub(self.controller_started_unix_ms))
     }
 
     /// Same state with the timestamp zeroed, for change comparison.

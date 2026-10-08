@@ -88,11 +88,23 @@ impl TerminalAccessibility {
                     continue;
                 }
             };
+            // Third cross-process property read, purely informational: an
+            // element that cannot report its name still contributes its
+            // rectangle, so this failure neither drops the pane nor seeds
+            // `first_error` (the "only fail when everything failed" policy
+            // stays keyed to the bounding-rect/focus reads above).
             let bounds = ScreenRect::new(bounds.left, bounds.top, bounds.right, bounds.bottom);
             if bounds.is_valid() {
+                // SAFETY: `element` is a live UI Automation proxy used on the
+                // COM apartment where it was obtained.
+                let title = match unsafe { element.CurrentName() } {
+                    Ok(name) => String::from_utf16_lossy(&name),
+                    Err(_) => String::new(),
+                };
                 panes.push(PaneGeometry {
                     bounds,
                     has_keyboard_focus: has_keyboard_focus.as_bool(),
+                    title,
                 });
             }
         }

@@ -11,6 +11,7 @@ use crate::model::{Direction, TerminalAction, WindowIdentity};
 use crate::pane_layout::ScreenPoint;
 use crate::platform::windows::{
     PlatformError, TerminalAccessibility, send_bridge_chord, send_literal_chord,
+    validate_window_identity,
 };
 use crate::prefix::{KeyChord, LogicalKey};
 use crate::{AppError, AppResult};
@@ -45,6 +46,10 @@ pub(super) enum WorkerError {
     #[error("{0}")]
     Focus(#[source] PlatformError),
 
+    /// Selecting a Windows Terminal tab via UI Automation failed.
+    #[error("{0}")]
+    TabSelect(#[source] PlatformError),
+
     /// Sending a chord to the target failed (injection state / UIPI).
     #[error("{0}")]
     Injection(#[source] PlatformError),
@@ -68,6 +73,16 @@ pub(super) enum WorkerMessage {
         /// Monotonic identifier for one pointer drag, so the leading pane is
         /// focused once per drag without depending on a separate end message.
         drag_sequence: u64,
+    },
+    /// Focuses the pane whose rectangle contains `point` (dashboard command).
+    FocusAtPoint {
+        target: WindowIdentity,
+        point: ScreenPoint,
+    },
+    /// Selects a Windows Terminal tab by index (dashboard command).
+    SelectTab {
+        target: WindowIdentity,
+        index: u32,
     },
     Stop,
 }
@@ -218,6 +233,12 @@ fn run(receiver: Receiver<WorkerMessage>, telemetry: WorkerTelemetry) -> WorkerR
                 steps,
                 drag_sequence,
             ),
+            WorkerMessage::FocusAtPoint { target, point } => {
+                dispatch_focus_at_point(&mut accessibility, target, point)
+            }
+            WorkerMessage::SelectTab { target, index } => {
+                dispatch_select_tab(&mut accessibility, target, index)
+            }
             WorkerMessage::Stop => break,
         };
 
@@ -263,17 +284,11 @@ fn dispatch_pointer_resize(
     if steps == 0 {
         return Ok(0);
     }
-    if accessibility.is_none() {
-        *accessibility =
-            Some(TerminalAccessibility::initialize().map_err(WorkerError::AccessibilityInit)?);
-    }
     // The leading pane of a divider is stable for the whole drag, so only focus
     // once per drag. Keying on the drag sequence (rather than a separate end
     // message) keeps this correct even when the action queue is saturated.
     if *last_focused != Some(drag_sequence) {
-        accessibility
-            .as_ref()
-            .expect("accessibility is initialized above")
+        ensure_accessibility(accessibility)?
             .focus_pane_at(target, focus_point)
             .map_err(WorkerError::Focus)?;
         *last_focused = Some(drag_sequence);
@@ -286,6 +301,52 @@ fn dispatch_pointer_resize(
         send_bridge_chord(target, binding.bridge_chord).map_err(WorkerError::Injection)?;
     }
     Ok(u64::from(steps))
+}
+
+/// Focuses the pane containing `point` for a dashboard `FocusPane` command.
+///
+/// Failures (including a target that is no longer the foreground window)
+/// surface through the shared failed-action telemetry.
+fn dispatch_focus_at_point(
+    accessibility: &mut Option<TerminalAccessibility>,
+    target: WindowIdentity,
+    point: ScreenPoint,
+) -> Result<u64, WorkerError> {
+    ensure_accessibility(accessibility)?
+        .focus_pane_at(target, point)
+        .map_err(WorkerError::Focus)?;
+    Ok(1)
+}
+
+/// Selects a tab for a dashboard `SelectTab` command.
+///
+/// The target identity is revalidated before any UIA call, so a recycled
+/// HWND can never receive a tab selection.
+fn dispatch_select_tab(
+    accessibility: &mut Option<TerminalAccessibility>,
+    target: WindowIdentity,
+    index: u32,
+) -> Result<u64, WorkerError> {
+    validate_window_identity(target).map_err(WorkerError::TabSelect)?;
+    ensure_accessibility(accessibility)?
+        .select_tab(target.hwnd, index)
+        .map_err(WorkerError::TabSelect)?;
+    Ok(1)
+}
+
+/// Lazily initializes the UI Automation adapter and borrows it for one
+/// dispatch; an initialization failure flows into the same telemetry as any
+/// other dispatch error.
+fn ensure_accessibility(
+    accessibility: &mut Option<TerminalAccessibility>,
+) -> Result<&TerminalAccessibility, WorkerError> {
+    if accessibility.is_none() {
+        *accessibility =
+            Some(TerminalAccessibility::initialize().map_err(WorkerError::AccessibilityInit)?);
+    }
+    Ok(accessibility
+        .as_ref()
+        .expect("accessibility is initialized above"))
 }
 
 #[cfg(test)]
@@ -400,6 +461,53 @@ mod tests {
         assert_eq!(report.failed_actions, 1);
         assert_eq!(report.dispatched_actions, 0);
         assert!(report.last_dispatch_error.is_some());
+    }
+
+    /// Dashboard commands execute on the same worker as keyboard dispatch,
+    /// so their failures must reach the shared telemetry the sidebar reads.
+    #[test]
+    fn dashboard_messages_record_their_failures_in_the_shared_telemetry() {
+        let worker = ActionWorker::start(4).expect("worker starts");
+        let telemetry = worker.telemetry().clone();
+        let target = WindowIdentity {
+            hwnd: 42,
+            process_id: 7,
+            process_started_at_100ns: 9,
+            channel: crate::model::TerminalChannel::Stable,
+        };
+        worker
+            .sender()
+            .send(WorkerMessage::FocusAtPoint {
+                target,
+                point: ScreenPoint::new(5, 6),
+            })
+            .expect("queue accepts the focus command");
+        worker
+            .sender()
+            .send(WorkerMessage::SelectTab { target, index: 0 })
+            .expect("queue accepts the tab command");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while telemetry.failed.load(Ordering::Relaxed) < 2 && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            telemetry.failed.load(Ordering::Relaxed),
+            2,
+            "both commands must fail on the fake target and be recorded"
+        );
+        assert!(
+            telemetry
+                .last_error
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some(),
+            "the last-error slot must describe a dashboard dispatch failure"
+        );
+
+        let report = worker.stop().expect("stop succeeds");
+        assert_eq!(report.failed_actions, 2);
+        assert_eq!(report.dispatched_actions, 0);
     }
 
     #[test]

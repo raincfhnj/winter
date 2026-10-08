@@ -121,13 +121,17 @@ Manual equivalent: run the OLD version's `winter uninstall`, delete
 | `winter plan` / `winter install` / `winter uninstall` | Bridge lifecycle: preview the changes, install the fragment, hidden keybindings, and shell block, or remove only what Winter still owns |
 | `winter doctor` | Machine-readable JSON `{schema_version, healthy, config:{path, ok, error}, integration}` |
 
-Open `winter ui` in a pane for a tmux-style dashboard: a left sidebar shows
-controller status (uptime, prefix, hook health, action counters, last error)
-and the pane list with titles and the focused pane marked `*`, while the right
-side draws the pane map. Pane titles come from Windows Terminal, so rename a
-tab to label an agent's pane. `q`, `Q`, `Ctrl+C`, or `Esc` quits, and the
-dashboard shows `OFFLINE` when the controller is not running (the sidebar
-degrades to a single column below 60 columns).
+Open `winter ui` in a pane for a tmux-style session manager: the left sidebar
+shows controller status (uptime, prefix, hook health, action counters, last
+error) and a `── sessions ──` tree — every Windows Terminal tab with its
+panes nested underneath, `●` marking the selected tab and `*` the focused
+pane; the right side draws the pane map. Navigate with `↑`/`↓` (or `k`/`j`)
+and press `Enter` to focus the selected pane or switch to the selected tab —
+requests reach the controller through a one-shot command file. A tmux-style
+status bar runs along the bottom. Pane/tab titles come from Windows Terminal,
+so rename a tab to label an agent's session. `q`, `Q`, `Ctrl+C`, or `Esc`
+quits, and the dashboard shows `OFFLINE` when the controller is not running
+(narrow terminals fall back to a single column below 60 columns).
 
 Exit statuses are listed under [Exit codes](#exit-codes). Scripts and agents should
 prefer the machine-readable outputs — `winter ui --once` and the JSON reports printed

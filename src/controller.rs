@@ -190,6 +190,7 @@ mod implementation {
             options.foreground_poll_interval,
             config.mouse_resize,
             telemetry.clone(),
+            action_worker.sender(),
         )?;
         let cached_desktop = desktop_cache.shared();
 

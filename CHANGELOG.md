@@ -9,11 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `winter ui`: a live pane dashboard for the terminal it runs in — header
-  with prefix/mouse-resize state, a scaled map of panes with the focused
-  pane marked, and an offline banner when the controller stops. The
-  controller publishes the state to `%LOCALAPPDATA%\Winter\dashboard.json`
-  on every observable change; `--once` renders a single frame for scripts.
+- `winter ui`: a tmux-style session manager for the terminal it runs in.
+  The left sidebar shows live controller telemetry (uptime, prefix, hook
+  health, action counters, last dispatch error) plus a `── sessions ──`
+  tree of Windows Terminal tabs with their panes nested underneath; the
+  right zone draws the pane map, and a tmux-style status bar runs along
+  the bottom. `↑`/`↓` (or `k`/`j`) move the cursor and `Enter` focuses the
+  selected pane or switches to the selected tab — requests travel to the
+  controller through a one-shot `command.json`, executed on the observer
+  tick and surfaced back through the same telemetry. Pane titles come from
+  UI Automation, so renaming a tab labels its session. State is published
+  to `%LOCALAPPDATA%\Winter\dashboard.json` on every observable change;
+  `--once` renders a single frame for scripts.
 - `winter doctor` now prints the stable JSON contract
   `{ schema_version, healthy, config: { path, ok, error }, integration }`, and
   the CLI documents exit codes: `0` success/healthy, `1` hard failure, `2`

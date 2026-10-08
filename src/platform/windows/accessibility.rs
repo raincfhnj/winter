@@ -4,8 +4,10 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, IUIAutomation2, IUIAutomationElement, TreeScope_Descendants,
-    UIA_ClassNamePropertyId,
+    CUIAutomation, IUIAutomation, IUIAutomation2, IUIAutomationElement,
+    IUIAutomationSelectionItemPattern, TreeScope_Descendants, UIA_ClassNamePropertyId,
+    UIA_ControlTypePropertyId, UIA_PROPERTY_ID, UIA_SelectionItemPatternId,
+    UIA_TabItemControlTypeId,
 };
 use windows::core::Interface;
 
@@ -18,6 +20,17 @@ use super::foreground::{foreground_hwnd, validate_window_identity};
 const UI_AUTOMATION_CONNECTION_TIMEOUT_MS: u32 = 250;
 const UI_AUTOMATION_TRANSACTION_TIMEOUT_MS: u32 = 250;
 const TERMINAL_CONTROL_CLASS_NAME: &str = "TermControl";
+
+/// One Windows Terminal tab as exposed by UI Automation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabInfo {
+    /// Zero-based position in the tab-strip enumeration; this is also the
+    /// index [`TerminalAccessibility::select_tab`] expects.
+    pub index: u32,
+    pub title: String,
+    /// Whether Windows Terminal currently shows this tab.
+    pub selected: bool,
+}
 
 /// Thread-affine UI Automation client used only outside low-level hook callbacks.
 ///
@@ -151,23 +164,114 @@ impl TerminalAccessibility {
             .map_err(|source| PlatformError::win32("IUIAutomationElement::SetFocus", source))
     }
 
+    /// Reads the tab strip of `hwnd` (title, selection, enumeration index).
+    ///
+    /// Failure policy mirrors [`Self::pane_geometries`]: a failed whole-tree
+    /// query is a `PlatformResult` error, while a single unreadable tab item
+    /// is skipped so one stale element cannot discard the list. The dashboard
+    /// observer is the caller; it degrades to its last known tab list (or an
+    /// empty one) instead of failing the dashboard.
+    pub fn tab_infos(&self, hwnd: isize) -> PlatformResult<Vec<TabInfo>> {
+        let elements = self.tab_elements(hwnd)?;
+        let element_count = elements.len();
+        let mut tabs = Vec::with_capacity(element_count);
+        let mut first_error = None;
+        for (position, element) in elements.into_iter().enumerate() {
+            // A single stale element must not discard the whole tab list; the
+            // caller retries on its next throttled query anyway.
+            // SAFETY: `element` is a live UI Automation proxy used on the COM
+            // apartment where it was obtained.
+            let title = match unsafe { element.CurrentName() } {
+                Ok(name) => String::from_utf16_lossy(&name),
+                Err(source) => {
+                    first_error.get_or_insert_with(|| {
+                        PlatformError::win32("IUIAutomationElement::CurrentName", source)
+                    });
+                    continue;
+                }
+            };
+            let selected = match selection_is_selected(&element) {
+                Ok(selected) => selected,
+                Err(source) => {
+                    // The tab still contributes its title; only a snapshot
+                    // where nothing was readable at all fails below.
+                    first_error.get_or_insert(source);
+                    false
+                }
+            };
+            tabs.push(TabInfo {
+                index: position as u32,
+                title,
+                selected,
+            });
+        }
+        if tabs.is_empty()
+            && element_count > 0
+            && let Some(error) = first_error
+        {
+            return Err(error);
+        }
+        Ok(tabs)
+    }
+
+    /// Selects the tab at zero-based `index` in `hwnd`'s tab strip via the
+    /// UI Automation `SelectionItem` pattern.
+    ///
+    /// An out-of-range index is [`PlatformError::TabNotFoundAt`]; a failed
+    /// `FindAll` keeps its structured [`PlatformError::Win32`] source.
+    pub fn select_tab(&self, hwnd: isize, index: u32) -> PlatformResult<()> {
+        let element = self
+            .tab_elements(hwnd)?
+            .into_iter()
+            .nth(index as usize)
+            .ok_or(PlatformError::TabNotFoundAt { hwnd, index })?;
+        let pattern = selection_pattern(&element)?;
+        // SAFETY: `pattern` is the SelectionItem pattern of a live tab
+        // element, used on its creating COM apartment.
+        unsafe { pattern.Select() }.map_err(|source| {
+            PlatformError::win32("IUIAutomationSelectionItemPattern::Select", source)
+        })
+    }
+
+    fn tab_elements(&self, hwnd: isize) -> PlatformResult<Vec<IUIAutomationElement>> {
+        // `UIA_TabItemControlTypeId` arrives as a VT_I4 variant, matching the
+        // integer ControlType property the provider compares against.
+        self.descendants_where(
+            hwnd,
+            UIA_ControlTypePropertyId,
+            VARIANT::from(UIA_TabItemControlTypeId.0),
+        )
+    }
+
     fn terminal_elements(&self, hwnd: isize) -> PlatformResult<Vec<IUIAutomationElement>> {
+        self.descendants_where(
+            hwnd,
+            UIA_ClassNamePropertyId,
+            VARIANT::from(TERMINAL_CONTROL_CLASS_NAME),
+        )
+    }
+
+    /// FindAll over `hwnd`'s descendants filtered by one property condition.
+    ///
+    /// Filtering in the provider avoids marshaling every descendant across
+    /// the process boundary just to discard it.
+    fn descendants_where(
+        &self,
+        hwnd: isize,
+        property_id: UIA_PROPERTY_ID,
+        value: VARIANT,
+    ) -> PlatformResult<Vec<IUIAutomationElement>> {
         // SAFETY: the caller supplies an opaque top-level HWND that is checked
         // by UI Automation; invalid or stale handles become a structured error.
         let root = unsafe { self.automation.ElementFromHandle(isize_to_hwnd(hwnd)) }
             .map_err(|source| PlatformError::win32("IUIAutomation::ElementFromHandle", source))?;
-        // Filtering by class name in the provider avoids marshaling every
-        // descendant across the process boundary just to discard it.
-        // SAFETY: the property id and string value are valid for this client,
+        // SAFETY: the property id and variant value are valid for this client,
         // and the temporary VARIANT is copied into the condition before it is
         // cleared by its `Drop` implementation.
-        let condition = unsafe {
-            self.automation.CreatePropertyCondition(
-                UIA_ClassNamePropertyId,
-                &VARIANT::from(TERMINAL_CONTROL_CLASS_NAME),
-            )
-        }
-        .map_err(|source| PlatformError::win32("IUIAutomation::CreatePropertyCondition", source))?;
+        let condition = unsafe { self.automation.CreatePropertyCondition(property_id, &value) }
+            .map_err(|source| {
+                PlatformError::win32("IUIAutomation::CreatePropertyCondition", source)
+            })?;
         // SAFETY: `root` and `condition` are live proxies on this apartment;
         // descendants are read-only accessibility elements.
         let descendants = unsafe { root.FindAll(TreeScope_Descendants, &condition) }
@@ -184,6 +288,36 @@ impl TerminalAccessibility {
         }
         Ok(elements)
     }
+}
+
+/// Reads `SelectionItem.CurrentIsSelected` for one tab-strip element.
+fn selection_is_selected(element: &IUIAutomationElement) -> PlatformResult<bool> {
+    let pattern = selection_pattern(element)?;
+    // SAFETY: `pattern` is a live SelectionItem proxy on its COM apartment.
+    let selected = unsafe { pattern.CurrentIsSelected() }.map_err(|source| {
+        PlatformError::win32(
+            "IUIAutomationSelectionItemPattern::CurrentIsSelected",
+            source,
+        )
+    })?;
+    Ok(selected.as_bool())
+}
+
+/// Obtains the `SelectionItem` pattern interface of one tab-strip element.
+fn selection_pattern(
+    element: &IUIAutomationElement,
+) -> PlatformResult<IUIAutomationSelectionItemPattern> {
+    // SAFETY: `element` is a live proxy on its COM apartment and the pattern
+    // id is a well-known UI Automation constant.
+    unsafe {
+        element.GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(UIA_SelectionItemPatternId)
+    }
+    .map_err(|source| {
+        PlatformError::win32(
+            "IUIAutomationElement::GetCurrentPattern(SelectionItem)",
+            source,
+        )
+    })
 }
 
 struct ComApartment;

@@ -110,11 +110,7 @@ cargo build --release --bins
 | `winter plan` / `winter install` / `winter uninstall` | 桥接生命周期：预览变更、安装 fragment/隐藏键位/Shell 受管块，或只移除仍属于 Winter 的部分 |
 | `winter doctor` | 面向机器的 JSON：`{schema_version, healthy, config:{path, ok, error}, integration}` |
 
-在一个窗格里打开 `winter ui`，即得到 tmux 风格仪表盘：左侧管理栏显示控制器
-状态（运行时长、Prefix、Hook 健康、动作计数、最近错误）与窗格列表（带标题，
-焦点窗格标 `*`），右侧绘制窗格地图。窗格标题取自 Windows Terminal——重命名
-标签页即可给某个 agent 的 pane 起名。按 `q`、`Q`、`Ctrl+C` 或 `Esc` 退出；
-控制器未运行时显示 `OFFLINE`（窄于 60 列时退化为单栏布局）。
+在一个窗格里打开 `winter ui`，即得到 tmux 风格的会话管理器：左侧管理栏显示控制器状态（运行时长、Prefix、Hook 健康、动作计数、最近错误）与 `── sessions ──` 会话树——列出每个 Windows Terminal 标签页并嵌套其窗格，`●` 标记当前标签、`*` 标记焦点窗格；右侧绘制窗格地图。用 `↑`/`↓`（或 `k`/`j`）移动光标，回车即聚焦所选窗格或切换所选标签页——请求经一次性命令文件送达控制器。底部是 tmux 风格状态栏。窗格/标签标题取自 Windows Terminal——重命名标签页即可给某个 agent 的会话起名。按 `q`、`Q`、`Ctrl+C` 或 `Esc` 退出；控制器未运行时显示 `OFFLINE`（窄于 60 列时退化为单栏布局）。
 
 退出码见 [退出码](#退出码) 一节。脚本与 Agent 应优先使用机器可读输出——
 `winter ui --once` 以及 `plan` / `install` / `uninstall` / `doctor` 打印的 JSON

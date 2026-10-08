@@ -16,7 +16,7 @@ mod known_folder;
 mod launcher;
 mod single_instance;
 
-pub use accessibility::TerminalAccessibility;
+pub use accessibility::{TabInfo, TerminalAccessibility};
 pub use cursor::show_pane_resize_cursor;
 pub use dpi::enable_per_monitor_dpi_awareness;
 pub use elevation::{is_current_process_elevated, relaunch_current_process_elevated};

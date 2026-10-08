@@ -80,6 +80,9 @@ pub enum PlatformError {
     #[error("no Windows Terminal pane contains screen point ({x}, {y}) in HWND {hwnd:#x}")]
     PaneNotFoundAt { hwnd: isize, x: i32, y: i32 },
 
+    #[error("no Windows Terminal tab with index {index} exists in HWND {hwnd:#x}")]
+    TabNotFoundAt { hwnd: isize, index: u32 },
+
     #[error("input sequence contains too many events for SendInput: {0}")]
     InputSequenceTooLarge(usize),
 

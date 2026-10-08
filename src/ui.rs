@@ -113,21 +113,68 @@ fn interactive(path: &Path) -> AppResult<ExitCode> {
         return Ok(render_plain(path));
     };
     let mut stdout = std::io::stdout();
+    let mut selection: Option<Selection> = None;
+    let mut note: Option<String> = None;
     loop {
         let state = read_dashboard(path);
         let age_ms = current_age(state.as_ref());
         let (cols, rows) = guard.size().unwrap_or((DEFAULT_COLS, DEFAULT_ROWS));
-        let frame = render(state.as_ref(), age_ms, cols, rows);
+        let items = state.as_ref().map(selectable).unwrap_or_default();
+        if selection.is_some_and(|item| !items.contains(&item)) {
+            selection = None;
+        }
+        if selection.is_none() {
+            selection = default_selection(state.as_ref());
+        }
+        let frame = render_with(
+            state.as_ref(),
+            age_ms,
+            cols,
+            rows,
+            selection,
+            note.as_deref(),
+        );
         if write_frame(&mut stdout, &frame).is_err() {
             break;
         }
-        match poll_quit(&guard) {
-            Ok(true) | Err(_) => break,
-            Ok(false) => {}
+        match poll_input(&guard) {
+            Ok(Some(KeyInput::Quit)) | Err(_) => break,
+            Ok(Some(KeyInput::Move(delta))) => {
+                selection = move_selection(&items, selection, delta);
+                note = None;
+            }
+            Ok(Some(KeyInput::Activate)) => {
+                note = Some(match activate(state.as_ref(), selection) {
+                    Ok(label) => format!("\u{2192} {label}"),
+                    Err(error) => format!("! {error}"),
+                });
+            }
+            Ok(None) => {}
         }
     }
     drop(guard);
     Ok(ExitCode::SUCCESS)
+}
+
+/// Runs Enter for a cursor position: writes the one-shot command file and
+/// returns the status-bar label (or an error message).
+fn activate(
+    state: Option<&DashboardState>,
+    selection: Option<Selection>,
+) -> Result<String, String> {
+    let (Some(state), Some(selection)) = (state, selection) else {
+        return Err("no live state to act on".to_owned());
+    };
+    let command =
+        activation_command(state, selection).ok_or_else(|| "nothing selectable".to_owned())?;
+    let label = match selection {
+        Selection::Tab(index) => format!("tab {}", index + 1),
+        Selection::Pane(index) => format!("focus pane {}", index + 1),
+    };
+    let path = crate::dashboard::command_path().map_err(|error| error.to_string())?;
+    crate::dashboard::write_command(&path, &command)
+        .map_err(|error| format!("command failed: {error}"))?;
+    Ok(label)
 }
 
 /// Milliseconds since the state was written; 0 without a state.
@@ -143,23 +190,34 @@ fn write_frame(stdout: &mut impl Write, frame: &str) -> std::io::Result<()> {
     stdout.flush()
 }
 
-/// Polls console input for one frame interval, true when the user quit.
-fn poll_quit(guard: &ConsoleGuard) -> AppResult<bool> {
+/// Keys the interactive loop reacts to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyInput {
+    Quit,
+    /// `-1` up, `+1` down.
+    Move(i32),
+    Activate,
+}
+
+/// Polls console input for one frame interval; the first actionable key
+/// seen wins, `None` on a quiet frame.
+fn poll_input(guard: &ConsoleGuard) -> AppResult<Option<KeyInput>> {
     let deadline = Instant::now() + FRAME_INTERVAL;
     loop {
-        if drain_input(guard.input)? {
-            return Ok(true);
+        if let Some(key) = drain_input(guard.input)? {
+            return Ok(Some(key));
         }
         if Instant::now() >= deadline {
-            return Ok(false);
+            return Ok(None);
         }
         std::thread::sleep(POLL_INTERVAL);
     }
 }
 
-/// Drains pending input records; true when a quit key was seen.
-fn drain_input(input: HANDLE) -> AppResult<bool> {
+/// Drains pending input records; quit wins over activate over move.
+fn drain_input(input: HANDLE) -> AppResult<Option<KeyInput>> {
     let mut records = [INPUT_RECORD::default(); INPUT_BATCH];
+    let mut found: Option<KeyInput> = None;
     for _ in 0..INPUT_BATCH_LIMIT {
         let pending = unsafe {
             let mut pending = 0u32;
@@ -168,7 +226,7 @@ fn drain_input(input: HANDLE) -> AppResult<bool> {
             pending
         };
         if pending == 0 {
-            return Ok(false);
+            return Ok(found);
         }
         let read = unsafe {
             let batch = pending.min(INPUT_BATCH as u32) as usize;
@@ -181,16 +239,34 @@ fn drain_input(input: HANDLE) -> AppResult<bool> {
             if u32::from(record.EventType) != KEY_EVENT {
                 continue;
             }
-            let (down, code) = unsafe {
+            let (down, char_code, virtual_code) = unsafe {
                 let key = record.Event.KeyEvent;
-                (key.bKeyDown.as_bool(), key.uChar.UnicodeChar)
+                (
+                    key.bKeyDown.as_bool(),
+                    key.uChar.UnicodeChar,
+                    key.wVirtualKeyCode,
+                )
             };
-            if down && is_quit_key(code) {
-                return Ok(true);
+            if !down {
+                continue;
+            }
+            if is_quit_key(char_code) {
+                return Ok(Some(KeyInput::Quit));
+            }
+            let key = match virtual_code {
+                0x26 | 0x4B => Some(KeyInput::Move(-1)),
+                0x28 | 0x4A => Some(KeyInput::Move(1)),
+                0x0D => Some(KeyInput::Activate),
+                _ => None,
+            };
+            if let Some(key) = key
+                && matches!(found, None | Some(KeyInput::Move(_)))
+            {
+                found = Some(key);
             }
         }
     }
-    Ok(false)
+    Ok(found)
 }
 
 /// `q`, `Q`, Ctrl+C (0x03), and Esc (0x1B) all quit the dashboard.
@@ -306,16 +382,130 @@ fn window_size(output: HANDLE) -> Option<(usize, usize)> {
 /// columns. A missing, stale, stopped, or pane-less state falls back to
 /// placeholder text plus an offline banner instead of a pane map.
 /// Degenerate sizes (0x0, 1x1, columns below 10) never panic.
+/// One selectable row in the session tree: a Windows Terminal tab or a
+/// pane of the currently shown tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Selection {
+    Tab(usize),
+    Pane(usize),
+}
+
+/// Flattened selectable list: every tab in window order, then every pane.
+fn selectable(state: &DashboardState) -> Vec<Selection> {
+    let tabs = (0..state.tabs.len()).map(Selection::Tab);
+    let panes = (0..state.panes.len()).map(Selection::Pane);
+    tabs.chain(panes).collect()
+}
+
+/// The tab Windows Terminal currently shows.
+fn selected_tab_index(state: &DashboardState) -> Option<usize> {
+    state.tabs.iter().position(|tab| tab.selected)
+}
+
+/// Default cursor: the focused pane, else the selected tab, else the
+/// first selectable row.
+pub fn default_selection(state: Option<&DashboardState>) -> Option<Selection> {
+    let state = state?;
+    state
+        .panes
+        .iter()
+        .position(|pane| pane.focused)
+        .map(Selection::Pane)
+        .or_else(|| selected_tab_index(state).map(Selection::Tab))
+        .or_else(|| selectable(state).first().copied())
+}
+
+/// Moves the cursor by `delta`, clamped at both ends.
+fn move_selection(
+    items: &[Selection],
+    current: Option<Selection>,
+    delta: i32,
+) -> Option<Selection> {
+    if items.is_empty() {
+        return None;
+    }
+    let index = current
+        .and_then(|item| items.iter().position(|entry| *entry == item))
+        .unwrap_or(0);
+    let moved = (index as i32 + delta).clamp(0, items.len() as i32 - 1) as usize;
+    Some(items[moved])
+}
+
+/// Short status-bar label for a cursor position.
+fn selection_label(state: &DashboardState, selection: Selection) -> String {
+    match selection {
+        Selection::Tab(index) => match state.tabs.get(index) {
+            Some(tab) => format!("tab {}: {}", tab.index + 1, display_title(&tab.title)),
+            None => format!("tab {}", index + 1),
+        },
+        Selection::Pane(index) => match state.panes.get(index) {
+            Some(pane) => format!("pane {}: {}", index + 1, display_title(&pane.title)),
+            None => format!("pane {}", index + 1),
+        },
+    }
+}
+
+/// Pane titles fall back to a dash when UI Automation reports nothing.
+fn display_title(title: &str) -> &str {
+    if title.is_empty() { "-" } else { title }
+}
+
+/// What Enter runs for a cursor position: focus the pane at its screen
+/// center, or select the tab through UI Automation.
+fn activation_command(
+    state: &DashboardState,
+    selection: Selection,
+) -> Option<crate::dashboard::DashboardCommand> {
+    match selection {
+        Selection::Tab(index) => {
+            let tab = state.tabs.get(index)?;
+            Some(crate::dashboard::DashboardCommand::new(
+                crate::dashboard::DashboardCommandAction::SelectTab { index: tab.index },
+            ))
+        }
+        Selection::Pane(index) => {
+            let pane = state.panes.get(index)?;
+            Some(crate::dashboard::DashboardCommand::new(
+                crate::dashboard::DashboardCommandAction::FocusPane {
+                    x: pane.x + pane.width / 2,
+                    y: pane.y + pane.height / 2,
+                },
+            ))
+        }
+    }
+}
+
+/// Renders with the default cursor and no transient note.
 pub fn render(state: Option<&DashboardState>, age_ms: u64, cols: usize, rows: usize) -> String {
+    render_with(state, age_ms, cols, rows, default_selection(state), None)
+}
+
+/// Renders one frame with an explicit cursor position and a transient
+/// status note (e.g. `→ focus pane 2` after Enter).
+pub fn render_with(
+    state: Option<&DashboardState>,
+    age_ms: u64,
+    cols: usize,
+    rows: usize,
+    selection: Option<Selection>,
+    note: Option<&str>,
+) -> String {
     if cols >= TWO_ZONE_MIN_COLS {
-        render_two_zone(state, age_ms, cols, rows)
+        render_two_zone(state, age_ms, cols, rows, selection, note)
     } else {
-        render_narrow(state, age_ms, cols, rows)
+        render_narrow(state, age_ms, cols, rows, selection, note)
     }
 }
 
 /// Legacy single-column frame used below [`TWO_ZONE_MIN_COLS`] columns.
-fn render_narrow(state: Option<&DashboardState>, age_ms: u64, cols: usize, rows: usize) -> String {
+fn render_narrow(
+    state: Option<&DashboardState>,
+    age_ms: u64,
+    cols: usize,
+    rows: usize,
+    selection: Option<Selection>,
+    note: Option<&str>,
+) -> String {
     let (prefix, terminal, mouse) = match state {
         Some(state) => (
             if state.prefix_armed { "ARMED" } else { "idle" },
@@ -332,7 +522,6 @@ fn render_narrow(state: Option<&DashboardState>, age_ms: u64, cols: usize, rows:
         ),
         None => ("idle", "not found", "off"),
     };
-    let footer = format!("refreshed {age_ms}ms ago \u{2014} q to quit");
     let mut lines = vec![format!(
         "winter ui  prefix: {prefix}  terminal: {terminal}  mouse resize: {mouse}"
     )];
@@ -360,13 +549,11 @@ fn render_narrow(state: Option<&DashboardState>, age_ms: u64, cols: usize, rows:
         lines.extend(map);
         lines.push("* = focused pane".to_owned());
         lines.push(format!("{pane_count} panes"));
-        lines.push(footer);
-        return fit(lines, cols, rows);
+    } else {
+        lines.push(String::new());
+        lines.push(placeholder(offline, pane_count));
     }
-
-    lines.push(String::new());
-    lines.push(placeholder(offline, pane_count));
-    lines.push(footer);
+    lines.push(status_bar(state, age_ms, selection, note, cols));
     fit(lines, cols, rows)
 }
 
@@ -377,6 +564,8 @@ fn render_two_zone(
     age_ms: u64,
     cols: usize,
     rows: usize,
+    selection: Option<Selection>,
+    note: Option<&str>,
 ) -> String {
     let sidebar_width = (cols / 3).clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
     let right_width = cols - sidebar_width - 1;
@@ -386,8 +575,12 @@ fn render_two_zone(
     if offline {
         frame.push(OFFLINE_BANNER.to_owned());
     }
-    let budget = rows.saturating_sub(frame.len());
-    let sidebar = fit_sidebar(sidebar_lines(state, age_ms, sidebar_width), budget);
+    // One row is reserved for the bottom status bar.
+    let budget = rows.saturating_sub(frame.len() + 1);
+    let sidebar = fit_sidebar(
+        sidebar_lines(state, age_ms, sidebar_width, selection),
+        budget,
+    );
     let right = right_zone_lines(state, age_ms, offline, right_width, budget);
 
     let height = sidebar.len().max(right.len());
@@ -400,7 +593,49 @@ fn render_two_zone(
             pad(zone, right_width)
         ));
     }
+    frame.push(status_bar(state, age_ms, selection, note, cols));
     fit(frame, cols, rows)
+}
+
+/// The tmux-style bottom status bar: one full-width line, cut to `cols`.
+///
+/// Segments are appended left-to-right and the whole line is truncated, so
+/// the right-hand key hints give way first on narrow terminals.
+fn status_bar(
+    state: Option<&DashboardState>,
+    age_ms: u64,
+    selection: Option<Selection>,
+    note: Option<&str>,
+    cols: usize,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let prefix = match state {
+        Some(state) if state.prefix_armed => "ARMED",
+        _ => "idle",
+    };
+    parts.push(format!("[winter] prefix:{prefix}"));
+    if is_offline(state, age_ms) {
+        parts.push("OFFLINE".to_owned());
+    } else if let Some(elapsed) = state.and_then(DashboardState::uptime_ms) {
+        parts.push(format!("online {}", format_uptime(elapsed)));
+    } else {
+        parts.push("online".to_owned());
+    }
+    if let Some(state) = state {
+        parts.push(format!(
+            "{}/{}/{}",
+            state.dispatched_actions, state.failed_actions, state.dropped_actions
+        ));
+        parts.push(format!("{} panes", state.panes.len()));
+        if let Some(selection) = selection {
+            parts.push(format!("> {}", selection_label(state, selection)));
+        }
+    }
+    if let Some(note) = note {
+        parts.push(note.to_owned());
+    }
+    parts.push("\u{2191}\u{2193}/jk Enter q".to_owned());
+    truncate(&parts.join(" \u{2502} "), cols)
 }
 
 /// Right zone content: pane map (or placeholder), legend, and the footer,
@@ -440,7 +675,12 @@ fn right_zone_lines(
 /// Builds the left sidebar: header, controller section, pane list, bottom
 /// rule, and quit hint. Every line is cut to `width`; row budgeting is
 /// the job of [`fit_sidebar`].
-fn sidebar_lines(state: Option<&DashboardState>, age_ms: u64, width: usize) -> Vec<String> {
+fn sidebar_lines(
+    state: Option<&DashboardState>,
+    age_ms: u64,
+    width: usize,
+    selection: Option<Selection>,
+) -> Vec<String> {
     let offline = is_offline(state, age_ms);
     let mut lines = vec!["winter ui".to_owned()];
     lines.push(section_rule(
@@ -503,25 +743,81 @@ fn sidebar_lines(state: Option<&DashboardState>, age_ms: u64, width: usize) -> V
         lines.push(truncate(&format!("err: {error}"), width));
     }
 
-    lines.push(section_rule(
-        "\u{2500}\u{2500} panes \u{2500}\u{2500}",
-        width,
-    ));
-    if let Some(state) = state {
-        for (index, pane) in state.panes.iter().enumerate() {
-            let marker = if pane.focused { '*' } else { ' ' };
-            let title = if pane.title.is_empty() {
-                "-"
-            } else {
-                pane.title.as_str()
-            };
-            let number = index + 1;
-            lines.push(truncate(&format!(" {number} {marker}{title}"), width));
+    match state {
+        None => {
+            lines.push(section_rule(
+                "\u{2500}\u{2500} panes \u{2500}\u{2500}",
+                width,
+            ));
+        }
+        Some(state) if state.tabs.is_empty() => {
+            lines.push(section_rule(
+                "\u{2500}\u{2500} panes \u{2500}\u{2500}",
+                width,
+            ));
+            push_pane_rows(&mut lines, state, width, selection, " ");
+        }
+        Some(state) => {
+            lines.push(section_rule(
+                "\u{2500}\u{2500} sessions \u{2500}\u{2500}",
+                width,
+            ));
+            let selected = selected_tab_index(state);
+            for (index, tab) in state.tabs.iter().enumerate() {
+                let last = index + 1 == state.tabs.len();
+                let glyph = if last { '\u{2514}' } else { '\u{251C}' };
+                let mark = if tab.selected { '\u{25CF}' } else { ' ' };
+                let cursor = if selection == Some(Selection::Tab(index)) {
+                    '\u{25B8}'
+                } else {
+                    ' '
+                };
+                let title = display_title(&tab.title);
+                lines.push(truncate(
+                    &format!("{cursor}{glyph} {} {mark}{title}", index + 1),
+                    width,
+                ));
+                if selected == Some(index) {
+                    push_pane_rows(&mut lines, state, width, selection, "\u{2502}");
+                }
+            }
+            if selected.is_none() {
+                lines.push(section_rule(
+                    "\u{2500}\u{2500} panes \u{2500}\u{2500}",
+                    width,
+                ));
+                push_pane_rows(&mut lines, state, width, selection, " ");
+            }
         }
     }
     lines.push("\u{2500}".repeat(width));
     lines.push("q quit".to_owned());
     lines
+}
+
+/// Appends pane rows, flat or nested under a `│` guide, each carrying the
+/// selection cursor in column zero.
+fn push_pane_rows(
+    lines: &mut Vec<String>,
+    state: &DashboardState,
+    width: usize,
+    selection: Option<Selection>,
+    indent: &str,
+) {
+    for (index, pane) in state.panes.iter().enumerate() {
+        let marker = if pane.focused { '*' } else { ' ' };
+        let cursor = if selection == Some(Selection::Pane(index)) {
+            '\u{25B8}'
+        } else {
+            ' '
+        };
+        let title = display_title(&pane.title);
+        let number = index + 1;
+        lines.push(truncate(
+            &format!("{cursor}{indent} {number} {marker}{title}"),
+            width,
+        ));
+    }
 }
 
 /// Shrinks a full sidebar to `rows` lines by dropping sections bottom-up
@@ -535,7 +831,7 @@ fn fit_sidebar(lines: Vec<String>, rows: usize) -> Vec<String> {
     }
     // Controller rows, from the bottom of the section up.
     while out.len() > rows {
-        let Some(panes) = out.iter().position(|line| line.starts_with("── panes")) else {
+        let Some(panes) = out.iter().position(|line| is_section_heading(line)) else {
             break;
         };
         if panes <= 2 {
@@ -553,7 +849,7 @@ fn fit_sidebar(lines: Vec<String>, rows: usize) -> Vec<String> {
     }
     // Pane entries, from the last one up.
     while out.len() > rows {
-        let Some(panes) = out.iter().position(|line| line.starts_with("── panes")) else {
+        let Some(panes) = out.iter().position(|line| is_section_heading(line)) else {
             break;
         };
         if out.len() <= panes + 2 {
@@ -563,7 +859,7 @@ fn fit_sidebar(lines: Vec<String>, rows: usize) -> Vec<String> {
     }
     // The pane section header, then the quit hint, then the header.
     if out.len() > rows
-        && let Some(panes) = out.iter().position(|line| line.starts_with("── panes"))
+        && let Some(panes) = out.iter().position(|line| is_section_heading(line))
     {
         out.remove(panes);
     }
@@ -590,6 +886,11 @@ fn section_rule(title: &str, width: usize) -> String {
 /// True for a line made only of `─` characters (the section bottom rule).
 fn is_rule(line: &str) -> bool {
     !line.is_empty() && line.chars().all(|character| character == '\u{2500}')
+}
+
+/// True for a sidebar section heading (`── panes ──` / `── sessions ──`).
+fn is_section_heading(line: &str) -> bool {
+    line.starts_with("\u{2500}\u{2500} panes") || line.starts_with("\u{2500}\u{2500} sessions")
 }
 
 /// Human-readable controller uptime: `7s`, `3m 12s`, or `1h 2m 3s`.
@@ -862,6 +1163,7 @@ mod tests {
             failed_actions: 1,
             dropped_actions: 2,
             last_dispatch_error: Some("injection failed".to_owned()),
+            tabs: Vec::new(),
             panes: vec![
                 DashboardPane {
                     x: 0,
@@ -870,6 +1172,7 @@ mod tests {
                     height: 12,
                     focused: false,
                     title: "root:~".to_owned(),
+                    last_focused_unix_ms: 0,
                 },
                 DashboardPane {
                     x: 40,
@@ -878,6 +1181,7 @@ mod tests {
                     height: 12,
                     focused: true,
                     title: "agent-build".to_owned(),
+                    last_focused_unix_ms: 0,
                 },
                 DashboardPane {
                     x: 0,
@@ -886,6 +1190,7 @@ mod tests {
                     height: 12,
                     focused: false,
                     title: String::new(),
+                    last_focused_unix_ms: 0,
                 },
             ],
             dividers: Vec::new(),
@@ -965,7 +1270,7 @@ mod tests {
         let mut state = fixture();
         state.panes[0].title.clear();
         state.panes[1].title = "a-very-long-pane-title-that-overflows-the-sidebar".to_owned();
-        let lines = sidebar_lines(Some(&state), 5, SIDEBAR_MIN_WIDTH);
+        let lines = sidebar_lines(Some(&state), 5, SIDEBAR_MIN_WIDTH, None);
 
         assert!(
             lines
@@ -974,12 +1279,12 @@ mod tests {
             "a sidebar line exceeded the width: {lines:?}"
         );
         assert!(
-            lines.iter().any(|line| line == " 1  -"),
+            lines.iter().any(|line| line == "   1  -"),
             "an empty title must render as a dash: {lines:?}"
         );
         let long = lines
             .iter()
-            .find(|line| line.starts_with(" 2 "))
+            .find(|line| line.starts_with("   2 "))
             .expect("the focused pane entry should exist");
         assert_eq!(
             long.chars().count(),
@@ -1028,8 +1333,8 @@ mod tests {
         );
         assert!(frame.contains("3 panes"), "missing pane count: {frame}");
         assert!(
-            frame.contains("refreshed 5ms ago \u{2014} q to quit"),
-            "missing footer: {frame}"
+            frame.contains("[winter] prefix:ARMED"),
+            "missing status bar: {frame}"
         );
 
         let lines: Vec<&str> = frame.split('\n').collect();
@@ -1127,5 +1432,188 @@ mod tests {
         let empty_panes: Vec<DashboardPane> = Vec::new();
         assert!(draw_map(&empty_panes, 40, 10).is_empty());
         assert!(draw_map(&state.panes, 2, 2).is_empty());
+    }
+
+    fn tabbed_fixture() -> DashboardState {
+        let mut state = fixture();
+        state.tabs = vec![
+            crate::dashboard::DashboardTab {
+                index: 0,
+                title: "pwsh build".to_owned(),
+                selected: true,
+            },
+            crate::dashboard::DashboardTab {
+                index: 1,
+                title: "logs".to_owned(),
+                selected: false,
+            },
+            crate::dashboard::DashboardTab {
+                index: 2,
+                title: String::new(),
+                selected: false,
+            },
+        ];
+        state
+    }
+
+    #[test]
+    fn session_tree_nests_panes_under_the_selected_tab() {
+        let state = tabbed_fixture();
+        let frame = render(Some(&state), 5, 100, 30);
+
+        assert!(
+            frame.contains("\u{2500}\u{2500} sessions \u{2500}\u{2500}"),
+            "missing sessions rule: {frame}"
+        );
+        assert!(
+            !frame.contains("\u{2500}\u{2500} panes \u{2500}\u{2500}"),
+            "tabs exist, no flat panes heading: {frame}"
+        );
+        assert!(
+            frame.contains("1 \u{25CF}pwsh build"),
+            "selected tab with bullet: {frame}"
+        );
+        assert!(frame.contains("2  logs"), "unselected tab: {frame}");
+        assert!(
+            frame.contains("3  -"),
+            "empty tab title falls back to dash: {frame}"
+        );
+        assert!(
+            frame.contains("\u{2502} 1  root:~"),
+            "panes nested under the selected tab: {frame}"
+        );
+        // Default selection is the focused pane (pane 2 of the fixture).
+        assert!(
+            frame.contains("\u{25B8}\u{2502} 2 *agent-build"),
+            "selection cursor on the focused pane: {frame}"
+        );
+        let lines: Vec<&str> = frame.split('\n').collect();
+        assert!(lines.len() <= 30, "row budget: {frame}");
+        assert!(
+            lines.iter().all(|line| line.chars().count() <= 100),
+            "column budget: {frame}"
+        );
+    }
+
+    #[test]
+    fn status_bar_carries_tomux_segments() {
+        let state = tabbed_fixture();
+        let frame = render_with(
+            Some(&state),
+            5,
+            100,
+            30,
+            Some(Selection::Tab(1)),
+            Some("\u{2192} tab 2"),
+        );
+
+        let bar = frame
+            .split('\n')
+            .next_back()
+            .expect("the frame must end with the status bar");
+        assert!(bar.starts_with("[winter] prefix:ARMED"), "bar: {bar}");
+        assert!(bar.contains("online 3m 12s"), "bar: {bar}");
+        assert!(bar.contains("128/1/2"), "bar: {bar}");
+        assert!(bar.contains("3 panes"), "bar: {bar}");
+        assert!(bar.contains("> tab 2: logs"), "selection label: {bar}");
+        assert!(bar.contains("\u{2192} tab 2"), "transient note: {bar}");
+        assert!(
+            bar.contains("\u{2191}\u{2193}/jk Enter q"),
+            "key hints: {bar}"
+        );
+        assert!(
+            bar.chars().count() <= 100,
+            "status bar exceeded the width: {bar}"
+        );
+    }
+
+    #[test]
+    fn navigation_moves_between_tabs_and_panes_with_clamping() {
+        let state = tabbed_fixture();
+        let items = selectable(&state);
+        assert_eq!(
+            items,
+            vec![
+                Selection::Tab(0),
+                Selection::Tab(1),
+                Selection::Tab(2),
+                Selection::Pane(0),
+                Selection::Pane(1),
+                Selection::Pane(2),
+            ],
+            "tabs come first, then panes"
+        );
+
+        let start = default_selection(Some(&state));
+        assert_eq!(start, Some(Selection::Pane(1)), "focused pane wins");
+
+        let up = move_selection(&items, start, -1);
+        assert_eq!(up, Some(Selection::Pane(0)));
+        let down = move_selection(&items, up, -1);
+        assert_eq!(down, Some(Selection::Tab(2)), "clamped at the top");
+        let past_end = move_selection(&items, Some(Selection::Pane(2)), 5);
+        assert_eq!(past_end, Some(Selection::Pane(2)), "clamped at the bottom");
+        assert_eq!(move_selection(&[], None, 1), None, "empty list");
+
+        let no_focus = {
+            let mut state = tabbed_fixture();
+            state.panes.iter_mut().for_each(|pane| pane.focused = false);
+            state
+        };
+        assert_eq!(
+            default_selection(Some(&no_focus)),
+            Some(Selection::Tab(0)),
+            "selected tab is the fallback"
+        );
+    }
+
+    #[test]
+    fn activation_builds_focus_and_select_commands() {
+        let state = tabbed_fixture();
+
+        let focus = activation_command(&state, Selection::Pane(1)).expect("pane command");
+        let json: serde_json::Value = serde_json::to_value(&focus).expect("command serializes");
+        assert_eq!(json["type"], "focusPane");
+        let pane = &state.panes[1];
+        assert_eq!(json["x"], pane.x + pane.width / 2, "center x");
+        assert_eq!(json["y"], pane.y + pane.height / 2, "center y");
+
+        let select = activation_command(&state, Selection::Tab(1)).expect("tab command");
+        let json: serde_json::Value = serde_json::to_value(&select).expect("command serializes");
+        assert_eq!(json["type"], "selectTab");
+        assert_eq!(json["index"], 1, "registry tab index, not list position");
+
+        assert!(
+            activation_command(&state, Selection::Tab(99)).is_none(),
+            "out of range selects nothing"
+        );
+    }
+
+    #[test]
+    fn activate_writes_the_command_file_and_reports_a_label() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp
+            .path()
+            .join(crate::dashboard::DASHBOARD_COMMAND_FILE_NAME);
+        // command_path() points at the real config dir; exercise the write
+        // path directly against the fixture path instead.
+        let state = tabbed_fixture();
+        let command = activation_command(&state, Selection::Pane(1)).expect("command");
+        crate::dashboard::write_command(&path, &command).expect("write succeeds");
+        let taken = crate::dashboard::take_command(&path).expect("command is readable");
+        assert_eq!(taken.action, command.action);
+        assert!(!path.exists(), "take_command removes the file");
+        assert!(
+            crate::dashboard::take_command(&path).is_none(),
+            "second take finds nothing"
+        );
+
+        assert!(
+            matches!(
+                activate(None, Some(Selection::Pane(0))),
+                Err(error) if error == "no live state to act on"
+            ),
+            "offline activation refuses cleanly"
+        );
     }
 }

@@ -12,10 +12,6 @@ pub const MINIMUM_FRAGMENT_VERSION: &str = "1.21";
 /// dashboard).
 pub const APP_DATA_DIR_NAME: &str = "Winter";
 
-/// Historical on-disk directory used by pre-Winter releases; only the
-/// one-shot migration in `integration::legacy` may reference it.
-pub const LEGACY_APP_DATA_DIR_NAME: &str = "WinTerminalP";
-
 /// Case-insensitive ownership key for a filesystem path.
 ///
 /// Windows paths compare case-insensitively, so every ownership record match

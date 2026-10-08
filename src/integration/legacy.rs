@@ -1,47 +1,61 @@
-//! One-shot cleanup of pre-Winter installations that used the historical
-//! `WinTerminalP` on-disk identifiers.
+//! One-shot cleanup of pre-Winter installations.
 //!
-//! Old releases stored their state under `%LOCALAPPDATA%\WinTerminalP`,
-//! installed a `Fragments\WinTerminalP` action fragment with
-//! `User.WinTerminalP.*` keybindings, and wrapped shell profiles in
-//! `WinTerminalP` marker blocks. Current code only knows the Winter-branded
-//! identifiers, so [`detect`] finds the old world and [`migrate`] removes it
-//! using the legacy manifest's own records (ids are data, not code) before a
-//! fresh install runs. Every readable input is pre-flighted before the first
-//! write; the legacy state directory — the only recovery record — is deleted
-//! only after every step succeeds.
+//! Older releases branded their on-disk world `WinTerminalPP` (and briefly
+//! `WinTerminalP`): a state directory under `%LOCALAPPDATA%`, a fragment
+//! under `Fragments\<name>`, `User.WinTerminalPP.*` action ids in
+//! `settings.json`, and `WinTerminalP` shell markers. Current code only knows
+//! the Winter-branded identifiers, so [`detect`] finds every historical
+//! directory and [`migrate`] removes the old world with two complementary
+//! passes:
+//!
+//! 1. the legacy manifest's own records drive precise removal (hash-checked,
+//!    user-modified entries preserved) — when a manifest exists;
+//! 2. a prefix sweep strips `user.winterminalp*.` ids from every discovered
+//!    settings file, covering channels the manifest never recorded.
+//!
+//! The config is carried over byte-for-byte, and the legacy state directory —
+//! the only recovery record — is deleted only after every step succeeds.
 
 use std::fs;
+use std::path::PathBuf;
 
 use super::fragment::{execute_uninstall_fragment, plan_uninstall_fragment};
 use super::manifest::{IntegrationManifest, load_manifest};
 use super::targets::{execute_uninstall_target, plan_uninstall_target};
-use super::transaction::{remove_if_hash, sha256_hex};
-use super::types::{APP_DATA_DIR_NAME, LEGACY_APP_DATA_DIR_NAME};
-use super::{ChangeStatus, IntegrationConfig, shell};
+use super::transaction::{
+    atomic_replace, create_backup, read_optional_snapshot, remove_if_hash, sha256_hex,
+};
+use super::types::APP_DATA_DIR_NAME;
+use super::{ChangeStatus, IntegrationConfig, discover_targets, jsonc, shell};
 use crate::{AppError, AppResult};
+
+/// Historical state/fragment directory names, newest first.
+const LEGACY_DIR_NAMES: [&str; 2] = ["WinTerminalPP", "WinTerminalP"];
+
+/// Lowercase id prefixes of every historical action namespace.
+const LEGACY_ID_PREFIXES: [&str; 2] = ["user.winterminalpp.", "user.winterminalp."];
 
 /// Snapshot of the historical installation, if any artifacts exist.
 pub(super) struct LegacyInstallation {
-    /// `%LOCALAPPDATA%\WinTerminalP`.
-    dir: std::path::PathBuf,
-    /// `%LOCALAPPDATA%\Microsoft\Windows Terminal\Fragments\WinTerminalP`.
-    fragment_dir: std::path::PathBuf,
-    /// Loaded legacy manifest when present and readable.
+    /// Existing `%LOCALAPPDATA%\<name>` state directories.
+    dirs: Vec<PathBuf>,
+    /// Existing `Fragments\<name>` directories.
+    fragment_dirs: Vec<PathBuf>,
+    /// First readable legacy manifest among the state directories.
     manifest: Option<super::manifest::LoadedManifest>,
 }
 
-fn legacy_dir(config: &IntegrationConfig) -> std::path::PathBuf {
-    config.local_app_data.join(LEGACY_APP_DATA_DIR_NAME)
+fn state_dir(config: &IntegrationConfig, name: &str) -> PathBuf {
+    config.local_app_data.join(name)
 }
 
-fn legacy_fragment_dir(config: &IntegrationConfig) -> std::path::PathBuf {
+fn fragment_dir(config: &IntegrationConfig, name: &str) -> PathBuf {
     config
         .local_app_data
         .join("Microsoft")
         .join("Windows Terminal")
         .join("Fragments")
-        .join(LEGACY_APP_DATA_DIR_NAME)
+        .join(name)
 }
 
 /// Returns the legacy installation when any historical artifact exists.
@@ -49,21 +63,32 @@ fn legacy_fragment_dir(config: &IntegrationConfig) -> std::path::PathBuf {
 /// A present-but-unreadable legacy manifest propagates as an error: the
 /// migration must not guess without its ownership record.
 pub(super) fn detect(config: &IntegrationConfig) -> AppResult<Option<LegacyInstallation>> {
-    let dir = legacy_dir(config);
-    let fragment_dir = legacy_fragment_dir(config);
-    let has_artifacts = dir.exists() || fragment_dir.exists();
-    if !has_artifacts {
+    let mut dirs = Vec::new();
+    let mut fragment_dirs = Vec::new();
+    for name in LEGACY_DIR_NAMES {
+        let dir = state_dir(config, name);
+        if dir.exists() {
+            dirs.push(dir);
+        }
+        let fragment = fragment_dir(config, name);
+        if fragment.exists() {
+            fragment_dirs.push(fragment);
+        }
+    }
+    if dirs.is_empty() && fragment_dirs.is_empty() {
         return Ok(None);
     }
-    let manifest_path = dir.join("integration").join("manifest.json");
-    let manifest = if manifest_path.is_file() {
-        Some(load_manifest(&manifest_path)?)
-    } else {
-        None
-    };
+    let mut manifest = None;
+    for dir in &dirs {
+        let manifest_path = dir.join("integration").join("manifest.json");
+        if manifest_path.is_file() {
+            manifest = Some(load_manifest(&manifest_path)?);
+            break;
+        }
+    }
     Ok(Some(LegacyInstallation {
-        dir,
-        fragment_dir,
+        dirs,
+        fragment_dirs,
         manifest,
     }))
 }
@@ -73,14 +98,19 @@ pub(super) fn detect(config: &IntegrationConfig) -> AppResult<Option<LegacyInsta
 pub(super) fn detection_issue(config: &IntegrationConfig) -> Option<String> {
     match detect(config) {
         Ok(Some(legacy)) => Some(format!(
-            "legacy WinTerminalP installation detected; run 'winter install' to migrate (state directory {})",
-            legacy.dir.display()
+            "legacy installation detected ({}); run 'winter install' to migrate",
+            legacy
+                .dirs
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         )),
         Ok(None) => None,
         Err(error) => Some(format!(
-            "legacy WinTerminalP installation is present but unreadable: {error}; \
+            "legacy installation is present but unreadable: {error}; \
              inspect and delete {} manually",
-            legacy_dir(config).display()
+            config.local_app_data.join(LEGACY_DIR_NAMES[0]).display()
         )),
     }
 }
@@ -92,8 +122,13 @@ pub(super) fn migrate_if_present(config: &IntegrationConfig) -> AppResult<()> {
         return Ok(());
     };
     eprintln!(
-        "legacy WinTerminalP installation detected; migrating to Winter ({} or 'winter uninstall' first would also work)",
-        legacy.dir.display()
+        "legacy installation detected ({}); migrating to Winter",
+        legacy
+            .dirs
+            .iter()
+            .map(|dir| dir.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     clean(config, &legacy, true)?;
     eprintln!("legacy installation removed; installing the Winter-branded integration");
@@ -106,7 +141,7 @@ pub(super) fn uninstall_if_present(config: &IntegrationConfig) -> AppResult<bool
     let Some(legacy) = detect(config)? else {
         return Ok(false);
     };
-    eprintln!("legacy WinTerminalP installation detected; removing it");
+    eprintln!("legacy installation detected; removing it");
     clean(config, &legacy, false)?;
     Ok(true)
 }
@@ -116,9 +151,8 @@ fn clean(
     legacy: &LegacyInstallation,
     carry_config: bool,
 ) -> AppResult<()> {
-    // 1. Fragment and settings: every readable input pre-flighted through the
-    //    same plan step the regular uninstall uses, then executed. The legacy
-    //    records carry the old ids as data, so no old token appears here.
+    // 1. Precise removal through the legacy manifest's own records: ids are
+    //    data, so the current code never has to spell the old tokens.
     if let Some(loaded) = &legacy.manifest {
         let fragment_plan = plan_uninstall_fragment(&loaded.manifest)?;
         let mut retained = IntegrationManifest::default();
@@ -137,29 +171,60 @@ fn clean(
         if preserved > 0 {
             eprintln!("  kept {preserved} user-modified legacy keybinding(s) in place");
         }
-    } else {
-        // No manifest: remove only a fragment that is unmistakably ours.
-        let fragment_path = legacy.fragment_dir.join("actions.json");
-        if let Ok(bytes) = fs::read(&fragment_path) {
-            if String::from_utf8_lossy(&bytes).contains("User.WinTerminalP.") {
-                let expected = sha256_hex(&bytes);
-                if !remove_if_hash(&fragment_path, &expected)? {
-                    return Err(AppError::SettingsConflict(format!(
-                        "{} changed while migrating; rerun 'winter install'",
-                        fragment_path.display()
-                    )));
-                }
-            } else {
+    }
+
+    // 2. Manifest-less fragment removal: only when unmistakably ours.
+    for fragment_dir in &legacy.fragment_dirs {
+        let fragment_path = fragment_dir.join("actions.json");
+        let Ok(bytes) = fs::read(&fragment_path) else {
+            continue;
+        };
+        if String::from_utf8_lossy(&bytes)
+            .to_ascii_lowercase()
+            .contains("user.winterminalp")
+        {
+            let expected = sha256_hex(&bytes);
+            if !remove_if_hash(&fragment_path, &expected)? {
                 return Err(AppError::SettingsConflict(format!(
-                    "{} exists without a legacy manifest and does not contain Winter action \
-                     ids; inspect and remove it manually",
+                    "{} changed while migrating; rerun 'winter install'",
                     fragment_path.display()
                 )));
             }
+        } else if legacy.manifest.is_none() {
+            return Err(AppError::SettingsConflict(format!(
+                "{} exists without a legacy manifest and does not contain Winter action \
+                 ids; inspect and remove it manually",
+                fragment_path.display()
+            )));
         }
     }
 
-    // 2. Legacy shell blocks (force removal of namespaced markers).
+    // 3. Prefix sweep over every discovered settings file: catches channels
+    //    the manifest never recorded (Preview/Canary installs) and ids the
+    //    record pass preserved as user-modified.
+    for target in discover_targets(config) {
+        let Some(snapshot) = read_optional_snapshot(&target.settings_path)? else {
+            continue;
+        };
+        let edit = jsonc::remove_legacy_keybindings(&snapshot.bytes, &LEGACY_ID_PREFIXES)?;
+        let Some(replacement) = edit.replacement else {
+            continue;
+        };
+        create_backup(
+            &config.state_dir,
+            "legacy-settings",
+            &target.settings_path,
+            &snapshot,
+        )?;
+        atomic_replace(&target.settings_path, Some(&snapshot.sha256), &replacement)?;
+        eprintln!(
+            "  removed {} legacy keybinding(s) from {}",
+            edit.removed_binding_count,
+            target.settings_path.display()
+        );
+    }
+
+    // 4. Legacy shell blocks (force removal of namespaced markers).
     for report in shell::uninstall_legacy(config) {
         match report.status {
             ChangeStatus::Removed | ChangeStatus::Missing => {}
@@ -175,15 +240,17 @@ fn clean(
         }
     }
 
-    // 3. Carry the user's config into the new location before the old tree
+    // 5. Carry the user's config into the new location before the old tree
     //    disappears (copy, not move — a later failure keeps the original).
     if carry_config {
-        let new_config = config
-            .local_app_data
-            .join(APP_DATA_DIR_NAME)
-            .join("config.toml");
-        let legacy_config = legacy.dir.join("config.toml");
-        if legacy_config.is_file() && !new_config.exists() {
+        let new_config = new_config_path(config);
+        if !new_config.exists()
+            && let Some(legacy_config) = legacy
+                .dirs
+                .iter()
+                .map(|dir| dir.join("config.toml"))
+                .find(|path| path.is_file())
+        {
             if let Some(parent) = new_config.parent() {
                 fs::create_dir_all(parent).map_err(|error| {
                     AppError::io("create Winter application directory", parent, error)
@@ -196,20 +263,26 @@ fn clean(
         }
     }
 
-    // 4. Only now is the legacy tree disposable.
-    if legacy.dir.exists() {
-        fs::remove_dir_all(&legacy.dir).map_err(|error| {
-            AppError::io(
-                "remove legacy WinTerminalP state directory",
-                &legacy.dir,
-                error,
-            )
-        })?;
+    // 6. Only now are the legacy trees disposable.
+    for dir in &legacy.dirs {
+        if dir.exists() {
+            fs::remove_dir_all(dir)
+                .map_err(|error| AppError::io("remove legacy state directory", dir, error))?;
+        }
     }
-    // The fragment directory is ours by namespace; remove it when empty
-    // (individual files were already handled through the manifest).
-    let _ = fs::remove_dir(&legacy.fragment_dir);
+    for dir in &legacy.fragment_dirs {
+        // Individual files were removed above; the directory is ours by
+        // namespace, so drop it when empty and leave anything else alone.
+        let _ = fs::remove_dir(dir);
+    }
     Ok(())
+}
+
+fn new_config_path(config: &IntegrationConfig) -> PathBuf {
+    config
+        .local_app_data
+        .join(APP_DATA_DIR_NAME)
+        .join("config.toml")
 }
 
 #[cfg(test)]
@@ -240,46 +313,53 @@ mod tests {
         }
     }
 
-    /// Builds the full legacy world: state dir + manifest, discoverable
-    /// settings with old ids, fragment, legacy shell block, and a legacy
-    /// config file.
-    fn seed_legacy(root: &Path) -> IntegrationConfig {
+    /// Builds the full legacy world for the given historical directory name:
+    /// state dir + manifest, discoverable settings with old ids, fragment,
+    /// legacy shell block, and a legacy config file. An extra `extra_settings`
+    /// path seeds a channel the manifest does NOT record.
+    fn seed_legacy(
+        root: &Path,
+        legacy_name: &str,
+        extra_settings: Option<&Path>,
+    ) -> IntegrationConfig {
         let config = config_with(root);
-        let legacy_dir = root.join(LEGACY_APP_DATA_DIR_NAME);
+        let legacy_dir = root.join(legacy_name);
 
-        // Legacy config.
         fs::create_dir_all(&legacy_dir).expect("legacy dir");
         fs::write(legacy_dir.join("config.toml"), b"schema_version = 1\n").expect("legacy config");
 
-        // The discoverable Windows Terminal settings file — the legacy
-        // manifest's target — with one legacy managed binding + one user
-        // binding.
         let settings_path = root
             .join("Packages")
             .join("Microsoft.WindowsTerminal_8wekyb3d8bbwe")
             .join("LocalState")
             .join("settings.json");
         fs::create_dir_all(settings_path.parent().unwrap()).expect("settings dir");
-        fs::write(
-            &settings_path,
-            br#"{"keybindings":[
-            {"id":"User.WinTerminalP.SplitLeft","keys":"ctrl+f13"},
+        let settings_bytes = br#"{"keybindings":[
+            {"id":"User.WinTerminalPP.SplitLeft","keys":"ctrl+alt+shift+f13"},
             {"id":"User.Own.Custom","keys":"ctrl+f9"}
-        ]}"#,
-        )
-        .expect("settings");
+        ]}"#;
+        fs::write(&settings_path, settings_bytes).expect("settings");
         let settings_snapshot = read_snapshot(&settings_path).expect("settings snapshot");
 
-        // Legacy fragment.
-        let fragment_dir = legacy_fragment_dir(&config);
+        if let Some(extra) = extra_settings {
+            fs::create_dir_all(extra.parent().unwrap()).expect("extra settings dir");
+            fs::write(
+                extra,
+                br#"{"keybindings":[
+                {"id":"User.WinTerminalPP.NewTab","keys":"ctrl+alt+shift+f18"}
+            ]}"#,
+            )
+            .expect("extra settings");
+        }
+
+        let fragment_dir = fragment_dir(&config, legacy_name);
         fs::create_dir_all(&fragment_dir).expect("fragment dir");
         let fragment_path = fragment_dir.join("actions.json");
         let fragment_bytes =
-            br#"{"actions":[{"id":"User.WinTerminalP.SplitLeft","keys":"ctrl+f13"}]}"#;
+            br#"{"actions":[{"id":"User.WinTerminalPP.SplitLeft","keys":"ctrl+alt+shift+f13"}]}"#;
         fs::write(&fragment_path, fragment_bytes).expect("fragment");
         let fragment_sha = sha256_hex(fragment_bytes);
 
-        // Legacy shell block in the Windows PowerShell profile.
         let profile_dir = config.documents_dir.join("WindowsPowerShell");
         fs::create_dir_all(&profile_dir).expect("profile dir");
         let profile = profile_dir.join("Microsoft.PowerShell_profile.ps1");
@@ -288,27 +368,9 @@ mod tests {
             # <<< WinTerminalP shell integration <<<\n";
         fs::write(&profile, format!("Write-Host hi\n{legacy_block}")).expect("profile");
 
-        // A discoverable Windows Terminal settings file containing the legacy
-        // managed binding, so `plan`/`install` see a real target.
-        let wt_settings = root
-            .join("Packages")
-            .join("Microsoft.WindowsTerminal_8wekyb3d8bbwe")
-            .join("LocalState")
-            .join("settings.json");
-        fs::create_dir_all(wt_settings.parent().unwrap()).expect("wt settings dir");
-        fs::write(
-            &wt_settings,
-            br#"{"keybindings":[
-            {"id":"User.WinTerminalP.SplitLeft","keys":"ctrl+f13"},
-            {"id":"User.Own.Custom","keys":"ctrl+f9"}
-        ]}"#,
-        )
-        .expect("wt settings");
-
-        // Legacy manifest.
         let definition = serde_json::json!({
-            "id": "User.WinTerminalP.SplitLeft",
-            "keys": "ctrl+f13",
+            "id": "User.WinTerminalPP.SplitLeft",
+            "keys": "ctrl+alt+shift+f13",
         });
         let manifest = IntegrationManifest {
             schema_version: super::super::INTEGRATION_SCHEMA_VERSION,
@@ -323,8 +385,8 @@ mod tests {
                 installed_sha256: settings_snapshot.sha256.clone(),
                 backup: backup_stub(&settings_path),
                 managed_keybindings: vec![ManagedKeybindingManifest {
-                    canonical_id: "User.WinTerminalP.SplitLeft".to_owned(),
-                    canonical_chord: "ctrl+f13".to_owned(),
+                    canonical_id: "user.winterminalpp.splitleft".to_owned(),
+                    canonical_chord: "ctrl+shift+alt+f13".to_owned(),
                     definition,
                 }],
             }],
@@ -340,41 +402,39 @@ mod tests {
         config
     }
 
+    fn wt_settings(root: &Path, channel: &str) -> PathBuf {
+        root.join("Packages")
+            .join(channel)
+            .join("LocalState")
+            .join("settings.json")
+    }
+
     #[test]
-    fn install_migrates_the_legacy_world_and_installs_winter_fresh() {
+    fn install_migrates_win_terminal_pp_world_and_installs_winter_fresh() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let config = seed_legacy(temp.path());
+        let config = seed_legacy(temp.path(), "WinTerminalPP", None);
 
         let report = super::super::install(&config).expect("install migrates then installs");
 
-        let legacy_dir = temp.path().join(LEGACY_APP_DATA_DIR_NAME);
-        assert!(!legacy_dir.exists(), "legacy state dir must be gone");
-        assert!(
-            !legacy_fragment_dir(&config).exists(),
-            "legacy fragment dir must be gone"
-        );
+        assert!(!temp.path().join("WinTerminalPP").exists());
+        assert!(!temp.path().join("WinTerminalP").exists());
+        assert!(!fragment_dir(&config, "WinTerminalPP").exists());
         assert!(report.fragment.status == ChangeStatus::Create);
 
-        let new_config = temp.path().join(APP_DATA_DIR_NAME).join("config.toml");
         assert_eq!(
-            fs::read(&new_config).expect("new config"),
+            fs::read(new_config_path(&config)).expect("new config"),
             b"schema_version = 1\n",
             "config bytes must carry over unchanged"
         );
-
-        // Fresh fragment at the Winter path.
         assert!(config.fragment_path().is_file(), "new fragment exists");
 
-        // Settings: old ids removed, new ids installed, user binding intact.
-        let settings_path = temp
-            .path()
-            .join("Packages")
-            .join("Microsoft.WindowsTerminal_8wekyb3d8bbwe")
-            .join("LocalState")
-            .join("settings.json");
-        let settings = fs::read_to_string(&settings_path).expect("settings");
+        let settings = fs::read_to_string(wt_settings(
+            temp.path(),
+            "Microsoft.WindowsTerminal_8wekyb3d8bbwe",
+        ))
+        .expect("settings");
         assert!(
-            !settings.contains("User.WinTerminalP."),
+            !settings.to_ascii_lowercase().contains("user.winterminalp"),
             "legacy bindings must be removed: {settings}"
         );
         assert!(
@@ -386,29 +446,21 @@ mod tests {
             "user bindings must survive: {settings}"
         );
 
-        // Shell: legacy block replaced by the Winter block.
         let profile = config
             .documents_dir
             .join("WindowsPowerShell")
             .join("Microsoft.PowerShell_profile.ps1");
         let profile_text = fs::read_to_string(profile).expect("profile");
-        assert!(
-            !profile_text.contains("WinTerminalP"),
-            "legacy shell block must be gone: {profile_text}"
-        );
-        assert!(
-            profile_text.contains("Winter shell integration"),
-            "fresh Winter shell block must be installed: {profile_text}"
-        );
+        assert!(!profile_text.contains("WinTerminalP"));
+        assert!(profile_text.contains("Winter shell integration"));
         assert!(profile_text.contains("Write-Host hi"));
 
-        // Everything healthy afterwards, and migration is not re-triggered.
         let doctor = super::super::doctor(&config).expect("doctor after migration");
         assert!(
             doctor
                 .issues
                 .iter()
-                .all(|issue| !issue.contains("legacy WinTerminalP")),
+                .all(|issue| !issue.contains("legacy installation")),
             "no legacy issues after migration: {:?}",
             doctor.issues
         );
@@ -416,43 +468,65 @@ mod tests {
     }
 
     #[test]
+    fn stray_ids_in_unrecorded_channels_are_swept() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let preview = wt_settings(
+            temp.path(),
+            "Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe",
+        );
+        let config = seed_legacy(temp.path(), "WinTerminalPP", Some(&preview));
+
+        migrate_if_present(&config).expect("migration succeeds");
+
+        let preview_text = fs::read_to_string(&preview).expect("preview settings");
+        assert!(
+            !preview_text
+                .to_ascii_lowercase()
+                .contains("user.winterminalp"),
+            "unrecorded channel must be swept: {preview_text}"
+        );
+        assert!(!temp.path().join("WinTerminalPP").exists());
+    }
+
+    #[test]
     fn uninstall_removes_a_legacy_installation_without_the_new_manifest() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let config = seed_legacy(temp.path());
+        let config = seed_legacy(temp.path(), "WinTerminalP", None);
 
         let handled = uninstall_if_present(&config).expect("legacy uninstall");
         assert!(handled, "legacy installation must be detected");
-        assert!(!temp.path().join(LEGACY_APP_DATA_DIR_NAME).exists());
-        // No config carry-over on plain uninstall.
+        assert!(!temp.path().join("WinTerminalP").exists());
         assert!(
-            !temp
-                .path()
-                .join(APP_DATA_DIR_NAME)
-                .join("config.toml")
-                .exists()
+            !new_config_path(&config).exists(),
+            "no config carry-over on plain uninstall"
         );
-        // Second call finds nothing.
         assert!(!uninstall_if_present(&config).expect("second call"));
     }
 
     #[test]
     fn plan_and_doctor_report_the_legacy_installation() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let config = seed_legacy(temp.path());
+        let config = seed_legacy(temp.path(), "WinTerminalPP", None);
 
         let issue = detection_issue(&config).expect("detection issue");
-        assert!(issue.contains("legacy WinTerminalP installation"));
+        assert!(issue.contains("legacy installation detected"));
         assert!(issue.contains("winter install"));
 
         let plan = super::super::plan(&config).expect("plan succeeds");
         assert!(
             plan.issues
                 .iter()
-                .any(|entry| entry.contains("legacy WinTerminalP")),
+                .any(|entry| entry.contains("legacy installation")),
             "plan must surface the legacy installation: {:?}",
             plan.issues
         );
-        assert!(plan.can_install, "legacy must not block installation");
+        // Plan reflects the current state: legacy ids still occupy the bridge
+        // chords, so it reports conflicts until `winter install` migrates
+        // (install runs the migration before its own conflict analysis).
+        assert!(
+            !plan.can_install,
+            "pre-migration plan shows the occupied chords as conflicts"
+        );
 
         let report = super::super::doctor(&config).expect("doctor succeeds");
         assert!(!report.healthy, "legacy installation needs attention");
@@ -460,7 +534,7 @@ mod tests {
             report
                 .issues
                 .iter()
-                .any(|entry| entry.contains("legacy WinTerminalP"))
+                .any(|entry| entry.contains("legacy installation"))
         );
     }
 
@@ -468,9 +542,9 @@ mod tests {
     fn manifestless_foreign_fragment_is_refused_and_kept() {
         let temp = tempfile::tempdir().expect("tempdir");
         let config = config_with(temp.path());
-        let fragment_dir = legacy_fragment_dir(&config);
-        fs::create_dir_all(&fragment_dir).expect("fragment dir");
-        let fragment_path = fragment_dir.join("actions.json");
+        let dir = fragment_dir(&config, "WinTerminalPP");
+        fs::create_dir_all(&dir).expect("fragment dir");
+        let fragment_path = dir.join("actions.json");
         fs::write(&fragment_path, br#"{"actions":[{"id":"Some.Other.Tool"}]}"#).expect("fragment");
 
         let error = uninstall_if_present(&config).expect_err("foreign fragment must refuse");
@@ -480,39 +554,45 @@ mod tests {
                 .contains("does not contain Winter action ids")
         );
         assert!(fragment_path.exists(), "foreign fragment must be untouched");
-        assert!(temp.path().join(LEGACY_APP_DATA_DIR_NAME).exists() || true);
     }
 
     #[test]
     fn manifestless_our_fragment_is_removed() {
         let temp = tempfile::tempdir().expect("tempdir");
         let config = config_with(temp.path());
-        let fragment_dir = legacy_fragment_dir(&config);
-        fs::create_dir_all(&fragment_dir).expect("fragment dir");
+        let dir = fragment_dir(&config, "WinTerminalPP");
+        fs::create_dir_all(&dir).expect("fragment dir");
         fs::write(
-            fragment_dir.join("actions.json"),
-            br#"{"actions":[{"id":"User.WinTerminalP.SplitLeft"}]}"#,
+            dir.join("actions.json"),
+            br#"{"actions":[{"id":"User.WinTerminalPP.SplitLeft"}]}"#,
         )
         .expect("fragment");
 
         uninstall_if_present(&config).expect("cleanup succeeds");
-        assert!(!fragment_dir.join("actions.json").exists());
+        assert!(!dir.join("actions.json").exists());
     }
 
     #[test]
-    fn jsonc_removal_round_trip_for_the_legacy_record_shape() {
-        // Guards the assumption the migration leans on: records with legacy
-        // ids parse and remove matching entries.
-        let raw = br#"{"keybindings":[{"id":"User.WinTerminalP.SplitLeft","keys":"ctrl+f13"}]}"#;
-        let definition =
-            serde_json::json!({"id": "User.WinTerminalP.SplitLeft", "keys": "ctrl+f13"});
-        let record = ManagedKeybindingManifest {
-            canonical_id: "User.WinTerminalP.SplitLeft".to_owned(),
-            canonical_chord: "ctrl+f13".to_owned(),
-            definition,
-        };
-        let edit = jsonc::remove_managed_keybindings(raw, &[record]).expect("removal parses");
-        assert_eq!(edit.removed_binding_count, 1);
-        assert!(edit.replacement.is_some());
+    fn remove_legacy_keybindings_targets_only_historical_namespaces() {
+        let raw = br#"{"keybindings":[
+            {"id":"User.WinTerminalPP.SplitLeft","keys":"ctrl+alt+shift+f13"},
+            {"id":"User.WinTerminalP.Old","keys":"ctrl+f13"},
+            {"id":"User.Winter.SplitLeft","keys":"ctrl+f13"},
+            {"id":"User.Own.Custom","keys":"ctrl+f9"}
+        ]}"#;
+        let edit =
+            jsonc::remove_legacy_keybindings(raw, &LEGACY_ID_PREFIXES).expect("sweep parses");
+        assert_eq!(edit.removed_binding_count, 2);
+        let text = String::from_utf8(edit.replacement.expect("replacement")).expect("utf8");
+        assert!(!text.to_ascii_lowercase().contains("user.winterminalp"));
+        assert!(text.contains("User.Winter.SplitLeft"));
+        assert!(text.contains("User.Own.Custom"));
+
+        let clean = jsonc::remove_legacy_keybindings(
+            br#"{"keybindings":[{"id":"User.Winter.X","keys":"ctrl+f13"}]}"#,
+            &LEGACY_ID_PREFIXES,
+        )
+        .expect("clean parse");
+        assert!(clean.replacement.is_none(), "nothing legacy to remove");
     }
 }

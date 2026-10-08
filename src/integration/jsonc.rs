@@ -317,6 +317,68 @@ pub fn analyze_keybindings(
     })
 }
 
+/// Removes keybindings whose id carries a historical Winter namespace
+/// (`User.WinTerminalPP.*`, `User.WinTerminalP.*`, …), regardless of chord.
+///
+/// Used by the one-shot migration in `integration::legacy` for entries the
+/// legacy manifest cannot account for — extra channels that were never
+/// recorded, or ids rewritten by hand. `legacy_prefixes` are lowercase id
+/// prefixes; everything else in the document is preserved untouched.
+pub(crate) fn remove_legacy_keybindings(
+    raw: &[u8],
+    legacy_prefixes: &[&str],
+) -> AppResult<RemovalEdit> {
+    let document = parse_document(raw)?;
+    let root_object = document.root.object_value().ok_or_else(|| {
+        AppError::InvalidConfiguration("settings root must be an object".to_owned())
+    })?;
+    let Some(array) = root_object.array_value("keybindings") else {
+        if root_object.get("keybindings").is_some() {
+            return Err(AppError::InvalidConfiguration(
+                "root keybindings must be an array".to_owned(),
+            ));
+        }
+        return Ok(RemovalEdit {
+            removed_binding_count: 0,
+            preserved_binding_count: 0,
+            retained: Vec::new(),
+            replacement: None,
+        });
+    };
+    let desired_ids = HashSet::new();
+    let (existing, parse_conflicts, _warnings) =
+        parse_existing_bindings(array.elements(), &desired_ids);
+    if !parse_conflicts.is_empty() {
+        return Err(AppError::SettingsConflict(
+            "settings contains malformed keybindings; legacy entries were retained".to_owned(),
+        ));
+    }
+    let mut removed_nodes = Vec::new();
+    for binding in &existing {
+        let Some(id) = binding.canonical_id.as_deref() else {
+            continue;
+        };
+        let lowered = id.to_ascii_lowercase();
+        if legacy_prefixes
+            .iter()
+            .any(|prefix| lowered.starts_with(prefix))
+        {
+            removed_nodes.push(binding.node.clone());
+        }
+    }
+    let removed_binding_count = removed_nodes.len();
+    for node in removed_nodes {
+        node.remove();
+    }
+    let replacement = (removed_binding_count > 0).then(|| serialize_document(&document));
+    Ok(RemovalEdit {
+        removed_binding_count,
+        preserved_binding_count: 0,
+        retained: Vec::new(),
+        replacement,
+    })
+}
+
 pub(crate) fn remove_managed_keybindings(
     raw: &[u8],
     managed: &[ManagedKeybindingManifest],

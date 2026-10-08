@@ -176,7 +176,7 @@ fn prune_backup_directory(backup_dir: &Path) {
 
 /// Replaces a file only if its current bytes still match the snapshot used to plan the edit.
 ///
-/// The replacement is staged in a `.winterminalp-tmp-*` file inside the destination directory
+/// The replacement is staged in a `.winter-tmp-*` file inside the destination directory
 /// and moved into place only after a second compare-and-swap check closes the long window spent
 /// writing and syncing that staging file. Every error path — including a failed staging write —
 /// deletes the staging file before the error is returned. Known residual race: a concurrent
@@ -210,7 +210,7 @@ where
     })?;
     fs::create_dir_all(parent)
         .map_err(|error| AppError::io("create integration target directory", parent, error))?;
-    let temp_path = unique_path(parent, ".winterminalp-tmp", "json");
+    let temp_path = unique_path(parent, ".winter-tmp", "json");
     let outcome = stage_replace(&temp_path, path, expected_sha256, replacement, write_temp);
     if outcome.is_err() {
         let _ = fs::remove_file(&temp_path);
@@ -404,7 +404,7 @@ mod tests {
             .filter(|path| {
                 path.file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(".winterminalp-tmp-"))
+                    .is_some_and(|name| name.starts_with(".winter-tmp-"))
             })
             .collect()
     }
@@ -431,7 +431,7 @@ mod tests {
         assert!(matches!(result, Err(AppError::InvalidConfiguration(_))));
         assert!(
             staging_files(temp.path()).is_empty(),
-            "failed staging write must not leave a .winterminalp-tmp file"
+            "failed staging write must not leave a .winter-tmp file"
         );
         assert_eq!(
             fs::read(&path).expect("fixture should remain readable"),
@@ -460,7 +460,7 @@ mod tests {
         assert!(matches!(result, Err(AppError::SettingsConflict(_))));
         assert!(
             staging_files(temp.path()).is_empty(),
-            "second-check failure must not leave a .winterminalp-tmp file"
+            "second-check failure must not leave a .winter-tmp file"
         );
         assert_eq!(
             fs::read(&path).expect("fixture should remain readable"),

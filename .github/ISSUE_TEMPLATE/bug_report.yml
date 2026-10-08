@@ -84,6 +84,6 @@ body:
     id: logs
     attributes:
       label: Additional context
-      description: Error log from `%LOCALAPPDATA%\WinTerminalP\last-error.log` if present, screenshots, or notes.
+      description: Error log from `%LOCALAPPDATA%\Winter\last-error.log` if present, screenshots, or notes.
     validations:
       required: false

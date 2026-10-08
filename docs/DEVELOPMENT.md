@@ -109,4 +109,4 @@ Shortcut 字段采用 `action_name = "modifier+key"`；缺失项继承默认值�
 - 不直接格式化或重写真实 `settings.json`。
 - 真实安装前记录目标绝对路径、原始哈希和备份路径。
 - 不修改 `defaults.json` 或 `state.json`。
-- 测试卸载时仅操作 `User.WinTerminalP.*` 命名空间。
+- 测试卸载时仅操作 `User.Winter.*` 命名空间。

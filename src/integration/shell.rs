@@ -14,26 +14,31 @@ use super::encoding::{UTF16LE_BOM, Utf16LeError, decode_utf16_le, encode_utf16_l
 use super::transaction::{atomic_replace, create_backup, read_optional_snapshot};
 use super::types::{ChangeStatus, IntegrationConfig, ShellIntegrationReport, ShellKind};
 
-const BEGIN_MARKER: &str = "# >>> WinTerminalP shell integration >>>";
-const END_MARKER: &str = "# <<< WinTerminalP shell integration <<<";
+const BEGIN_MARKER: &str = "# >>> Winter shell integration >>>";
+const END_MARKER: &str = "# <<< Winter shell integration <<<";
 
-const SNIPPET_BODY: &str = r#"# Managed by WinTerminalP. Run `winter uninstall` to remove this block.
-if (-not $Global:__WinTerminalP_PromptWrapped) {
-    $Global:__WinTerminalP_PromptWrapped = $true
-    $Global:__WinTerminalP_OriginalPrompt = $function:prompt
+/// Historical marker pair written by pre-Winter releases; referenced only by
+/// the one-shot migration in [`super::legacy`].
+pub(super) const LEGACY_BEGIN_MARKER: &str = "# >>> WinTerminalP shell integration >>>";
+pub(super) const LEGACY_END_MARKER: &str = "# <<< WinTerminalP shell integration <<<";
+
+const SNIPPET_BODY: &str = r#"# Managed by Winter. Run `winter uninstall` to remove this block.
+if (-not $Global:__Winter_PromptWrapped) {
+    $Global:__Winter_PromptWrapped = $true
+    $Global:__Winter_OriginalPrompt = $function:prompt
     function global:prompt {
-        $__wtpLocation = $ExecutionContext.SessionState.Path.CurrentLocation
-        $__wtpOsc = "$([char]27)]9;9;`"$__wtpLocation`"$([char]7)"
-        $__wtpBase = if ($Global:__WinTerminalP_OriginalPrompt) {
-            & $Global:__WinTerminalP_OriginalPrompt
+        $__winterLocation = $ExecutionContext.SessionState.Path.CurrentLocation
+        $__winterOsc = "$([char]27)]9;9;`"$__winterLocation`"$([char]7)"
+        $__winterBase = if ($Global:__Winter_OriginalPrompt) {
+            & $Global:__Winter_OriginalPrompt
         }
         else {
-            "PS $__wtpLocation> "
+            "PS $__winterLocation> "
         }
-        if ($__wtpBase -is [System.Array]) {
-            return @($__wtpOsc) + @($__wtpBase)
+        if ($__winterBase -is [System.Array]) {
+            return @($__winterOsc) + @($__winterBase)
         }
-        return $__wtpOsc + [string]$__wtpBase
+        return $__winterOsc + [string]$__winterBase
     }
 }"#;
 
@@ -101,7 +106,7 @@ fn plan_profile_inner(shell: ShellKind, path: &Path) -> AppResult<ShellIntegrati
         ));
     };
     let (_, text) = decode_profile(path, &snapshot.bytes)?;
-    Ok(match block_state(&text) {
+    Ok(match block_state(&text, BEGIN_MARKER, END_MARKER) {
         BlockState::Absent => report(shell, path, ChangeStatus::Update, None, None),
         BlockState::Present { start, end } => {
             let desired = managed_block(detect_newline(&text));
@@ -151,7 +156,7 @@ fn install_profile_inner(
 
     let (encoding, text) = decode_profile(path, &snapshot.bytes)?;
     let newline = detect_newline(&text);
-    match block_state(&text) {
+    match block_state(&text, BEGIN_MARKER, END_MARKER) {
         BlockState::Malformed(message) => Ok(report(
             shell,
             path,
@@ -212,6 +217,54 @@ fn uninstall_profile_inner(
     shell: ShellKind,
     path: &Path,
 ) -> AppResult<ShellIntegrationReport> {
+    uninstall_profile_with(
+        config,
+        shell,
+        path,
+        BEGIN_MARKER,
+        END_MARKER,
+        BlockPolicy::PreserveEdited,
+    )
+}
+
+/// Removes the historical block written by pre-Winter releases.
+///
+/// The legacy markers are namespaced to this project, so a well-formed block
+/// is removed even when its content was edited; the current-marker path keeps
+/// edited blocks (see [`uninstall_profile_inner`]).
+pub(super) fn uninstall_legacy(config: &IntegrationConfig) -> Vec<ShellIntegrationReport> {
+    profile_targets(config)
+        .into_iter()
+        .map(|(shell, path)| {
+            uninstall_profile_with(
+                config,
+                shell,
+                &path,
+                LEGACY_BEGIN_MARKER,
+                LEGACY_END_MARKER,
+                BlockPolicy::RemoveEvenIfEdited,
+            )
+            .unwrap_or_else(|error| shell_error(shell, &path, error))
+        })
+        .collect()
+}
+
+/// Whether an edited managed block may be removed (`RemoveEvenIfEdited`, used
+/// for namespaced legacy markers) or must be preserved (`PreserveEdited`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlockPolicy {
+    PreserveEdited,
+    RemoveEvenIfEdited,
+}
+
+fn uninstall_profile_with(
+    config: &IntegrationConfig,
+    shell: ShellKind,
+    path: &Path,
+    begin_marker: &str,
+    end_marker: &str,
+    policy: BlockPolicy,
+) -> AppResult<ShellIntegrationReport> {
     let Some(snapshot) = read_optional_snapshot(path)? else {
         return Ok(report(
             shell,
@@ -222,7 +275,7 @@ fn uninstall_profile_inner(
         ));
     };
     let (encoding, text) = decode_profile(path, &snapshot.bytes)?;
-    match block_state(&text) {
+    match block_state(&text, begin_marker, end_marker) {
         BlockState::Absent => Ok(report(
             shell,
             path,
@@ -239,7 +292,9 @@ fn uninstall_profile_inner(
         )),
         BlockState::Present { start, end } => {
             let newline = detect_newline(&text);
-            if !normalized_eq(&text[start..end], &managed_block(newline)) {
+            if policy == BlockPolicy::PreserveEdited
+                && !normalized_eq(&text[start..end], &managed_block(newline))
+            {
                 return Ok(report(
                     shell,
                     path,
@@ -248,7 +303,12 @@ fn uninstall_profile_inner(
                     Some("managed block was edited and was left in place".to_owned()),
                 ));
             }
-            let backup = create_backup(&config.state_dir, "shell", path, &snapshot)?;
+            let backup_label = if policy == BlockPolicy::RemoveEvenIfEdited {
+                "legacy-shell"
+            } else {
+                "shell"
+            };
+            let backup = create_backup(&config.state_dir, backup_label, path, &snapshot)?;
             let mut block_start = start;
             if block_start >= newline.len() && text[..block_start].ends_with(newline) {
                 block_start -= newline.len();
@@ -402,9 +462,9 @@ enum BlockState {
 /// Classifies every marker occurrence instead of only the first pair, so a
 /// stray, reversed, or duplicated marker cannot slip past install/uninstall and
 /// leave a silently surviving second block behind.
-fn block_state(text: &str) -> BlockState {
-    let mut begins = text.match_indices(BEGIN_MARKER).map(|(index, _)| index);
-    let mut ends = text.match_indices(END_MARKER).map(|(index, _)| index);
+fn block_state(text: &str, begin_marker: &str, end_marker: &str) -> BlockState {
+    let mut begins = text.match_indices(begin_marker).map(|(index, _)| index);
+    let mut ends = text.match_indices(end_marker).map(|(index, _)| index);
     let begin = begins.next();
     let end = ends.next();
     let begin_count = usize::from(begin.is_some()) + begins.count();
@@ -414,13 +474,13 @@ fn block_state(text: &str) -> BlockState {
         (Some(begin), Some(end)) if begin_count == 1 && end_count == 1 && end >= begin => {
             BlockState::Present {
                 start: begin,
-                end: end + END_MARKER.len(),
+                end: end + end_marker.len(),
             }
         }
         _ => {
             let mut message = format!(
                 "profile contains {begin_count} BEGIN marker(s) and {end_count} END marker(s); \
-                 exactly one WinTerminalP marker block pair is required"
+                 exactly one managed marker block pair is required"
             );
             if begin_count == 1 && end_count == 1 {
                 message.push_str("; the END marker appears before the BEGIN marker");
@@ -505,7 +565,7 @@ mod tests {
         install(&config);
         let edited = fs::read_to_string(&profile)
             .expect("profile should be readable")
-            .replace("PS $__wtpLocation> ", "PS> ");
+            .replace("PS $__winterLocation> ", "PS> ");
         fs::write(&profile, edited).expect("edited profile should be written");
 
         let report = uninstall(&config);
@@ -826,12 +886,12 @@ mod tests {
     #[test]
     fn block_state_scans_all_marker_occurrences() {
         assert!(matches!(
-            block_state("Set-Alias ll Get-ChildItem\n"),
+            block_state("Set-Alias ll Get-ChildItem\n", BEGIN_MARKER, END_MARKER),
             BlockState::Absent
         ));
 
         let well_formed = format!("content\n{}\nmore", managed_block("\n"));
-        match block_state(&well_formed) {
+        match block_state(&well_formed, BEGIN_MARKER, END_MARKER) {
             BlockState::Present { start, end } => {
                 assert_eq!(&well_formed[start..end], managed_block("\n"));
             }
@@ -839,7 +899,7 @@ mod tests {
         }
 
         let reversed = format!("{END_MARKER}\ncontent\n{BEGIN_MARKER}\n");
-        match block_state(&reversed) {
+        match block_state(&reversed, BEGIN_MARKER, END_MARKER) {
             BlockState::Malformed(message) => {
                 assert!(
                     message.contains("1 BEGIN marker(s) and 1 END marker(s)")

@@ -344,7 +344,7 @@ mod tests {
 
     #[test]
     fn primary_dir_yields_app_data_log_before_temp_fallback() {
-        let primary_dir = PathBuf::from(r"C:\invalid\readonly\WinTerminalP");
+        let primary_dir = PathBuf::from(r"C:\invalid\readonly\Winter");
         let fallback = PathBuf::from(r"C:\temp\winter-last-error.log");
         let [primary, chosen_fallback] =
             error_log_paths(Some(primary_dir.clone()), fallback.clone());

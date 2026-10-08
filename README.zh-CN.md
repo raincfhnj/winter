@@ -23,10 +23,11 @@ Ctrl+B, X / Z / ,     →  关闭窗格 / 放大 / 重命名标签页
 
 Windows Terminal 没有 tmux 式的 Prefix 模式，其 keybinding 也只能表达“修饰键 + 一个非
 修饰键”。Winter 运行一个很小的低级键盘 Hook，仅在 Windows Terminal 位于前台时
-识别 Prefix，然后注入一个隐藏的单组合桥接键，该键绑定到 `User.WinTerminalP.*` 动作。
+识别 Prefix，然后注入一个隐藏的单组合桥接键，该键绑定到 `User.Winter.*` 动作。
 你的现有 Profile、主题、字体、Shell 和快捷键都不受影响。
 
-> 说明：动作 ID 与磁盘路径中的 `WinTerminalP` 是历史集成名，为安装兼容性保留。
+> 说明：动作 ID、磁盘路径、fragment 目录与 Shell 标记均使用 Winter 品牌命名；
+> `winter install` 会自动迁移历史上的 `WinTerminalP` 安装。
 
 ## 功能
 
@@ -89,6 +90,33 @@ cargo build --release --bins
 可直接运行 `target\release` 下的文件，或用
 `cargo install --path . --bins --locked` 安装到 PATH。
 
+### 从 0.2.x 升级
+
+旧版本使用历史上的 `WinTerminalP` 目录、动作 ID 与 Shell 标记。直接执行
+`winter install` 会检测到该旧安装并先移除它（旧键位、fragment、Shell 受管块与
+状态目录），再安装 Winter 品牌的集成；配置快捷键会从
+`%LOCALAPPDATA%\WinTerminalP\config.toml` 迁移到
+`%LOCALAPPDATA%\Winter\config.toml`。手动等价步骤：先用旧版执行
+`winter uninstall`，删除 `%LOCALAPPDATA%\WinTerminalP`，再执行 `winter install`。
+
+## 用法
+
+| 命令 | 作用 |
+|---|---|
+| `winter` / `winter launch` | 启动后台控制器并打开 Windows Terminal；首次运行会自动安装桥接 |
+| `winter run [--no-launch]` | 在当前进程内运行控制器；`--no-launch` 不新开窗口 |
+| `winter ui [--once]` | 在本终端显示实时窗格仪表盘——面向人类的 TUI 界面；`--once` 为脚本打印一帧 |
+| `winter config`（`--path` / `--edit`） | 输出完整生效配置、只输出路径，或用记事本打开 |
+| `winter plan` / `winter install` / `winter uninstall` | 桥接生命周期：预览变更、安装 fragment/隐藏键位/Shell 受管块，或只移除仍属于 Winter 的部分 |
+| `winter doctor` | 面向机器的 JSON：`{schema_version, healthy, config:{path, ok, error}, integration}` |
+
+在一个窗格里打开 `winter ui` 即可实时观察窗格、焦点与 Prefix 状态；按 `q`、`Q`、
+`Ctrl+C` 或 `Esc` 退出，控制器未运行时仪表盘显示 `OFFLINE`。
+
+退出码见 [退出码](#退出码) 一节。脚本与 Agent 应优先使用机器可读输出——
+`winter ui --once` 以及 `plan` / `install` / `uninstall` / `doctor` 打印的 JSON
+报告——而不是交互式 TUI。
+
 ## 默认快捷键
 
 所有快捷键仅在 Windows Terminal 位于前台时生效。先按下并释放 `Ctrl+B`，再按第二个键。
@@ -128,7 +156,7 @@ winter config --path   # 只输出路径
 winter config --edit   # 用记事本打开
 ```
 
-配置文件位于 `%LOCALAPPDATA%\WinTerminalP\config.toml`。只需写想覆盖的动作，其余继承
+配置文件位于 `%LOCALAPPDATA%\Winter\config.toml`。只需写想覆盖的动作，其余继承
 默认值。例如改成 Vim 风格：
 
 ```toml

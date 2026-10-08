@@ -33,7 +33,7 @@ fn help_exits_zero_and_documents_doctor() {
 #[test]
 fn doctor_reports_broken_config_as_needing_attention() {
     let temp = tempdir().expect("temporary directory should be created");
-    let config_dir = temp.path().join("WinTerminalP");
+    let config_dir = temp.path().join("Winter");
     fs::create_dir_all(&config_dir).expect("config directory should be created");
     fs::write(
         config_dir.join("config.toml"),
@@ -163,8 +163,8 @@ fn config_path_prints_a_file_under_the_redirected_local_app_data() {
     );
     assert_eq!(
         printed.parent().and_then(Path::file_name),
-        Some(OsStr::new("WinTerminalP")),
-        "the configuration file must live in the WinTerminalP directory: {printed:?}"
+        Some(OsStr::new("Winter")),
+        "the configuration file must live in the Winter directory: {printed:?}"
     );
 }
 

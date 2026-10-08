@@ -710,7 +710,7 @@ mod tests {
     #[test]
     fn merge_is_lossless_around_the_edited_array_and_idempotent() {
         let source = b"\xef\xbb\xbf{\r\n  // keep this comment\r\n  \"profiles\": [],\r\n}\r\n";
-        let bindings = [desired("WinTerminalP.SplitLeft", "ctrl+f13")];
+        let bindings = [desired("Winter.SplitLeft", "ctrl+f13")];
 
         let first = merge_keybindings(source, &bindings).expect("merge should succeed");
         assert!(first.conflicts.is_empty());
@@ -730,8 +730,8 @@ mod tests {
 
     #[test]
     fn blocks_same_id_with_a_different_chord() {
-        let source = br#"{"keybindings":[{"id":"WinTerminalP.SplitLeft","keys":"ctrl+f14"}]}"#;
-        let result = merge_keybindings(source, &[desired("WinTerminalP.SplitLeft", "ctrl+f13")])
+        let source = br#"{"keybindings":[{"id":"Winter.SplitLeft","keys":"ctrl+f14"}]}"#;
+        let result = merge_keybindings(source, &[desired("Winter.SplitLeft", "ctrl+f13")])
             .expect("analysis should complete");
 
         assert!(result.replacement.is_none());
@@ -746,11 +746,8 @@ mod tests {
     #[test]
     fn blocks_same_chord_with_a_different_id_after_normalization() {
         let source = br#"{"keybindings":[{"id":"User.Action","keys":"SHIFT + CTRL + F13"}]}"#;
-        let result = merge_keybindings(
-            source,
-            &[desired("WinTerminalP.SplitLeft", "ctrl+shift+f13")],
-        )
-        .expect("analysis should complete");
+        let result = merge_keybindings(source, &[desired("Winter.SplitLeft", "ctrl+shift+f13")])
+            .expect("analysis should complete");
 
         assert!(result.replacement.is_none());
         assert!(
@@ -765,14 +762,14 @@ mod tests {
     fn uninstall_removes_only_semantically_unchanged_manifest_entries() {
         let source = br#"{
   "keybindings": [
-    { "id": "WinTerminalP.SplitLeft", "keys": "ctrl+f13" },
-    { "id": "WinTerminalP.SplitRight", "keys": "ctrl+f24", "userNote": true },
+    { "id": "Winter.SplitLeft", "keys": "ctrl+f13" },
+    { "id": "Winter.SplitRight", "keys": "ctrl+f24", "userNote": true },
     { "id": "User.Action", "keys": "ctrl+x" }
   ]
 }"#;
         let records = [
-            to_manifest_binding(&desired("WinTerminalP.SplitLeft", "ctrl+f13")),
-            to_manifest_binding(&desired("WinTerminalP.SplitRight", "ctrl+f14")),
+            to_manifest_binding(&desired("Winter.SplitLeft", "ctrl+f13")),
+            to_manifest_binding(&desired("Winter.SplitRight", "ctrl+f14")),
         ];
 
         let edit = remove_managed_keybindings(source, &records).expect("removal should succeed");
@@ -789,11 +786,9 @@ mod tests {
     #[test]
     fn command_keybindings_without_id_are_not_malformed() {
         let source = br#"{"keybindings":[{"command":"newTab","keys":"ctrl+shift+t"}]}"#;
-        let result = merge_keybindings(
-            source,
-            &[desired("WinTerminalP.SplitLeft", "ctrl+alt+shift+f13")],
-        )
-        .expect("analysis should complete");
+        let result =
+            merge_keybindings(source, &[desired("Winter.SplitLeft", "ctrl+alt+shift+f13")])
+                .expect("analysis should complete");
 
         assert!(result.conflicts.is_empty());
         assert!(result.replacement.is_some());
@@ -803,11 +798,9 @@ mod tests {
     fn multi_chord_entries_are_not_malformed_but_still_reserve_their_chords() {
         let source =
             br#"{"keybindings":[{"id":"User.Multi","keys":["ctrl+alt+shift+f13","ctrl+x"]}]}"#;
-        let result = merge_keybindings(
-            source,
-            &[desired("WinTerminalP.SplitLeft", "ctrl+alt+shift+f13")],
-        )
-        .expect("analysis should complete");
+        let result =
+            merge_keybindings(source, &[desired("Winter.SplitLeft", "ctrl+alt+shift+f13")])
+                .expect("analysis should complete");
 
         assert!(
             result
@@ -826,16 +819,16 @@ mod tests {
     #[test]
     fn analyze_matches_merge_counts_and_conflicts() {
         let desired_bindings = [
-            desired("WinTerminalP.SplitLeft", "ctrl+f13"),
-            desired("WinTerminalP.SplitRight", "ctrl+f14"),
+            desired("Winter.SplitLeft", "ctrl+f13"),
+            desired("Winter.SplitRight", "ctrl+f14"),
         ];
         let fixtures: &[&[u8]] = &[
             br#"{}"#,
             br#"{"keybindings":[]}"#,
-            br#"{"keybindings":[{"id":"WinTerminalP.SplitLeft","keys":"ctrl+f13"}]}"#,
-            br#"{"keybindings":[{"id":"WinTerminalP.SplitLeft","keys":"ctrl+f14"},{"id":"User.Action","keys":"ctrl+alt+f14"}]}"#,
-            br#"{"keybindings":[{"id":"WinTerminalP.SplitLeft","keys":"ctrl+f13","command":"unbound"}]}"#,
-            br#"{"keybindings":[{"id":"WinTerminalP.SplitLeft"},{"id":"User.Junk","keys":[]}]}"#,
+            br#"{"keybindings":[{"id":"Winter.SplitLeft","keys":"ctrl+f13"}]}"#,
+            br#"{"keybindings":[{"id":"Winter.SplitLeft","keys":"ctrl+f14"},{"id":"User.Action","keys":"ctrl+alt+f14"}]}"#,
+            br#"{"keybindings":[{"id":"Winter.SplitLeft","keys":"ctrl+f13","command":"unbound"}]}"#,
+            br#"{"keybindings":[{"id":"Winter.SplitLeft"},{"id":"User.Junk","keys":[]}]}"#,
             br#"{"keybindings":[42,"junk"]}"#,
             br#"{ "keybindings": [], "keybindings": [] }"#,
             br#"{"keybindings":{}}"#,
@@ -874,7 +867,7 @@ mod tests {
     { "id": "User.Junk", "keys": 7 }
   ]
 }"#;
-        let bindings = [desired("WinTerminalP.SplitLeft", "ctrl+f13")];
+        let bindings = [desired("Winter.SplitLeft", "ctrl+f13")];
 
         let edit =
             merge_keybindings(source, &bindings).expect("unmanaged junk must not block install");
@@ -901,15 +894,15 @@ mod tests {
     fn malformed_managed_entries_still_conflict() {
         let source = br#"{
   "keybindings": [
-    { "id": "WinTerminalP.SplitLeft" },
-    { "id": "WinTerminalP.SplitRight", "keys": [] },
-    { "id": "WinTerminalP.SplitRight", "keys": 7 },
+    { "id": "Winter.SplitLeft" },
+    { "id": "Winter.SplitRight", "keys": [] },
+    { "id": "Winter.SplitRight", "keys": 7 },
     { "id": "User.Junk" }
   ]
 }"#;
         let bindings = [
-            desired("WinTerminalP.SplitLeft", "ctrl+f13"),
-            desired("WinTerminalP.SplitRight", "ctrl+f14"),
+            desired("Winter.SplitLeft", "ctrl+f13"),
+            desired("Winter.SplitRight", "ctrl+f14"),
         ];
 
         let edit = merge_keybindings(source, &bindings).expect("analysis should complete");
@@ -953,7 +946,7 @@ mod tests {
     #[test]
     fn ctrl_plus_plus_collides_with_the_canonical_plus_chord() {
         let source = br#"{"keybindings":[{"id":"User.Plus","keys":"ctrl++"}]}"#;
-        let bindings = [desired("WinTerminalP.SplitLeft", "ctrl+plus")];
+        let bindings = [desired("Winter.SplitLeft", "ctrl+plus")];
 
         let edit = merge_keybindings(source, &bindings).expect("analysis should complete");
         assert!(edit.replacement.is_none());
@@ -966,8 +959,8 @@ mod tests {
 
     #[test]
     fn extra_properties_do_not_block_a_managed_entry_with_matching_keys() {
-        let bindings = [desired("WinTerminalP.SplitLeft", "ctrl+f13")];
-        let source = br#"{"keybindings":[{"id":"WinTerminalP.SplitLeft","keys":"ctrl+f13","command":"unbound","userNote":true}]}"#;
+        let bindings = [desired("Winter.SplitLeft", "ctrl+f13")];
+        let source = br#"{"keybindings":[{"id":"Winter.SplitLeft","keys":"ctrl+f13","command":"unbound","userNote":true}]}"#;
 
         let edit = merge_keybindings(source, &bindings).expect("analysis should complete");
         assert!(edit.conflicts.is_empty());
@@ -978,7 +971,7 @@ mod tests {
         assert_eq!(analysis.bindings_to_add, 0);
 
         let source =
-            br#"{"keybindings":[{"id":"WinTerminalP.SplitLeft","keys":"ctrl+f14","command":"unbound"}]}"#;
+            br#"{"keybindings":[{"id":"Winter.SplitLeft","keys":"ctrl+f14","command":"unbound"}]}"#;
         let edit = merge_keybindings(source, &bindings).expect("analysis should complete");
         assert!(edit.replacement.is_none());
         assert_eq!(
@@ -992,11 +985,11 @@ mod tests {
 
     #[test]
     fn index_lookup_preserves_first_match_selection() {
-        let bindings = [desired("WinTerminalP.SplitLeft", "ctrl+f13")];
+        let bindings = [desired("Winter.SplitLeft", "ctrl+f13")];
 
         let source = br#"{"keybindings":[
-            {"id":"WinTerminalP.SplitLeft","keys":"ctrl+f14"},
-            {"id":"WinTerminalP.SplitLeft","keys":"ctrl+f13"}
+            {"id":"Winter.SplitLeft","keys":"ctrl+f14"},
+            {"id":"Winter.SplitLeft","keys":"ctrl+f13"}
         ]}"#;
         let edit = merge_keybindings(source, &bindings).expect("analysis should complete");
         assert!(edit.conflicts.is_empty());
@@ -1005,8 +998,8 @@ mod tests {
         assert_eq!(analysis.managed_binding_count, 1);
 
         let source = br#"{"keybindings":[
-            {"id":"WinTerminalP.SplitLeft","keys":"ctrl+f15"},
-            {"id":"WinTerminalP.SplitLeft","keys":"ctrl+f16"}
+            {"id":"Winter.SplitLeft","keys":"ctrl+f15"},
+            {"id":"Winter.SplitLeft","keys":"ctrl+f16"}
         ]}"#;
         let edit = merge_keybindings(source, &bindings).expect("analysis should complete");
         assert_eq!(
@@ -1027,10 +1020,7 @@ mod tests {
             .iter()
             .find(|conflict| conflict.kind == ConflictKind::SameChordDifferentBinding)
             .expect("chord conflict should be reported");
-        assert_eq!(
-            conflict.action_id.as_deref(),
-            Some("winterminalp.splitleft")
-        );
+        assert_eq!(conflict.action_id.as_deref(), Some("winter.splitleft"));
         assert!(
             conflict.message.contains("user.first"),
             "message was: {}",
@@ -1042,11 +1032,11 @@ mod tests {
     #[test]
     fn removal_skips_unmanaged_junk_but_still_blocks_managed_malformed_entries() {
         let records = [to_manifest_binding(&desired(
-            "WinTerminalP.SplitLeft",
+            "Winter.SplitLeft",
             "ctrl+f13",
         ))];
         let source =
-            br#"{"keybindings":[{"id":"User.Junk"},{"id":"WinTerminalP.SplitLeft","keys":"ctrl+f13"}]}"#;
+            br#"{"keybindings":[{"id":"User.Junk"},{"id":"Winter.SplitLeft","keys":"ctrl+f13"}]}"#;
         let edit = remove_managed_keybindings(source, &records)
             .expect("unmanaged junk must not block removal");
         assert_eq!(edit.removed_binding_count, 1);
@@ -1055,7 +1045,7 @@ mod tests {
         assert!(text.contains("User.Junk"));
         assert!(!text.contains("SplitLeft"));
 
-        let source = br#"{"keybindings":[{"id":"WinTerminalP.SplitLeft"}]}"#;
+        let source = br#"{"keybindings":[{"id":"Winter.SplitLeft"}]}"#;
         assert!(remove_managed_keybindings(source, &records).is_err());
     }
 
@@ -1063,7 +1053,7 @@ mod tests {
     fn utf16le_settings_merge_and_remove_round_trip_in_the_original_encoding() {
         let text = "{\r\n  // keep this comment\r\n  \"profiles\": [],\r\n}\r\n";
         let source = encode_utf16_le_with_bom(text);
-        let bindings = [desired("WinTerminalP.SplitLeft", "ctrl+f13")];
+        let bindings = [desired("Winter.SplitLeft", "ctrl+f13")];
 
         let first = merge_keybindings(&source, &bindings).expect("utf16le merge should succeed");
         assert!(first.conflicts.is_empty());
@@ -1073,7 +1063,7 @@ mod tests {
             decode_utf16_le(&replacement[UTF16LE_BOM.len()..]).expect("result should decode");
         assert!(decoded.contains("// keep this comment\r\n"));
         assert!(decoded.contains("\"profiles\": []"));
-        assert!(decoded.contains("WinTerminalP.SplitLeft"));
+        assert!(decoded.contains("Winter.SplitLeft"));
         assert_eq!(
             encode_utf16_le_with_bom(&decoded),
             replacement,
@@ -1090,17 +1080,17 @@ mod tests {
         let removed = removal.replacement.expect("binding should be removed");
         assert_eq!(&removed[..2], UTF16LE_BOM);
         let decoded = decode_utf16_le(&removed[UTF16LE_BOM.len()..]).expect("result should decode");
-        assert!(!decoded.contains("WinTerminalP.SplitLeft"));
+        assert!(!decoded.contains("Winter.SplitLeft"));
         assert!(decoded.contains("// keep this comment\r\n"));
         assert_eq!(removal.removed_binding_count, 1);
     }
 
     #[test]
     fn utf16le_analysis_matches_the_utf8_twin_and_needs_no_write() {
-        let text = "{\r\n  // keep this comment\r\n  \"keybindings\": [{\"id\": \"WinTerminalP.SplitLeft\", \"keys\": \"ctrl+f13\"}]\r\n}\r\n";
+        let text = "{\r\n  // keep this comment\r\n  \"keybindings\": [{\"id\": \"Winter.SplitLeft\", \"keys\": \"ctrl+f13\"}]\r\n}\r\n";
         let utf8 = text.as_bytes().to_vec();
         let utf16 = encode_utf16_le_with_bom(text);
-        let bindings = [desired("WinTerminalP.SplitLeft", "ctrl+f13")];
+        let bindings = [desired("Winter.SplitLeft", "ctrl+f13")];
 
         let utf8_analysis = analyze_keybindings(&utf8, &bindings).expect("utf8 analysis");
         let utf16_analysis = analyze_keybindings(&utf16, &bindings).expect("utf16 analysis");
@@ -1131,7 +1121,7 @@ mod tests {
 
     #[test]
     fn utf16be_and_truncated_utf16le_settings_are_rejected_with_clear_errors() {
-        let bindings = [desired("WinTerminalP.SplitLeft", "ctrl+f13")];
+        let bindings = [desired("Winter.SplitLeft", "ctrl+f13")];
 
         let mut utf16be = vec![0xfe, 0xff];
         for unit in "{}".encode_utf16() {

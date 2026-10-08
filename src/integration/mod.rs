@@ -10,6 +10,7 @@ mod encoding;
 mod fragment;
 mod helpers;
 mod jsonc;
+mod legacy;
 mod manifest;
 mod rollback;
 mod shell;
@@ -41,6 +42,9 @@ pub fn plan(config: &IntegrationConfig) -> AppResult<PlanReport> {
     let fragment = prepare_fragment(config, &loaded_manifest.manifest)?;
     let targets = validated_targets(config)?;
     let mut issues = Vec::new();
+    if let Some(issue) = legacy::detection_issue(config) {
+        issues.push(issue);
+    }
     if targets.is_empty() {
         issues.push(
             "no initialized Windows Terminal Stable, Preview, Canary, or Unpackaged settings file was found"
@@ -73,6 +77,7 @@ pub fn plan(config: &IntegrationConfig) -> AppResult<PlanReport> {
 /// remaining channels; install only fails when the fragment step fails or
 /// every target fails.
 pub fn install(config: &IntegrationConfig) -> AppResult<InstallReport> {
+    legacy::migrate_if_present(config)?;
     let desired = desired_keybindings()?;
     let targets = validated_targets(config)?;
     if targets.is_empty() {
@@ -170,6 +175,7 @@ pub fn install(config: &IntegrationConfig) -> AppResult<InstallReport> {
 pub fn uninstall(config: &IntegrationConfig) -> AppResult<UninstallReport> {
     let loaded = load_manifest(&config.manifest_path())?;
     if loaded.sha256.is_none() {
+        legacy::uninstall_if_present(config)?;
         let shell_integration = shell::uninstall(config);
         return Ok(UninstallReport {
             schema_version: INTEGRATION_SCHEMA_VERSION,
@@ -300,6 +306,9 @@ pub fn doctor(config: &IntegrationConfig) -> AppResult<DoctorReport> {
 
     let mut issues = Vec::new();
     if let Some(issue) = manifest_issue {
+        issues.push(issue);
+    }
+    if let Some(issue) = legacy::detection_issue(config) {
         issues.push(issue);
     }
     if fragment.report.status == ChangeStatus::Conflict {
@@ -662,7 +671,7 @@ mod tests {
         assert_eq!(preview.added_binding_count, 0);
 
         let stable_text = fs::read_to_string(&stable_path).expect("stable should be readable");
-        assert!(stable_text.contains("User.WinTerminalP."));
+        assert!(stable_text.contains("User.Winter."));
         assert_eq!(
             fs::read(&preview_path).expect("preview should remain readable"),
             preview_original,
@@ -761,12 +770,12 @@ mod tests {
 
         let stable_text = fs::read_to_string(&stable_path).expect("stable should be readable");
         assert!(
-            !stable_text.contains("User.WinTerminalP."),
+            !stable_text.contains("User.Winter."),
             "the earlier removal must be persisted"
         );
         let preview_text = fs::read_to_string(&preview_path).expect("preview should be readable");
         assert!(
-            preview_text.contains("User.WinTerminalP."),
+            preview_text.contains("User.Winter."),
             "the failed target must keep its bindings"
         );
 
@@ -833,7 +842,7 @@ mod tests {
         );
         let stable_text = fs::read_to_string(&stable_path).expect("stable should be readable");
         assert!(
-            stable_text.contains("User.WinTerminalP."),
+            stable_text.contains("User.Winter."),
             "no target may be mutated before pre-flight succeeds"
         );
     }

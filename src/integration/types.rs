@@ -7,6 +7,15 @@ use crate::TerminalChannel;
 pub const INTEGRATION_SCHEMA_VERSION: u32 = 1;
 pub const MINIMUM_FRAGMENT_VERSION: &str = "1.21";
 
+/// On-disk application directory under `%LOCALAPPDATA%` for the current
+/// Winter-branded installation (config, integration state, backups,
+/// dashboard).
+pub const APP_DATA_DIR_NAME: &str = "Winter";
+
+/// Historical on-disk directory used by pre-Winter releases; only the
+/// one-shot migration in `integration::legacy` may reference it.
+pub const LEGACY_APP_DATA_DIR_NAME: &str = "WinTerminalP";
+
 /// Case-insensitive ownership key for a filesystem path.
 ///
 /// Windows paths compare case-insensitively, so every ownership record match
@@ -55,7 +64,7 @@ impl IntegrationConfig {
         let local_app_data = PathBuf::from(local_app_data);
         Ok(Self::new(
             &local_app_data,
-            local_app_data.join("WinTerminalP").join("integration"),
+            local_app_data.join(APP_DATA_DIR_NAME).join("integration"),
             default_documents_dir(),
         ))
     }
@@ -66,7 +75,7 @@ impl IntegrationConfig {
             .join("Microsoft")
             .join("Windows Terminal")
             .join("Fragments")
-            .join("WinTerminalP")
+            .join(APP_DATA_DIR_NAME)
             .join("actions.json")
     }
 

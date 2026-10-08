@@ -47,7 +47,7 @@ winter config
 winter config --edit
 ```
 
-配置文件位于 `%LOCALAPPDATA%\WinTerminalP\config.toml`。例如改成更接近 Vim/tmux 的 `H/J/K/L`：
+配置文件位于 `%LOCALAPPDATA%\Winter\config.toml`。例如改成更接近 Vim/tmux 的 `H/J/K/L`：
 
 ```toml
 prefix = "ctrl+a"

@@ -25,11 +25,12 @@ Ctrl+B, X / Z / ,     →  close pane / zoom / rename tab
 Windows Terminal has no tmux-style prefix mode, and its keybindings can only express
 "modifiers + one non-modifier key". Winter runs a small low-level keyboard hook
 that recognizes the prefix only while a Windows Terminal window is in the foreground,
-then injects a hidden single-chord bridge key that is bound to a `User.WinTerminalP.*`
+then injects a hidden single-chord bridge key that is bound to a `User.Winter.*`
 action. Your existing profiles, themes, fonts, shells, and keybindings are untouched.
 
-> Note: `WinTerminalP` in action ids and on-disk paths is the historical integration
-> name, kept for install compatibility.
+> Note: action ids, on-disk paths, fragment directory, and shell markers are all
+> Winter-branded; `winter install` migrates any legacy `WinTerminalP` installation
+> automatically.
 
 ## Features
 
@@ -99,6 +100,35 @@ This produces three binaries in `target\release`:
 Run them from `target\release`, or install them onto your `PATH` with
 `cargo install --path . --bins --locked`.
 
+### Upgrading from 0.2.x
+
+Older installs used the historical `WinTerminalP` directories, action ids, and shell
+markers. A plain `winter install` detects that legacy installation and removes it
+first (old keybindings, fragment, shell block, and state directory), then installs the
+Winter-branded integration; your config shortcuts are carried over from
+`%LOCALAPPDATA%\WinTerminalP\config.toml` to `%LOCALAPPDATA%\Winter\config.toml`.
+Manual equivalent: run the OLD version's `winter uninstall`, delete
+`%LOCALAPPDATA%\WinTerminalP`, then run `winter install`.
+
+## Usage
+
+| Command | What it does |
+|---|---|
+| `winter` / `winter launch` | Start the background controller and open Windows Terminal; the bridge is installed automatically on first run |
+| `winter run [--no-launch]` | Run the controller in this process; `--no-launch` keeps it from opening a new window |
+| `winter ui [--once]` | Live pane dashboard in this terminal — the humans' TUI surface; `--once` prints a single frame for scripts |
+| `winter config` (`--path` / `--edit`) | Print the effective config, print only its path, or open it in Notepad |
+| `winter plan` / `winter install` / `winter uninstall` | Bridge lifecycle: preview the changes, install the fragment, hidden keybindings, and shell block, or remove only what Winter still owns |
+| `winter doctor` | Machine-readable JSON `{schema_version, healthy, config:{path, ok, error}, integration}` |
+
+Open `winter ui` in a pane to watch panes, focus, and prefix state live; `q`, `Q`,
+`Ctrl+C`, or `Esc` quits, and the dashboard shows `OFFLINE` when the controller is not
+running.
+
+Exit statuses are listed under [Exit codes](#exit-codes). Scripts and agents should
+prefer the machine-readable outputs — `winter ui --once` and the JSON reports printed
+by `plan` / `install` / `uninstall` / `doctor` — over the interactive TUI.
+
 ## Default keybindings
 
 All shortcuts work only while Windows Terminal is in the foreground. Press and release
@@ -140,7 +170,7 @@ winter config --path   # print only the path
 winter config --edit   # open it in Notepad
 ```
 
-The file lives at `%LOCALAPPDATA%\WinTerminalP\config.toml`. Only the actions you want
+The file lives at `%LOCALAPPDATA%\Winter\config.toml`. Only the actions you want
 to override need to be present; everything else keeps its default. For example, a
 Vim-style layout:
 

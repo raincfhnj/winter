@@ -7,7 +7,7 @@ use crate::model::TerminalAction;
 use crate::prefix::{Modifiers, push_modifier_names};
 use crate::registry;
 
-const ACTION_ID_PREFIX: &str = "User.WinTerminalP.";
+const ACTION_ID_PREFIX: &str = "User.Winter.";
 
 /// A synthetic function-key chord managed by Winter.
 ///
@@ -259,14 +259,14 @@ mod tests {
         assert_eq!(
             binding.action_definition_json(),
             json!({
-                "id": "User.WinTerminalP.SendPrefixLiteral",
+                "id": "User.Winter.SendPrefixLiteral",
                 "command": { "action": "sendInput", "input": "\u{0002}" },
             })
         );
         assert_eq!(
             binding.keybinding_definition_json(),
             json!({
-                "id": "User.WinTerminalP.SendPrefixLiteral",
+                "id": "User.Winter.SendPrefixLiteral",
                 "keys": "ctrl+shift+f15",
             })
         );

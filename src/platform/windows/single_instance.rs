@@ -9,7 +9,7 @@ use windows::core::{Owned, PCWSTR};
 use super::error::{PlatformError, PlatformResult};
 
 pub const DEFAULT_INSTANCE_MUTEX_NAME: &str =
-    r"Local\WinTerminalP.Controller.7eb6e94d-5a26-42d7-856a-97e878aa344f";
+    r"Local\Winter.Controller.7eb6e94d-5a26-42d7-856a-97e878aa344f";
 
 /// Owned named mutex proving this is the controller instance for the session.
 pub struct SingleInstanceGuard {
@@ -67,7 +67,7 @@ mod tests {
 
     fn unique_mutex_name() -> String {
         format!(
-            r"Local\WinTerminalP.Tests.{}.{}",
+            r"Local\Winter.Tests.{}.{}",
             std::process::id(),
             NEXT_MUTEX.fetch_add(1, Ordering::Relaxed)
         )

@@ -115,10 +115,11 @@ Windows Terminal keybinding 只能表达“多个 modifier + 一个非 modifier 
 
 Bridge 分两层：
 
-1. `%LOCALAPPDATA%\Microsoft\Windows Terminal\Fragments\WinTerminalP\actions.json` 提供命名 Action。
+1. `%LOCALAPPDATA%\Microsoft\Windows Terminal\Fragments\Winter\actions.json` 提供命名 Action。
 2. 每个 Terminal 通道的用户 `settings.json` 只绑定产品隐藏 chord 到这些 Action ID。
 
-> 说明：`WinTerminalP`（配置路径、Action ID、fragment 目录、Shell 标记）是历史集成名，为安装兼容性保留。
+> 说明：配置路径、Action ID、fragment 目录与 Shell 标记均使用 Winter 品牌命名；
+> 历史上的 `WinTerminalP` 安装由 `winter install` 自动迁移。
 
 桥接表使用 F13、F14、F15、F18–F24 的三组修饰键组合。F16/F17 已在 Stable 1.24 真实输入链路中判定为不可靠并由单元测试禁止重新进入托管表。`send_prefix_literal` 是唯一例外：控制器按当前配置的 Prefix 直接注入对应 chord，不经过静态桥接，因此自定义 Prefix 无需重新安装桥接。
 
@@ -143,7 +144,11 @@ Bridge 分两层：
 
 ### 应用配置
 
-`%LOCALAPPDATA%\WinTerminalP\config.toml`
+`%LOCALAPPDATA%\Winter\config.toml`
+
+同一目录下还持久化其余运行状态：集成状态与备份（`integration\`，内含 `manifest.json`
+与 `backups\`）、控制器发布的仪表盘状态 `dashboard.json`（`winter ui` 的数据源），以及
+`winterd` 的诊断日志 `last-error.log`。
 
 ```toml
 schema_version = 2
@@ -185,7 +190,7 @@ Terminal settings 是 JSONC，允许注释和尾逗号。Integration 使用 CST 
 
 ### PowerShell Shell Integration
 
-Windows Terminal 只有在 Shell 通过 `OSC 9;9` 报告 CWD 时，才会让 `splitMode: duplicate` 的窗格继承当前目录（WT 的 `_MakeTerminalPane` 读取活动控件的 `WorkingDirectory`）。因此 `winter install` 会向 `Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1` 和存在时的 `Documents\PowerShell\Microsoft.PowerShell_profile.ps1` 追加一段带 `# >>> WinTerminalP shell integration >>>` / `# <<< ... >>>` 标记的提示符包装：它保存原 `prompt`，先输出 `OSC 9;9`，再调用原提示符。安装使用与 Terminal 配置相同的快照、备份和 CAS 写入；重复安装幂等，卸载只移除内容未被用户修改的受管块，用户改动会被保留并报告。写入保持原 Profile 编码（UTF-8 / UTF-16LE），无法识别的编码只报告为冲突、不修改文件。该步骤不参与 `bridge_is_ready` 判定，任何 Profile 失败都只体现在报告里，不影响控制器启动，只会失去目录继承。
+Windows Terminal 只有在 Shell 通过 `OSC 9;9` 报告 CWD 时，才会让 `splitMode: duplicate` 的窗格继承当前目录（WT 的 `_MakeTerminalPane` 读取活动控件的 `WorkingDirectory`）。因此 `winter install` 会向 `Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1` 和存在时的 `Documents\PowerShell\Microsoft.PowerShell_profile.ps1` 追加一段带 `# >>> Winter shell integration >>>` / `# <<< Winter shell integration <<<` 标记的提示符包装：它保存原 `prompt`，先输出 `OSC 9;9`，再调用原提示符。安装使用与 Terminal 配置相同的快照、备份和 CAS 写入；重复安装幂等，卸载只移除内容未被用户修改的受管块，用户改动会被保留并报告。写入保持原 Profile 编码（UTF-8 / UTF-16LE），无法识别的编码只报告为冲突、不修改文件。该步骤不参与 `bridge_is_ready` 判定，任何 Profile 失败都只体现在报告里，不影响控制器启动，只会失去目录继承。
 
 ## 8. 安全边界
 

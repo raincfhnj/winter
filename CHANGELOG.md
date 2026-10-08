@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `winter ui`: a live pane dashboard for the terminal it runs in — header
   with prefix/mouse-resize state, a scaled map of panes with the focused
   pane marked, and an offline banner when the controller stops. The
-  controller publishes the state to `%LOCALAPPDATA%\WinTerminalP\dashboard.json`
+  controller publishes the state to `%LOCALAPPDATA%\Winter\dashboard.json`
   on every observable change; `--once` renders a single frame for scripts.
 - `winter doctor` now prints the stable JSON contract
   `{ schema_version, healthy, config: { path, ok, error }, integration }`, and
@@ -37,7 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Unmanaged malformed `keybindings` entries are reported as warnings instead of
   blocking `install`/`uninstall` for every channel; literal `+` chords
   (`ctrl++`) parse as the `plus` key.
-- Failed atomic writes no longer leave `.winterminalp-tmp-*.json` staging files
+- Failed atomic writes no longer leave `.winter-tmp-*.json` staging files
   (or mismatched backups) in Windows Terminal's directories.
 - A single unreadable or symlinked `settings.json` no longer aborts
   installation for all channels; symlinked settings files are not discovered.
@@ -60,10 +60,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The project is renamed to **Winter**: GitHub repo `raincfhnj/winter` (the old
   repository URL redirects there), package/crate `winter`, primary CLI
-  `winter` unchanged; the compatibility alias `winterminalp` is kept, and
-  on-disk integration identifiers (config directory, fragment path, action ids,
-  shell markers) retain the historical `WinTerminalP` token for install
-  compatibility.
+  `winter` unchanged; the compatibility alias `winterminalp` is kept. Every
+  on-disk identifier is now Winter-branded (`%LOCALAPPDATA%\Winter`,
+  `Fragments\Winter`, `User.Winter.*`, `# >>> Winter shell integration >>>`),
+  and `winter install` auto-migrates historical `WinTerminalP` installations:
+  it removes the legacy keybindings, fragment, and shell block using the old
+  manifest's own records, carries `config.toml` over, and deletes the legacy
+  state directory — `winter uninstall` also cleans a legacy-only install, and
+  `plan`/`doctor` surface a pending migration as an issue.
 - Action metadata now lives in a single registry (`src/registry.rs`): the
   prefix shortcut specs and the managed bridge bindings are derived from one
   const table, with compile-time assertions replacing the runtime count checks

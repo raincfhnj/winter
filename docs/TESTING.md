@@ -53,7 +53,7 @@ cargo build --release --bins --locked
 
 - prefix 快捷键规格（30 条）与托管桥接绑定（29 条）均由 `registry.rs` 注册表在编译期派生；`const` 断言拒绝重复动作/ID/chord、不完整的 `SPEC_ORDER` 置换和多余 shutdown，测试验证派生表与注册表逐条一致。
 - 所有 TerminalAction 都有唯一 ID、command 和 chord。
-- ID 均以 `User.WinTerminalP.` 开头。
+- ID 均以 `User.Winter.` 开头。
 - 托管 chord 只使用 F13、F14、F15、F18–F24 和约定 modifier，F16/F17 必须被测试阻止进入托管表。
 - fragment 包含 actions 且不包含 keys/keybindings。
 - 用户 keybinding 引用的 ID 全部存在于 fragment。
@@ -94,7 +94,7 @@ Fixture 至少覆盖：
 真实验证必须使用专用测试窗口，不能操作用户正在工作的 Terminal：
 
 1. 记录 Stable settings 原始 SHA-256 和备份路径。
-2. 运行 `plan`，确认只增加 `User.WinTerminalP.*`。
+2. 运行 `plan`，确认只增加 `User.Winter.*`。
 3. 运行 `install`，重新打开专用 Windows Terminal 窗口。
 4. 启动前台控制器。
 5. 验证四向 split、focus、键盘 resize，并在横向、纵向、嵌套分栏上拖动原生边界。

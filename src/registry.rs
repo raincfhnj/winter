@@ -110,7 +110,7 @@ pub const ACTIONS: &[ActionEntry] = &[
         TerminalAction::SplitPane {
             direction: Direction::Left,
         },
-        "User.WinTerminalP.SplitLeft",
+        "User.Winter.SplitLeft",
         BridgeChord::new(true, true, true, 13),
     ),
     terminal_entry(
@@ -119,7 +119,7 @@ pub const ACTIONS: &[ActionEntry] = &[
         TerminalAction::SplitPane {
             direction: Direction::Right,
         },
-        "User.WinTerminalP.SplitRight",
+        "User.Winter.SplitRight",
         BridgeChord::new(true, true, true, 14),
     ),
     terminal_entry(
@@ -128,7 +128,7 @@ pub const ACTIONS: &[ActionEntry] = &[
         TerminalAction::SplitPane {
             direction: Direction::Up,
         },
-        "User.WinTerminalP.SplitUp",
+        "User.Winter.SplitUp",
         BridgeChord::new(true, true, true, 15),
     ),
     terminal_entry(
@@ -137,7 +137,7 @@ pub const ACTIONS: &[ActionEntry] = &[
         TerminalAction::SplitPane {
             direction: Direction::Down,
         },
-        "User.WinTerminalP.SplitDown",
+        "User.Winter.SplitDown",
         BridgeChord::new(true, true, true, 18),
     ),
     terminal_entry(
@@ -146,7 +146,7 @@ pub const ACTIONS: &[ActionEntry] = &[
         TerminalAction::FocusPane {
             direction: Direction::Left,
         },
-        "User.WinTerminalP.FocusLeft",
+        "User.Winter.FocusLeft",
         BridgeChord::new(true, true, true, 19),
     ),
     terminal_entry(
@@ -155,7 +155,7 @@ pub const ACTIONS: &[ActionEntry] = &[
         TerminalAction::FocusPane {
             direction: Direction::Right,
         },
-        "User.WinTerminalP.FocusRight",
+        "User.Winter.FocusRight",
         BridgeChord::new(true, true, true, 20),
     ),
     terminal_entry(
@@ -164,7 +164,7 @@ pub const ACTIONS: &[ActionEntry] = &[
         TerminalAction::FocusPane {
             direction: Direction::Up,
         },
-        "User.WinTerminalP.FocusUp",
+        "User.Winter.FocusUp",
         BridgeChord::new(true, true, true, 21),
     ),
     terminal_entry(
@@ -173,7 +173,7 @@ pub const ACTIONS: &[ActionEntry] = &[
         TerminalAction::FocusPane {
             direction: Direction::Down,
         },
-        "User.WinTerminalP.FocusDown",
+        "User.Winter.FocusDown",
         BridgeChord::new(true, true, true, 22),
     ),
     terminal_entry(
@@ -182,7 +182,7 @@ pub const ACTIONS: &[ActionEntry] = &[
         TerminalAction::ResizePane {
             direction: Direction::Left,
         },
-        "User.WinTerminalP.ResizeLeft",
+        "User.Winter.ResizeLeft",
         BridgeChord::new(true, true, true, 23),
     ),
     terminal_entry(
@@ -191,7 +191,7 @@ pub const ACTIONS: &[ActionEntry] = &[
         TerminalAction::ResizePane {
             direction: Direction::Right,
         },
-        "User.WinTerminalP.ResizeRight",
+        "User.Winter.ResizeRight",
         BridgeChord::new(true, true, true, 24),
     ),
     terminal_entry(
@@ -200,7 +200,7 @@ pub const ACTIONS: &[ActionEntry] = &[
         TerminalAction::ResizePane {
             direction: Direction::Up,
         },
-        "User.WinTerminalP.ResizeUp",
+        "User.Winter.ResizeUp",
         BridgeChord::new(true, false, true, 13),
     ),
     terminal_entry(
@@ -209,7 +209,7 @@ pub const ACTIONS: &[ActionEntry] = &[
         TerminalAction::ResizePane {
             direction: Direction::Down,
         },
-        "User.WinTerminalP.ResizeDown",
+        "User.Winter.ResizeDown",
         BridgeChord::new(true, false, true, 14),
     ),
     // The controller now injects the configured Prefix directly, so this static
@@ -219,119 +219,119 @@ pub const ACTIONS: &[ActionEntry] = &[
         "send_prefix_literal",
         chord(LogicalKey::Character('b'), false, false, false),
         TerminalAction::SendPrefixLiteral,
-        "User.WinTerminalP.SendPrefixLiteral",
+        "User.Winter.SendPrefixLiteral",
         BridgeChord::new(true, false, true, 15),
     ),
     terminal_entry(
         "new_tab",
         chord(LogicalKey::Character('c'), false, false, false),
         TerminalAction::NewTab,
-        "User.WinTerminalP.NewTab",
+        "User.Winter.NewTab",
         BridgeChord::new(true, false, true, 18),
     ),
     terminal_entry(
         "next_tab",
         chord(LogicalKey::Character('n'), false, false, false),
         TerminalAction::NextTab,
-        "User.WinTerminalP.NextTab",
+        "User.Winter.NextTab",
         BridgeChord::new(true, false, true, 19),
     ),
     terminal_entry(
         "previous_tab",
         chord(LogicalKey::Character('p'), false, false, false),
         TerminalAction::PreviousTab,
-        "User.WinTerminalP.PreviousTab",
+        "User.Winter.PreviousTab",
         BridgeChord::new(true, false, true, 20),
     ),
     terminal_entry(
         "activate_tab_0",
         chord(LogicalKey::Character('0'), false, false, false),
         TerminalAction::ActivateTab { index: 0 },
-        "User.WinTerminalP.ActivateTab0",
+        "User.Winter.ActivateTab0",
         BridgeChord::new(true, false, true, 21),
     ),
     terminal_entry(
         "activate_tab_1",
         chord(LogicalKey::Character('1'), false, false, false),
         TerminalAction::ActivateTab { index: 1 },
-        "User.WinTerminalP.ActivateTab1",
+        "User.Winter.ActivateTab1",
         BridgeChord::new(true, false, true, 22),
     ),
     terminal_entry(
         "activate_tab_2",
         chord(LogicalKey::Character('2'), false, false, false),
         TerminalAction::ActivateTab { index: 2 },
-        "User.WinTerminalP.ActivateTab2",
+        "User.Winter.ActivateTab2",
         BridgeChord::new(true, false, true, 23),
     ),
     terminal_entry(
         "activate_tab_3",
         chord(LogicalKey::Character('3'), false, false, false),
         TerminalAction::ActivateTab { index: 3 },
-        "User.WinTerminalP.ActivateTab3",
+        "User.Winter.ActivateTab3",
         BridgeChord::new(true, false, true, 24),
     ),
     terminal_entry(
         "activate_tab_4",
         chord(LogicalKey::Character('4'), false, false, false),
         TerminalAction::ActivateTab { index: 4 },
-        "User.WinTerminalP.ActivateTab4",
+        "User.Winter.ActivateTab4",
         BridgeChord::new(false, true, true, 13),
     ),
     terminal_entry(
         "activate_tab_5",
         chord(LogicalKey::Character('5'), false, false, false),
         TerminalAction::ActivateTab { index: 5 },
-        "User.WinTerminalP.ActivateTab5",
+        "User.Winter.ActivateTab5",
         BridgeChord::new(false, true, true, 14),
     ),
     terminal_entry(
         "activate_tab_6",
         chord(LogicalKey::Character('6'), false, false, false),
         TerminalAction::ActivateTab { index: 6 },
-        "User.WinTerminalP.ActivateTab6",
+        "User.Winter.ActivateTab6",
         BridgeChord::new(false, true, true, 15),
     ),
     terminal_entry(
         "activate_tab_7",
         chord(LogicalKey::Character('7'), false, false, false),
         TerminalAction::ActivateTab { index: 7 },
-        "User.WinTerminalP.ActivateTab7",
+        "User.Winter.ActivateTab7",
         BridgeChord::new(false, true, true, 18),
     ),
     terminal_entry(
         "activate_tab_8",
         chord(LogicalKey::Character('8'), false, false, false),
         TerminalAction::ActivateTab { index: 8 },
-        "User.WinTerminalP.ActivateTab8",
+        "User.Winter.ActivateTab8",
         BridgeChord::new(false, true, true, 19),
     ),
     terminal_entry(
         "activate_tab_9",
         chord(LogicalKey::Character('9'), false, false, false),
         TerminalAction::ActivateTab { index: 9 },
-        "User.WinTerminalP.ActivateTab9",
+        "User.Winter.ActivateTab9",
         BridgeChord::new(false, true, true, 20),
     ),
     terminal_entry(
         "close_pane",
         chord(LogicalKey::Character('x'), false, false, false),
         TerminalAction::ClosePane,
-        "User.WinTerminalP.ClosePane",
+        "User.Winter.ClosePane",
         BridgeChord::new(false, true, true, 21),
     ),
     terminal_entry(
         "toggle_zoom",
         chord(LogicalKey::Character('z'), false, false, false),
         TerminalAction::TogglePaneZoom,
-        "User.WinTerminalP.TogglePaneZoom",
+        "User.Winter.TogglePaneZoom",
         BridgeChord::new(false, true, true, 22),
     ),
     terminal_entry(
         "rename_tab",
         chord(LogicalKey::Character(','), false, false, false),
         TerminalAction::RenameTab,
-        "User.WinTerminalP.RenameTab",
+        "User.Winter.RenameTab",
         BridgeChord::new(false, true, true, 23),
     ),
     shutdown_entry(chord(LogicalKey::Character('q'), false, false, false)),
@@ -596,7 +596,7 @@ const _: () = {
         if let ActionCommand::Terminal { action, bridge } = ACTIONS[outer].command {
             assert!(
                 str_starts_with(bridge.action_id, action_id_prefix()),
-                "bridge action ids must carry the WinTerminalP prefix"
+                "bridge action ids must carry the Winter prefix"
             );
             let mut inner = outer + 1;
             while inner < ACTION_COUNT {

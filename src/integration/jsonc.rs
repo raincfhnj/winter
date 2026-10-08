@@ -392,6 +392,9 @@ fn parse_document(raw: &[u8]) -> AppResult<ParsedDocument> {
         allow_single_quoted_strings: false,
         allow_hexadecimal_numbers: false,
         allow_unary_plus_numbers: false,
+        allow_bare_decimal_point_numbers: false,
+        allow_extended_string_escapes: false,
+        allow_non_finite_numbers: false,
     };
     let root = CstRootNode::parse(source, &options).map_err(|error| {
         AppError::InvalidConfiguration(format!("settings JSONC could not be parsed: {error}"))

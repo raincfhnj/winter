@@ -194,13 +194,10 @@ target\release\winter.exe uninstall
 
 ## 文档
 
-- [`docs/PRD.md`](docs/PRD.md) — 产品需求
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — 架构与失败语义
 - [`docs/SHORTCUTS.md`](docs/SHORTCUTS.md) — 快捷键参考
 - [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) — 构建与开发指南
 - [`docs/TESTING.md`](docs/TESTING.md) — 测试策略与人工验证
-- [`docs/VERIFICATION.md`](docs/VERIFICATION.md) — 真实环境验证记录
-- [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) — 实施计划
 - [`docs/fault-reviews/`](docs/fault-reviews) — 故障复盘
 
 ## 已知限制

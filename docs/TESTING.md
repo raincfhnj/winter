@@ -1,7 +1,5 @@
 # WinTerminalP 测试策略
 
-当前机器的实测结果、产物哈希和未自动化边界记录在 `docs/VERIFICATION.md`。
-
 ## 1. 自动化门槛
 
 ```powershell

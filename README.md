@@ -213,13 +213,10 @@ semantics.
 
 ## Documentation
 
-- [`docs/PRD.md`](docs/PRD.md) — product requirements
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — architecture and failure semantics
 - [`docs/SHORTCUTS.md`](docs/SHORTCUTS.md) — keybinding reference
 - [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) — build and development guide
 - [`docs/TESTING.md`](docs/TESTING.md) — test strategy and manual verification
-- [`docs/VERIFICATION.md`](docs/VERIFICATION.md) — real-environment verification record
-- [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) — implementation plan
 - [`docs/fault-reviews/`](docs/fault-reviews) — post-mortems
 
 ## Limitations

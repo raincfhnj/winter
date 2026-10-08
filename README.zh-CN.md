@@ -189,7 +189,9 @@ target\release\winter.exe uninstall
 
 项目是一个小型模块化 Rust 单体。纯状态机（`prefix`、`pane_layout`）不依赖 Win32；
 `platform/windows` 适配层负责低级 Hook、UI Automation、前台身份识别与 `SendInput`；
-`integration` 负责无损 JSONC 事务与备份。完整设计与失败语义见
+`integration` 负责无损 JSONC 事务与备份。行为由两个规范表单源驱动：`registry` 在
+编译期派生 Prefix 快捷键规格与托管桥接绑定，`keys` 驱动键名 parse/display 与
+虚拟键正/反向映射。完整设计与失败语义见
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
 
 ## 文档
@@ -212,10 +214,17 @@ target\release\winter.exe uninstall
 欢迎贡献。请先阅读 [`CONTRIBUTING.md`](CONTRIBUTING.md)，并在提交 PR 前运行质量门：
 
 ```powershell
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
+cargo --locked fmt --all -- --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --all-targets --locked
+cargo test --doc --locked
+$env:RUSTDOCFLAGS = '-D warnings'; cargo doc --no-deps --locked
+cargo build --release --bins --locked
 ```
+
+CI 在 `windows-latest` 上把它们拆成五个并行作业：格式化、Clippy 与文档、测试、
+Release 构建，以及在 Rust 1.85 上运行 `cargo check --all-targets --locked` 的
+MSRV 作业。
 
 ## 许可证
 

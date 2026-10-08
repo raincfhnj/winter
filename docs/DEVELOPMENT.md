@@ -13,11 +13,18 @@
 
 ## 常用命令
 
+质量门与 CI 完全一致（CI 在 `windows-latest` 上拆成 fmt / lint / test / build / MSRV 五个并行作业，全部使用 `--locked`）：
+
 ```powershell
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
+cargo --locked fmt --all -- --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --all-targets --locked
+cargo test --doc --locked
+$env:RUSTDOCFLAGS = '-D warnings'; cargo doc --no-deps --locked
+cargo build --release --bins --locked
 ```
+
+MSRV 作业另在 Rust 1.85 工具链上运行 `cargo check --all-targets --locked`。
 
 开发期以前台模式运行控制器：
 
@@ -72,11 +79,13 @@ Shortcut 字段采用 `action_name = "modifier+key"`；缺失项继承默认值�
 |---|---|
 | `model` | 方向、动作、Terminal 通道和窗口身份 |
 | `config` | 应用 TOML schema、兼容默认值与 Shortcut 校验 |
-| `keymap` | Action ID、WT command 和隐藏 chord 的唯一表 |
-| `prefix` | KeyChord 契约、默认动作表和不依赖 Win32 的纯 Prefix 状态机 |
+| `registry` | 唯一动作注册表：编译期派生 prefix 快捷键规格与 29 条托管桥接绑定，`const` 断言查重查数 |
+| `keys` | 规范键名表：配置 parse/display 与虚拟键正/反向映射的单一来源 |
+| `keymap` | `ManagedBinding`/`BridgeChord` 类型与 registry 派生的桥接视图（`MANAGED_BINDINGS`） |
+| `prefix` | KeyChord 契约和不依赖 Win32 的纯 Prefix 状态机；动作表由 registry 派生 |
 | `pane_layout` | 纯几何分隔线推导、命中测试和拖动步长状态 |
 | `platform/windows` | 统一输入 Hook、UI Automation、前台识别、SendInput、单实例和启动 |
-| `integration` | Terminal 发现、fragment、JSONC、备份和 manifest |
+| `integration` | 按职责拆分的 settings 事务层：discovery/targets/fragment/jsonc/transaction/rollback/manifest/helpers/shell/types |
 | `controller/keyboard` | Win32 虚拟键与物理 modifier 的无 IO 规范化 |
 | `controller/desktop` | 前台身份与可丢弃窗格几何快照，不拥有布局 |
 | `controller` | Prefix/拖动 reducer、有界工作队列和 dispatcher 编排 |

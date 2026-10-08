@@ -50,7 +50,34 @@ WinTerminalP 是 Windows Terminal 的无界面输入增强层，不是终端模�
                        UIA focus native TermControl once
                                   │
                                   ▼
-                  native resizePane action × batch steps
+                   native resizePane action × batch steps
+
+### 模块结构
+
+    src/
+    ├── model.rs / config.rs / pane_layout.rs   纯数据结构、TOML schema 与纯几何状态机
+    ├── registry.rs    唯一动作注册表：30 条动作（含 1 条 shutdown）。prefix 快捷键
+    │                  规格与 29 条托管桥接绑定都在编译期由它派生，const 断言拒绝
+    │                  重复动作/默认 chord/Action ID、不完整 SPEC_ORDER 与多余 shutdown
+    ├── keys.rs        规范键名表：配置 parse/display 与虚拟键正/反向映射的单一来源
+    ├── prefix.rs      KeyChord 契约与 Prefix 状态机（SHORTCUT_SPECS 由 registry 派生）
+    ├── keymap.rs      ManagedBinding/BridgeChord 类型与 registry 派生的桥接视图
+    │                  （MANAGED_BINDINGS）
+    ├── controller/    keyboard / desktop / pointer / action_worker 与编排入口
+    ├── platform/windows/ 低级 Hook、UI Automation、前台身份、SendInput、提权与单实例
+    ├── integration/   settings 事务层，按职责拆分（不再是单文件模块）：
+    │   ├── mod.rs          plan / install / uninstall / doctor 编排
+    │   ├── discovery.rs    Windows Terminal 通道发现
+    │   ├── targets.rs      逐目标计划、预检与执行
+    │   ├── fragment.rs     fragment 安装与卸载
+    │   ├── jsonc.rs        无损 JSONC CST 编辑与 keybindings 合并
+    │   ├── transaction.rs  同目录临时文件 + CAS 原子替换
+    │   ├── rollback.rs     内存逆操作栈回滚
+    │   ├── manifest.rs     托管 manifest 读写与语义比对
+    │   ├── helpers.rs      期望 keybindings 推导与错误上下文
+    │   ├── shell.rs        PowerShell 受管 Profile 包装
+    │   └── types.rs        报告与状态类型
+    └── bin/            winter / winterd / winterminalp CLI 入口
 
 ## 3. 线程与性能
 
@@ -92,6 +119,8 @@ Bridge 分两层：
 2. 每个 Terminal 通道的用户 `settings.json` 只绑定产品隐藏 chord 到这些 Action ID。
 
 桥接表使用 F13、F14、F15、F18–F24 的三组修饰键组合。F16/F17 已在 Stable 1.24 真实输入链路中判定为不可靠并由单元测试禁止重新进入托管表。`send_prefix_literal` 是唯一例外：控制器按当前配置的 Prefix 直接注入对应 chord，不经过静态桥接，因此自定义 Prefix 无需重新安装桥接。
+
+两张表不再靠手工同步：`src/registry.rs` 的 `ACTIONS` 是唯一动作注册表，`keymap::MANAGED_BINDINGS`（29 条托管绑定，保持注册表顺序以保证已安装 fragment/keybindings 字节稳定）与 `prefix::SHORTCUT_SPECS`（30 条快捷键规格，按 `SPEC_ORDER` 置换为用户可见顺序）都在编译期由注册表派生；模块底部的 `const` 断言在编译期拒绝重复或不完整的注册表。引入新的 `TerminalAction` 只需在注册表加一条记录。
 
 官方自 1.21 起允许 fragment 提供 Action，但明确禁止 fragment 注入 keys；这是防止第三方静默劫持快捷键的安全边界。[Action fragment implementation](https://github.com/microsoft/terminal/pull/16185)
 
@@ -185,6 +214,11 @@ Windows Terminal 只有在 Shell 通过 `OSC 9;9` 报告 CWD 时，才会让 `sp
 | JSONC 无法解析 | 不写文件 |
 | 安装时文件并发变化 | CAS 失败并重新规划 |
 | 卸载时用户已修改 | 只保留用户修改并报告 |
+| Hook 回调 panic | `HookHealth` 原子计数并禁用 handler，后续事件 fail-open 透传；控制器的 `recv_timeout` 看门狗轮询发现后返回错误，而不是永久阻塞在等待上 |
+| Hook 线程关闭超时 | 有界 join（3 秒、20 ms 轮询）后返回 `HookShutdownTimeout` 并分离线程，不无限等待 |
+| 关闭握手超时 | `Q` 的按下与释放必须在 3 秒窗口内完成；超时或期间出现其他键则丢弃握手，不会稍后误关控制器 |
+
+错误模型按可恢复性区分三类：`SettingsConflict` 表示磁盘内容与操作预期分歧（含 CAS 检出的并发用户修改），文件保留给用户处置；`OperationIncomplete` 表示工具侧未能完成（回滚未全部还原、持久化失败或不可能的中途状态），系统可能处于部分修改状态，由原字节备份与 manifest 描述残余；`Platform` 包装 Windows API 失败并保留 `PlatformError` 的 `source()` 链（可附加诊断 context），调用方能沿链定位底层原因，而不是只得到扁平化字符串。
 
 ## 10. 架构限制
 

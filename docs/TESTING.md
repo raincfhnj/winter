@@ -2,11 +2,18 @@
 
 ## 1. 自动化门槛
 
+与 CI 五个并行作业（fmt / lint / test / build / MSRV）保持一致，全部使用 `--locked`：
+
 ```powershell
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
+cargo --locked fmt --all -- --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --all-targets --locked
+cargo test --doc --locked
+$env:RUSTDOCFLAGS = '-D warnings'; cargo doc --no-deps --locked
+cargo build --release --bins --locked
 ```
+
+`cargo test --all-targets` 不跑 doc test，所以必须单独执行 `cargo test --doc --locked`；MSRV 作业另在 Rust 1.85 上运行 `cargo check --all-targets --locked`。
 
 ## 2. Prefix 单元测试
 
@@ -26,7 +33,7 @@ cargo test --all-targets
 
 ## 3. Shortcut 配置测试
 
-- 旧 schema 1 三字段 TOML 自动获得默认 Prefix、30 个动作和鼠标配置，在内存中迁移到 schema 2，且不改写原文件。
+- 旧 schema 1 三字段 TOML 自动获得默认 Prefix、30 个动作（`registry.rs` 派生的 `ACTION_COUNT`）和鼠标配置，在内存中迁移到 schema 2，且不改写原文件。
 - Partial `[shortcuts]` 只覆盖指定动作，其他动作回落默认值。
 - 自定义 Prefix 和动作能编译为不可变运行时映射。
 - 未知动作名、重复 chord、普通无修饰 Prefix、系统保留键必须失败。
@@ -44,6 +51,7 @@ cargo test --all-targets
 
 ## 5. Bridge 测试
 
+- prefix 快捷键规格（30 条）与托管桥接绑定（29 条）均由 `registry.rs` 注册表在编译期派生；`const` 断言拒绝重复动作/ID/chord、不完整的 `SPEC_ORDER` 置换和多余 shutdown，测试验证派生表与注册表逐条一致。
 - 所有 TerminalAction 都有唯一 ID、command 和 chord。
 - ID 均以 `User.WinTerminalP.` 开头。
 - 托管 chord 只使用 F13、F14、F15、F18–F24 和约定 modifier，F16/F17 必须被测试阻止进入托管表。

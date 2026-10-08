@@ -207,7 +207,10 @@ WinTerminalP.
 The project is a small modular Rust monolith. Pure state machines (`prefix`,
 `pane_layout`) have no Win32 dependency; a narrow `platform/windows` adapter owns the
 low-level hooks, UI Automation, foreground identity, and `SendInput`; `integration`
-owns lossless JSONC transactions and backups. See
+owns lossless JSONC transactions and backups. Behavior is single-sourced from two
+canonical tables: the `registry` module derives the prefix shortcut specs and the
+managed bridge bindings at compile time, and the `keys` module drives key-name
+parsing plus both virtual-key maps. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design and failure
 semantics.
 
@@ -233,10 +236,17 @@ Contributions are welcome. Please read [`CONTRIBUTING.md`](CONTRIBUTING.md) firs
 run the quality gate before opening a pull request:
 
 ```powershell
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
+cargo --locked fmt --all -- --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --all-targets --locked
+cargo test --doc --locked
+$env:RUSTDOCFLAGS = '-D warnings'; cargo doc --no-deps --locked
+cargo build --release --bins --locked
 ```
+
+CI runs these as five parallel jobs on `windows-latest`: format, clippy & docs, test,
+release build, and an MSRV job that checks Rust 1.85 with
+`cargo check --all-targets --locked`.
 
 ## License
 

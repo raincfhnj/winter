@@ -12,15 +12,17 @@ up the project, run the quality gate, and submit changes.
 ## Build and test
 
 ```powershell
-cargo build
-cargo test --all-targets
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo build --release --bins
+cargo --locked fmt --all -- --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --all-targets --locked
+cargo test --doc --locked
+$env:RUSTDOCFLAGS = '-D warnings'; cargo doc --no-deps --locked
+cargo build --release --bins --locked
 ```
 
-All of these must pass before a pull request is merged. CI runs the same commands on
-`windows-latest`.
+All of these must pass before a pull request is merged. CI runs the same commands as
+five parallel jobs on `windows-latest` (format, clippy & docs, test, release build,
+and an MSRV job that runs `cargo check --all-targets --locked` on Rust 1.85).
 
 Run the controller in the foreground during development:
 
@@ -42,12 +44,14 @@ cargo run --bin winter -- doctor
 |---|---|
 | `src/model.rs` | Directions, actions, terminal channels, window identity |
 | `src/config.rs` | TOML schema, defaults, shortcut validation |
-| `src/keymap.rs` | Single source of truth for action IDs, WT commands, and hidden chords |
-| `src/prefix.rs` | Win32-free prefix state machine |
+| `src/registry.rs` | Canonical action registry; derives the prefix shortcut specs and managed bridge bindings at compile time with `const` consistency checks |
+| `src/keys.rs` | Canonical key table; single source for config name parse/display and both virtual-key maps |
+| `src/keymap.rs` | `ManagedBinding`/`BridgeChord` types and the registry-derived bridge view (`MANAGED_BINDINGS`) |
+| `src/prefix.rs` | Win32-free prefix state machine; shortcut specs derived from the registry |
 | `src/pane_layout.rs` | Win32-free divider inference, hit testing, drag steps |
 | `src/controller/` | Prefix/pointer reducers, bounded action queue, dispatcher |
 | `src/platform/windows/` | Hooks, UI Automation, foreground identity, `SendInput`, elevation |
-| `src/integration/` | Terminal discovery, JSONC transactions, backups, manifest, shell integration |
+| `src/integration/` | Terminal discovery, JSONC transactions, backups, manifest, shell integration (split across `discovery`/`targets`/`fragment`/`jsonc`/`transaction`/`rollback`/`manifest`/`helpers`/`shell`/`types`) |
 | `src/bin/` | CLI entry points and the hidden daemon |
 
 More detail is in [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) and
@@ -70,8 +74,8 @@ More detail is in [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) and
 
 ## Tests
 
-- Prefer pure unit tests for state machines (`prefix`, `pane_layout`, `config`,
-  `keymap`) with no Win32 dependency.
+- Prefer pure unit tests for state machines (`prefix`, `pane_layout`, `config`) and for
+  the canonical tables (`registry`, `keys`) with no Win32 dependency.
 - Use temporary directories and JSONC fixtures for integration tests. Never rewrite a
   real `settings.json` in a test.
 - Tests that install global hooks or inject real input live in `tests/live_bridge.rs`

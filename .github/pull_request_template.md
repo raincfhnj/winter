@@ -16,9 +16,10 @@
 
 <!-- Describe the tests you ran and any manual verification. -->
 
-- [ ] `cargo fmt --all -- --check`
-- [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-- [ ] `cargo test --all-targets`
+- [ ] `cargo --locked fmt --all -- --check`
+- [ ] `cargo clippy --all-targets --all-features --locked -- -D warnings`
+- [ ] `cargo test --all-targets --locked`
+- [ ] `cargo test --doc --locked`
 - [ ] Manual verification on a real Windows Terminal (describe below, if applicable)
 
 ## Checklist

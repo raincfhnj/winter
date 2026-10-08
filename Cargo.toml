@@ -57,3 +57,12 @@ assert_cmd = "2.2.2"
 predicates = "3.1.4"
 serde_json = "1"
 tempfile = "3"
+
+# Faster local iteration: dependencies carry no debug info, and this crate
+# keeps only line tables, so linking tests/bins is significantly cheaper
+# while backtraces still resolve to source lines.
+[profile.dev.package."*"]
+debug = false
+
+[profile.dev]
+debug = "line-tables-only"

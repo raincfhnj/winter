@@ -55,6 +55,10 @@ pub struct ControllerRunReport {
 
 /// Returns true only when every discovered Terminal channel has the complete,
 /// conflict-free action bridge required before the hook may consume Prefix keys.
+///
+/// The expected count is the registry-derived [`managed_bindings`] table, and
+/// the per-target `managed_binding_count` counts installed `(id, chord)` pairs,
+/// so readiness means every canonical action id and chord is present.
 #[must_use]
 pub fn bridge_is_ready(report: &DoctorReport) -> bool {
     let expected_bindings = managed_bindings().len();
@@ -158,17 +162,17 @@ mod implementation {
             Err(error) => {
                 let worker_result = action_worker.stop();
                 let mut app_error = map_platform_error(error);
-                if let AppError::Native(message) = &mut app_error {
+                if let AppError::Platform { context, .. } = &mut app_error {
                     match worker_result {
                         Ok(report) if report.failed_actions > 0 => {
-                            message.push_str(&format!(
+                            context.push_str(&format!(
                                 "; action worker also recorded {} failed action(s), last error: {}",
                                 report.failed_actions,
                                 report.last_dispatch_error.as_deref().unwrap_or("unknown")
                             ));
                         }
                         Err(worker_error) => {
-                            message.push_str(&format!("; {worker_error}"));
+                            context.push_str(&format!("; {worker_error}"));
                         }
                         _ => {}
                     }
@@ -245,7 +249,7 @@ mod implementation {
         if matches!(&error, PlatformError::AlreadyRunning) {
             AppError::ControllerAlreadyRunning
         } else {
-            AppError::Native(error.to_string())
+            AppError::platform(error)
         }
     }
 
@@ -621,6 +625,22 @@ mod implementation {
             .join();
 
             assert_eq!(source.snapshot(), Some(seeded));
+        }
+
+        #[test]
+        fn map_platform_error_routes_platform_failures_through_the_platform_variant() {
+            let error = map_platform_error(PlatformError::HookStartupTerminated);
+            assert!(matches!(error, AppError::Platform { .. }));
+            assert!(
+                std::error::Error::source(&error).is_some(),
+                "the PlatformError source chain must survive the mapping"
+            );
+
+            let already_running = map_platform_error(PlatformError::AlreadyRunning);
+            assert!(matches!(
+                already_running,
+                AppError::ControllerAlreadyRunning
+            ));
         }
     }
 }

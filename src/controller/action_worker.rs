@@ -7,14 +7,46 @@ use windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY;
 use crate::keymap::binding_for_action;
 use crate::model::{Direction, TerminalAction, WindowIdentity};
 use crate::pane_layout::ScreenPoint;
-use crate::platform::windows::{TerminalAccessibility, send_bridge_chord, send_literal_chord};
-use crate::prefix::KeyChord;
+use crate::platform::windows::{
+    PlatformError, TerminalAccessibility, send_bridge_chord, send_literal_chord,
+};
+use crate::prefix::{KeyChord, LogicalKey};
 use crate::{AppError, AppResult};
 
 use super::keyboard::virtual_key_for_logical_key;
 
 const STOP_SEND_ATTEMPTS: usize = 50;
 const STOP_SEND_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Failure of a single dispatched action inside the worker thread.
+///
+/// `Display` reproduces the strings the worker historically stored verbatim,
+/// so `WorkerReport.last_dispatch_error` (and the serialized
+/// [`ControllerRunReport`](crate::ControllerRunReport)) is unchanged; only
+/// the internal typing gains structure. Platform-backed variants keep their
+/// [`PlatformError`] source chain.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum WorkerError {
+    /// The registry exposes no bridge chord for the requested action id.
+    #[error("no bridge binding exists for {action:?}")]
+    MissingBinding { action: TerminalAction },
+
+    /// The configured prefix key has no injectable virtual-key mapping.
+    #[error("configured prefix key {key:?} cannot be injected")]
+    UnsupportedPrefixKey { key: LogicalKey },
+
+    /// The accessibility subsystem failed to initialize for a pointer resize.
+    #[error("{0}")]
+    AccessibilityInit(#[source] PlatformError),
+
+    /// Focusing the pane under the pointer failed before the resize steps.
+    #[error("{0}")]
+    Focus(#[source] PlatformError),
+
+    /// Sending a chord to the target failed (injection state / UIPI).
+    #[error("{0}")]
+    Injection(#[source] PlatformError),
+}
 
 pub(super) enum WorkerMessage {
     Dispatch {
@@ -140,24 +172,24 @@ fn run(receiver: Receiver<WorkerMessage>) -> WorkerReport {
             Ok(dispatched) => report.dispatched_actions += dispatched,
             Err(error) => {
                 report.failed_actions += 1;
-                report.last_dispatch_error = Some(error);
+                report.last_dispatch_error = Some(error.to_string());
             }
         }
     }
     report
 }
 
-fn dispatch_action(target: WindowIdentity, action: TerminalAction) -> Result<u64, String> {
-    let binding = binding_for_action(action)
-        .ok_or_else(|| format!("no bridge binding exists for {action:?}"))?;
+fn dispatch_action(target: WindowIdentity, action: TerminalAction) -> Result<u64, WorkerError> {
+    let binding =
+        binding_for_action(action).ok_or_else(|| WorkerError::MissingBinding { action })?;
     send_bridge_chord(target, binding.bridge_chord)
         .map(|_| 1)
-        .map_err(|error| error.to_string())
+        .map_err(WorkerError::Injection)
 }
 
-fn dispatch_literal_prefix(target: WindowIdentity, chord: KeyChord) -> Result<u64, String> {
+fn dispatch_literal_prefix(target: WindowIdentity, chord: KeyChord) -> Result<u64, WorkerError> {
     let virtual_key = virtual_key_for_logical_key(chord.key)
-        .ok_or_else(|| format!("configured prefix key {:?} cannot be injected", chord.key))?;
+        .ok_or_else(|| WorkerError::UnsupportedPrefixKey { key: chord.key })?;
     send_literal_chord(
         target,
         VIRTUAL_KEY(virtual_key),
@@ -166,7 +198,7 @@ fn dispatch_literal_prefix(target: WindowIdentity, chord: KeyChord) -> Result<u6
         chord.modifiers.shift,
     )
     .map(|_| 1)
-    .map_err(|error| error.to_string())
+    .map_err(WorkerError::Injection)
 }
 
 fn dispatch_pointer_resize(
@@ -177,13 +209,13 @@ fn dispatch_pointer_resize(
     direction: Direction,
     steps: u8,
     drag_sequence: u64,
-) -> Result<u64, String> {
+) -> Result<u64, WorkerError> {
     if steps == 0 {
         return Ok(0);
     }
     if accessibility.is_none() {
         *accessibility =
-            Some(TerminalAccessibility::initialize().map_err(|error| error.to_string())?);
+            Some(TerminalAccessibility::initialize().map_err(WorkerError::AccessibilityInit)?);
     }
     // The leading pane of a divider is stable for the whole drag, so only focus
     // once per drag. Keying on the drag sequence (rather than a separate end
@@ -193,15 +225,15 @@ fn dispatch_pointer_resize(
             .as_ref()
             .expect("accessibility is initialized above")
             .focus_pane_at(target, focus_point)
-            .map_err(|error| error.to_string())?;
+            .map_err(WorkerError::Focus)?;
         *last_focused = Some(drag_sequence);
     }
 
     let action = TerminalAction::ResizePane { direction };
-    let binding = binding_for_action(action)
-        .ok_or_else(|| format!("no bridge binding exists for {action:?}"))?;
+    let binding =
+        binding_for_action(action).ok_or_else(|| WorkerError::MissingBinding { action })?;
     for _ in 0..steps {
-        send_bridge_chord(target, binding.bridge_chord).map_err(|error| error.to_string())?;
+        send_bridge_chord(target, binding.bridge_chord).map_err(WorkerError::Injection)?;
     }
     Ok(u64::from(steps))
 }
@@ -256,5 +288,36 @@ mod tests {
         let report = worker.stop().expect("stop succeeds");
         assert_eq!(report.dispatched_actions, 0);
         assert_eq!(report.failed_actions, 0);
+    }
+
+    #[test]
+    fn worker_error_display_matches_the_reported_dispatch_strings() {
+        let missing = WorkerError::MissingBinding {
+            action: TerminalAction::NewTab,
+        };
+        assert_eq!(missing.to_string(), "no bridge binding exists for NewTab");
+
+        let unsupported = WorkerError::UnsupportedPrefixKey {
+            key: LogicalKey::Escape,
+        };
+        assert_eq!(
+            unsupported.to_string(),
+            "configured prefix key Escape cannot be injected"
+        );
+    }
+
+    #[test]
+    fn worker_error_preserves_the_platform_source_chain() {
+        let error = WorkerError::Injection(PlatformError::HookThreadPanicked);
+
+        assert_eq!(
+            error.to_string(),
+            PlatformError::HookThreadPanicked.to_string(),
+            "the report string must stay identical to the raw platform message"
+        );
+        assert!(
+            std::error::Error::source(&error).is_some(),
+            "the PlatformError must remain reachable as the source"
+        );
     }
 }

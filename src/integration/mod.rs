@@ -6,60 +6,32 @@
 //! channel's root `keybindings` array.
 
 mod discovery;
+mod fragment;
+mod helpers;
 mod jsonc;
 mod manifest;
+mod rollback;
 mod shell;
+mod targets;
 mod transaction;
 mod types;
 
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
-
-use serde_json::{Value, json};
-
-use crate::keymap::managed_bindings;
-use crate::{AppError, AppResult, TerminalChannel};
+use crate::{AppError, AppResult};
 
 pub use discovery::discover_targets;
-use jsonc::{
-    DesiredKeybinding, analyze_keybindings, desired_keybinding, merge_keybindings,
-    remove_managed_keybindings, validate_desired_bindings,
+use fragment::{
+    execute_uninstall_fragment, install_fragment, plan_uninstall_fragment, prepare_fragment,
 };
+use helpers::desired_keybindings;
 use manifest::{
-    FragmentManifest, IntegrationManifest, LoadedManifest, ManagedKeybindingManifest,
-    TargetManifest, load_manifest, remove_manifest_if_unchanged, save_manifest,
+    IntegrationManifest, LoadedManifest, load_manifest, remove_manifest_if_unchanged, save_manifest,
 };
-use transaction::{
-    FileSnapshot, atomic_replace, create_backup, read_optional_snapshot, read_snapshot,
-    remove_if_hash, sha256_hex,
+use rollback::rollback_install;
+use targets::{
+    TargetPreflight, diagnose_targets, execute_uninstall_target, install_target, plan_target,
+    plan_uninstall_target, preflight_target, validated_targets,
 };
 pub use types::*;
-
-struct FragmentPreparation {
-    desired_value: Value,
-    desired_bytes: Vec<u8>,
-    semantically_equal: bool,
-    current: Option<FileSnapshot>,
-    report: FragmentReport,
-}
-
-struct TargetPreparation {
-    target: TerminalSettingsTarget,
-    snapshot: FileSnapshot,
-    edit: jsonc::SettingsEdit,
-}
-
-enum UndoOperation {
-    Created {
-        path: PathBuf,
-        installed_sha256: String,
-    },
-    Replaced {
-        path: PathBuf,
-        installed_sha256: String,
-        original: Vec<u8>,
-    },
-}
 
 /// Produces a read-only installation plan. No directory or file is created.
 pub fn plan(config: &IntegrationConfig) -> AppResult<PlanReport> {
@@ -180,68 +152,12 @@ pub fn install(config: &IntegrationConfig) -> AppResult<InstallReport> {
         }
         Err(install_error) => match rollback_install(&mut applied) {
             Ok(()) => Err(install_error),
-            Err(rollback_error) => Err(AppError::SettingsConflict(format!(
+            Err(rollback_error) => Err(AppError::OperationIncomplete(format!(
                 "installation failed: {install_error}; rollback was incomplete: {rollback_error}; raw backups were retained in {}",
                 config.state_dir.join("backups").display()
             ))),
         },
     }
-}
-
-enum TargetPreflight {
-    Ready(TargetPreparation),
-    Failed(TargetInstallReport),
-}
-
-fn preflight_target(
-    target: &TerminalSettingsTarget,
-    desired: &[DesiredKeybinding],
-) -> TargetPreflight {
-    let failed = |status: ChangeStatus, before_sha256: Option<String>, message: String| {
-        let after_sha256 = before_sha256.clone();
-        TargetPreflight::Failed(TargetInstallReport {
-            channel: target.channel,
-            settings_path: target.settings_path.clone(),
-            status,
-            added_binding_count: 0,
-            backup_path: None,
-            before_sha256,
-            after_sha256,
-            message: Some(message),
-        })
-    };
-    let snapshot = match read_snapshot(&target.settings_path) {
-        Ok(snapshot) => snapshot,
-        Err(error) => return failed(ChangeStatus::Skipped, None, error.to_string()),
-    };
-    let before_sha256 = Some(snapshot.sha256.clone());
-    let edit = match merge_keybindings(&snapshot.bytes, desired) {
-        Ok(edit) => edit,
-        Err(error) => {
-            let error = settings_context(&target.settings_path, error);
-            return failed(ChangeStatus::Conflict, before_sha256, error.to_string());
-        }
-    };
-    if !edit.conflicts.is_empty() {
-        return failed(
-            ChangeStatus::Conflict,
-            before_sha256,
-            format!(
-                "{}: {}",
-                target.settings_path.display(),
-                edit.conflicts
-                    .iter()
-                    .map(|conflict| conflict.message.as_str())
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            ),
-        );
-    }
-    TargetPreflight::Ready(TargetPreparation {
-        target: target.clone(),
-        snapshot,
-        edit,
-    })
 }
 
 /// Removes only definitions that still semantically match the installation manifest.
@@ -402,82 +318,7 @@ pub fn doctor(config: &IntegrationConfig) -> AppResult<DoctorReport> {
         issues.push("no initialized Windows Terminal settings files were found".to_owned());
     }
 
-    let mut target_reports = Vec::with_capacity(targets.len());
-    for target in targets {
-        match read_optional_snapshot(&target.settings_path) {
-            Ok(Some(snapshot)) => match analyze_keybindings(&snapshot.bytes, &desired) {
-                Ok(analysis) => {
-                    if !analysis.conflicts.is_empty() {
-                        issues.push(format!(
-                            "{} has {} integration conflict(s)",
-                            target.settings_path.display(),
-                            analysis.conflicts.len()
-                        ));
-                    }
-                    let warnings = analysis.warnings;
-                    target_reports.push(DoctorTargetReport {
-                        channel: target.channel,
-                        settings_path: target.settings_path,
-                        initialized: true,
-                        readable: true,
-                        valid_jsonc: true,
-                        managed_binding_count: analysis.managed_binding_count,
-                        conflicts: analysis.conflicts,
-                        message: if warnings.is_empty() {
-                            None
-                        } else {
-                            Some(warnings.join("; "))
-                        },
-                    });
-                }
-                Err(error) => {
-                    issues.push(format!("{}: {error}", target.settings_path.display()));
-                    target_reports.push(DoctorTargetReport {
-                        channel: target.channel,
-                        settings_path: target.settings_path,
-                        initialized: true,
-                        readable: true,
-                        valid_jsonc: false,
-                        managed_binding_count: 0,
-                        conflicts: vec![IntegrationConflict {
-                            kind: ConflictKind::InvalidSettingsShape,
-                            action_id: None,
-                            keys: None,
-                            message: error.to_string(),
-                        }],
-                        message: Some(error.to_string()),
-                    });
-                }
-            },
-            Ok(None) => {
-                let message = "settings file is no longer present".to_owned();
-                issues.push(format!("{}: {message}", target.settings_path.display()));
-                target_reports.push(DoctorTargetReport {
-                    channel: target.channel,
-                    settings_path: target.settings_path,
-                    initialized: false,
-                    readable: false,
-                    valid_jsonc: false,
-                    managed_binding_count: 0,
-                    conflicts: Vec::new(),
-                    message: Some(message),
-                });
-            }
-            Err(error) => {
-                issues.push(format!("{}: {error}", target.settings_path.display()));
-                target_reports.push(DoctorTargetReport {
-                    channel: target.channel,
-                    settings_path: target.settings_path,
-                    initialized: true,
-                    readable: false,
-                    valid_jsonc: false,
-                    managed_binding_count: 0,
-                    conflicts: Vec::new(),
-                    message: Some(error.to_string()),
-                });
-            }
-        }
-    }
+    let target_reports = diagnose_targets(targets, &desired, &mut issues);
 
     Ok(DoctorReport {
         schema_version: INTEGRATION_SCHEMA_VERSION,
@@ -491,579 +332,21 @@ pub fn doctor(config: &IntegrationConfig) -> AppResult<DoctorReport> {
     })
 }
 
-fn desired_keybindings() -> AppResult<Vec<DesiredKeybinding>> {
-    let desired = managed_bindings()
-        .iter()
-        .copied()
-        .map(|binding| desired_keybinding(binding.keybinding_definition_json()))
-        .collect::<AppResult<Vec<_>>>()?;
-    validate_desired_bindings(&desired)?;
-    Ok(desired)
-}
-
-fn desired_fragment() -> AppResult<(Value, Vec<u8>)> {
-    let actions = managed_bindings()
-        .iter()
-        .copied()
-        .map(|binding| binding.action_definition_json())
-        .collect::<Vec<_>>();
-    let value = json!({ "actions": actions });
-    if contains_forbidden_keybinding_field(&value) {
-        return Err(AppError::InvalidConfiguration(
-            "action fragment generation attempted to include keys or keybindings".to_owned(),
-        ));
-    }
-    let mut bytes = serde_json::to_vec_pretty(&value).map_err(|error| {
-        AppError::InvalidConfiguration(format!("serialize Windows Terminal fragment: {error}"))
-    })?;
-    bytes.push(b'\n');
-    Ok((value, bytes))
-}
-
-fn contains_forbidden_keybinding_field(value: &Value) -> bool {
-    match value {
-        Value::Object(object) => object.iter().any(|(key, value)| {
-            matches!(key.as_str(), "keys" | "keybindings")
-                || contains_forbidden_keybinding_field(value)
-        }),
-        Value::Array(values) => values.iter().any(contains_forbidden_keybinding_field),
-        _ => false,
-    }
-}
-
-fn prepare_fragment(
-    config: &IntegrationConfig,
-    manifest: &IntegrationManifest,
-) -> AppResult<FragmentPreparation> {
-    let path = config.fragment_path();
-    let (desired_value, desired_bytes) = desired_fragment()?;
-    let desired_sha256 = sha256_hex(&desired_bytes);
-    let current = read_optional_snapshot(&path)?;
-    let owned = manifest
-        .fragment
-        .as_ref()
-        .filter(|record| path_key(&record.path) == path_key(&path))
-        .filter(|record| {
-            current
-                .as_ref()
-                .is_some_and(|snapshot| snapshot.sha256 == record.installed_sha256)
-        });
-    let semantically_equal = current
-        .as_ref()
-        .and_then(|snapshot| parse_fragment_value(&snapshot.bytes).ok())
-        .is_some_and(|value| value == desired_value);
-    let (status, message) = match current.as_ref() {
-        None => (ChangeStatus::Create, None),
-        Some(_) if semantically_equal => (ChangeStatus::Unchanged, None),
-        Some(_) if owned.is_some() => (ChangeStatus::Update, None),
-        Some(_) => (
-            ChangeStatus::Conflict,
-            Some(format!(
-                "{} already exists but is not the fragment recorded by WinTerminalP",
-                path.display()
-            )),
-        ),
-    };
-    let report = FragmentReport {
-        path,
-        status,
-        current_sha256: current.as_ref().map(|snapshot| snapshot.sha256.clone()),
-        desired_sha256,
-        minimum_terminal_version: MINIMUM_FRAGMENT_VERSION.to_owned(),
-        message,
-    };
-    Ok(FragmentPreparation {
-        desired_value,
-        desired_bytes,
-        semantically_equal,
-        current,
-        report,
-    })
-}
-
-fn install_fragment(
-    config: &IntegrationConfig,
-    preparation: FragmentPreparation,
-    manifest: &mut IntegrationManifest,
-    applied: &mut Vec<UndoOperation>,
-) -> AppResult<FragmentReport> {
-    let mut report = preparation.report;
-    let old_record = manifest.fragment.clone();
-    match report.status {
-        ChangeStatus::Create => {
-            let installed_sha256 =
-                apply_install_change(&report.path, None, &preparation.desired_bytes, applied)?;
-            manifest.fragment = Some(FragmentManifest {
-                path: report.path.clone(),
-                installed_sha256: installed_sha256.clone(),
-                backup: None,
-            });
-            report.current_sha256 = Some(installed_sha256);
-        }
-        ChangeStatus::Update => {
-            let current = preparation.current.as_ref().ok_or_else(|| {
-                AppError::SettingsConflict("fragment disappeared during installation".to_owned())
-            })?;
-            let backup = create_backup(&config.state_dir, "fragment", &report.path, current)?;
-            let installed_sha256 = apply_install_change(
-                &report.path,
-                Some(current),
-                &preparation.desired_bytes,
-                applied,
-            )?;
-            manifest.fragment = Some(FragmentManifest {
-                path: report.path.clone(),
-                installed_sha256: installed_sha256.clone(),
-                backup: Some(backup),
-            });
-            report.current_sha256 = Some(installed_sha256);
-        }
-        ChangeStatus::Unchanged => {
-            let current_sha256 = preparation
-                .current
-                .as_ref()
-                .map(|current| current.sha256.clone());
-            manifest.fragment = old_record.and_then(|mut record| {
-                if path_key(&record.path) != path_key(&report.path) {
-                    return None;
-                }
-                let hash_matches =
-                    current_sha256.as_deref() == Some(record.installed_sha256.as_str());
-                if !hash_matches && !preparation.semantically_equal {
-                    return None;
-                }
-                if !hash_matches {
-                    if let Some(current_sha256) = current_sha256 {
-                        record.installed_sha256 = current_sha256;
-                    }
-                }
-                Some(record)
-            });
-        }
-        ChangeStatus::Conflict => {
-            return Err(AppError::SettingsConflict(
-                report
-                    .message
-                    .clone()
-                    .unwrap_or_else(|| "action fragment conflict".to_owned()),
-            ));
-        }
-        _ => {
-            return Err(AppError::InvalidConfiguration(
-                "invalid fragment installation state".to_owned(),
-            ));
-        }
-    }
-    debug_assert!(!contains_forbidden_keybinding_field(
-        &preparation.desired_value
-    ));
-    Ok(report)
-}
-
-fn plan_target(
-    target: &TerminalSettingsTarget,
-    desired: &[DesiredKeybinding],
-    manifest: &IntegrationManifest,
-) -> TargetPlan {
-    let old_managed_count = manifest
-        .targets
-        .iter()
-        .find(|record| path_key(&record.settings_path) == path_key(&target.settings_path))
-        .map_or(0, |record| record.managed_keybindings.len());
-    match read_snapshot(&target.settings_path)
-        .and_then(|snapshot| analyze_keybindings(&snapshot.bytes, desired))
-    {
-        Ok(analysis) => TargetPlan {
-            channel: target.channel,
-            settings_path: target.settings_path.clone(),
-            status: if !analysis.conflicts.is_empty() {
-                ChangeStatus::Conflict
-            } else if analysis.bindings_to_add == 0 {
-                ChangeStatus::Unchanged
-            } else {
-                ChangeStatus::Update
-            },
-            existing_binding_count: analysis.existing_binding_count,
-            bindings_to_add: analysis.bindings_to_add,
-            managed_binding_count: analysis.managed_binding_count.max(old_managed_count),
-            conflicts: analysis.conflicts,
-        },
-        Err(error) => TargetPlan {
-            channel: target.channel,
-            settings_path: target.settings_path.clone(),
-            status: ChangeStatus::Conflict,
-            existing_binding_count: 0,
-            bindings_to_add: 0,
-            managed_binding_count: old_managed_count,
-            conflicts: vec![IntegrationConflict {
-                kind: ConflictKind::InvalidSettingsShape,
-                action_id: None,
-                keys: None,
-                message: error.to_string(),
-            }],
-        },
-    }
-}
-
-fn install_target(
-    config: &IntegrationConfig,
-    preparation: TargetPreparation,
-    manifest: &mut IntegrationManifest,
-    applied: &mut Vec<UndoOperation>,
-) -> AppResult<TargetInstallReport> {
-    let old_record = manifest
-        .targets
-        .iter()
-        .find(|record| {
-            path_key(&record.settings_path) == path_key(&preparation.target.settings_path)
-        })
-        .cloned();
-    let before_sha256 = preparation.snapshot.sha256.clone();
-    let mut backup_path = None;
-    let (status, after_sha256, new_backup) = match preparation.edit.replacement.as_ref() {
-        Some(replacement) => {
-            let backup = create_backup(
-                &config.state_dir,
-                channel_label(preparation.target.channel),
-                &preparation.target.settings_path,
-                &preparation.snapshot,
-            )?;
-            backup_path = Some(backup.backup_path.clone());
-            run_before_target_write_hook(&preparation.target.settings_path);
-            let after_sha256 = apply_install_change(
-                &preparation.target.settings_path,
-                Some(&preparation.snapshot),
-                replacement,
-                applied,
-            )?;
-            (ChangeStatus::Update, after_sha256, Some(backup))
-        }
-        None => (
-            ChangeStatus::Unchanged,
-            preparation.snapshot.sha256.clone(),
-            None,
-        ),
-    };
-
-    let mut owned = old_record
-        .as_ref()
-        .map_or_else(Vec::new, |record| record.managed_keybindings.clone());
-    owned.extend(preparation.edit.additions.iter().cloned());
-    deduplicate_managed_records(&mut owned);
-    manifest.targets.retain(|record| {
-        path_key(&record.settings_path) != path_key(&preparation.target.settings_path)
-    });
-    if !owned.is_empty() {
-        let backup = new_backup
-            .or_else(|| old_record.as_ref().map(|record| record.backup.clone()))
-            .ok_or_else(|| {
-                AppError::InvalidConfiguration(
-                    "managed settings record is missing its recovery backup".to_owned(),
-                )
-            })?;
-        manifest.targets.push(TargetManifest {
-            channel: preparation.target.channel,
-            settings_path: preparation.target.settings_path.clone(),
-            installed_sha256: after_sha256.clone(),
-            backup,
-            managed_keybindings: owned,
-        });
-    }
-
-    Ok(TargetInstallReport {
-        channel: preparation.target.channel,
-        settings_path: preparation.target.settings_path,
-        status,
-        added_binding_count: preparation.edit.additions.len(),
-        backup_path,
-        before_sha256: Some(before_sha256),
-        after_sha256: Some(after_sha256),
-        message: None,
-    })
-}
-
-fn apply_install_change(
-    path: &Path,
-    before: Option<&FileSnapshot>,
-    replacement: &[u8],
-    applied: &mut Vec<UndoOperation>,
-) -> AppResult<String> {
-    let expected_sha256 = before.map(|snapshot| snapshot.sha256.as_str());
-    let replacement_sha256 = sha256_hex(replacement);
-    match atomic_replace(path, expected_sha256, replacement) {
-        Ok(installed_sha256) => {
-            applied.push(undo_operation(path, before, installed_sha256.clone()));
-            Ok(installed_sha256)
-        }
-        Err(error) => {
-            let applied_state = match read_optional_snapshot(path) {
-                Ok(None) => false,
-                Ok(Some(snapshot)) => snapshot.sha256 == replacement_sha256,
-                Err(_) => true,
-            };
-            if applied_state {
-                applied.push(undo_operation(path, before, replacement_sha256));
-            }
-            Err(error)
-        }
-    }
-}
-
-fn undo_operation(
-    path: &Path,
-    before: Option<&FileSnapshot>,
-    installed_sha256: String,
-) -> UndoOperation {
-    match before {
-        Some(snapshot) => UndoOperation::Replaced {
-            path: path.to_path_buf(),
-            installed_sha256,
-            original: snapshot.bytes.clone(),
-        },
-        None => UndoOperation::Created {
-            path: path.to_path_buf(),
-            installed_sha256,
-        },
-    }
-}
-
-fn rollback_install(applied: &mut Vec<UndoOperation>) -> AppResult<()> {
-    let mut failures = Vec::new();
-    while let Some(operation) = applied.pop() {
-        let result = match operation {
-            UndoOperation::Created {
-                path,
-                installed_sha256,
-            } => match remove_if_hash(&path, &installed_sha256) {
-                Ok(true) => Ok(()),
-                Ok(false) if !path.exists() => Ok(()),
-                Ok(false) => Err(AppError::SettingsConflict(format!(
-                    "{} changed after WinTerminalP created it; user bytes were preserved",
-                    path.display()
-                ))),
-                Err(error) => Err(error),
-            },
-            UndoOperation::Replaced {
-                path,
-                installed_sha256,
-                original,
-            } => atomic_replace(&path, Some(&installed_sha256), &original).map(|_| ()),
-        };
-        if let Err(error) = result {
-            failures.push(error.to_string());
-        }
-    }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(AppError::SettingsConflict(failures.join("; ")))
-    }
-}
-
-#[cfg(test)]
-type BeforeTargetWriteHook = std::cell::RefCell<Option<Box<dyn Fn(&Path)>>>;
-
-#[cfg(test)]
-thread_local! {
-    static BEFORE_TARGET_WRITE_HOOK: BeforeTargetWriteHook = std::cell::RefCell::new(None);
-}
-
-#[cfg(test)]
-fn run_before_target_write_hook(path: &Path) {
-    BEFORE_TARGET_WRITE_HOOK.with(|hook| {
-        if let Some(hook) = hook.borrow().as_ref() {
-            hook(path);
-        }
-    });
-}
-
-#[cfg(not(test))]
-fn run_before_target_write_hook(_path: &Path) {}
-
-enum FragmentUninstallPlan {
-    Missing,
-    Preserved,
-    Remove(FileSnapshot),
-}
-
-fn plan_uninstall_fragment(manifest: &IntegrationManifest) -> AppResult<FragmentUninstallPlan> {
-    let Some(fragment) = manifest.fragment.as_ref() else {
-        return Ok(FragmentUninstallPlan::Missing);
-    };
-    let Some(snapshot) = read_optional_snapshot(&fragment.path)? else {
-        return Ok(FragmentUninstallPlan::Missing);
-    };
-    if snapshot.sha256 != fragment.installed_sha256 {
-        return Ok(FragmentUninstallPlan::Preserved);
-    }
-    Ok(FragmentUninstallPlan::Remove(snapshot))
-}
-
-fn execute_uninstall_fragment(
-    config: &IntegrationConfig,
-    installed: &IntegrationManifest,
-    plan: FragmentUninstallPlan,
-    retained: &mut IntegrationManifest,
-) -> AppResult<ChangeStatus> {
-    let Some(fragment) = installed.fragment.as_ref() else {
-        return Ok(ChangeStatus::Missing);
-    };
-    match plan {
-        FragmentUninstallPlan::Missing => Ok(ChangeStatus::Missing),
-        FragmentUninstallPlan::Preserved => {
-            retained.fragment = Some(fragment.clone());
-            Ok(ChangeStatus::Preserved)
-        }
-        FragmentUninstallPlan::Remove(snapshot) => {
-            create_backup(
-                &config.state_dir,
-                "fragment-uninstall",
-                &fragment.path,
-                &snapshot,
-            )?;
-            if remove_if_hash(&fragment.path, &fragment.installed_sha256)? {
-                Ok(ChangeStatus::Removed)
-            } else {
-                retained.fragment = Some(fragment.clone());
-                Ok(ChangeStatus::Preserved)
-            }
-        }
-    }
-}
-
-struct TargetUninstallPlan {
-    snapshot: FileSnapshot,
-    edit: jsonc::RemovalEdit,
-}
-
-fn plan_uninstall_target(installed: &TargetManifest) -> AppResult<Option<TargetUninstallPlan>> {
-    let Some(snapshot) = read_optional_snapshot(&installed.settings_path)? else {
-        return Ok(None);
-    };
-    let edit = remove_managed_keybindings(&snapshot.bytes, &installed.managed_keybindings)
-        .map_err(|error| settings_context(&installed.settings_path, error))?;
-    Ok(Some(TargetUninstallPlan { snapshot, edit }))
-}
-
-fn execute_uninstall_target(
-    config: &IntegrationConfig,
-    installed: &TargetManifest,
-    plan: TargetUninstallPlan,
-) -> AppResult<(TargetUninstallReport, Option<TargetManifest>)> {
-    let TargetUninstallPlan { snapshot, edit } = plan;
-    let mut backup_path = None;
-    let mut after_sha256 = snapshot.sha256.clone();
-    if let Some(replacement) = edit.replacement.as_ref() {
-        let backup = create_backup(
-            &config.state_dir,
-            &format!("{}-uninstall", channel_label(installed.channel)),
-            &installed.settings_path,
-            &snapshot,
-        )?;
-        backup_path = Some(backup.backup_path.clone());
-        run_before_target_write_hook(&installed.settings_path);
-        after_sha256 = atomic_replace(
-            &installed.settings_path,
-            Some(&snapshot.sha256),
-            replacement,
-        )?;
-    }
-    let retained = if edit.retained.is_empty() {
-        None
-    } else {
-        Some(TargetManifest {
-            channel: installed.channel,
-            settings_path: installed.settings_path.clone(),
-            installed_sha256: after_sha256,
-            backup: installed.backup.clone(),
-            managed_keybindings: edit.retained,
-        })
-    };
-    let status = if edit.preserved_binding_count > 0 {
-        ChangeStatus::Preserved
-    } else if edit.removed_binding_count > 0 {
-        ChangeStatus::Removed
-    } else {
-        ChangeStatus::Missing
-    };
-    Ok((
-        TargetUninstallReport {
-            channel: installed.channel,
-            settings_path: installed.settings_path.clone(),
-            status,
-            removed_binding_count: edit.removed_binding_count,
-            preserved_binding_count: edit.preserved_binding_count,
-            backup_path,
-            message: None,
-        },
-        retained,
-    ))
-}
-
-fn validated_targets(config: &IntegrationConfig) -> AppResult<Vec<TerminalSettingsTarget>> {
-    let targets = discover_targets(config);
-    ensure_distinct_targets(&targets)?;
-    Ok(targets)
-}
-
-fn ensure_distinct_targets(targets: &[TerminalSettingsTarget]) -> AppResult<()> {
-    let mut paths = HashSet::new();
-    for target in targets {
-        if !paths.insert(path_key(&target.settings_path)) {
-            return Err(AppError::InvalidConfiguration(format!(
-                "duplicate Windows Terminal settings target {}",
-                target.settings_path.display()
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn parse_fragment_value(raw: &[u8]) -> AppResult<Value> {
-    let raw = raw.strip_prefix(b"\xef\xbb\xbf").unwrap_or(raw);
-    serde_json::from_slice(raw).map_err(|error| {
-        AppError::InvalidConfiguration(format!("action fragment is invalid JSON: {error}"))
-    })
-}
-
-fn deduplicate_managed_records(records: &mut Vec<ManagedKeybindingManifest>) {
-    let mut seen = HashSet::new();
-    records.retain(|record| {
-        seen.insert((record.canonical_id.clone(), record.canonical_chord.clone()))
-    });
-}
-
-fn settings_context(path: &Path, error: AppError) -> AppError {
-    match error {
-        AppError::SettingsConflict(message) => {
-            AppError::SettingsConflict(format!("{}: {message}", path.display()))
-        }
-        AppError::Io { .. } | AppError::Settings { .. } => error,
-        error => AppError::Settings {
-            path: path.to_path_buf(),
-            message: error.to_string(),
-        },
-    }
-}
-
-const fn channel_label(channel: TerminalChannel) -> &'static str {
-    match channel {
-        TerminalChannel::Stable => "stable",
-        TerminalChannel::Preview => "preview",
-        TerminalChannel::Canary => "canary",
-        TerminalChannel::Unpackaged => "unpackaged",
-        TerminalChannel::Portable => "portable",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
     use std::fs;
+    use std::path::Path;
     use std::rc::Rc;
 
-    use serde_json::Value;
+    use serde_json::{Value, json};
 
+    use crate::TerminalChannel;
+    use crate::keymap::managed_bindings;
+
+    use super::fragment::desired_fragment;
+    use super::targets::BEFORE_TARGET_WRITE_HOOK;
+    use super::transaction::sha256_hex;
     use super::*;
 
     fn channel_settings(root: &Path, package: &str, source: &[u8]) -> std::path::PathBuf {
@@ -1080,23 +363,6 @@ mod tests {
 
     fn stable_settings(root: &Path, source: &[u8]) -> std::path::PathBuf {
         channel_settings(root, "Microsoft.WindowsTerminal_8wekyb3d8bbwe", source)
-    }
-
-    #[test]
-    fn generated_fragment_has_actions_but_no_keybindings() {
-        let (value, bytes) = desired_fragment().expect("fragment should be generated");
-
-        assert_eq!(
-            value["actions"]
-                .as_array()
-                .expect("actions should be an array")
-                .len(),
-            managed_bindings().len()
-        );
-        assert!(!contains_forbidden_keybinding_field(&value));
-        let text = std::str::from_utf8(&bytes).expect("fragment should be UTF-8");
-        assert!(!text.contains("\"keys\""));
-        assert!(!text.contains("\"keybindings\""));
     }
 
     #[test]
@@ -1592,23 +858,6 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_targets_differing_only_by_case_are_rejected() {
-        let targets = vec![
-            TerminalSettingsTarget {
-                channel: TerminalChannel::Stable,
-                settings_path: PathBuf::from(r"C:\Users\Me\settings.json"),
-            },
-            TerminalSettingsTarget {
-                channel: TerminalChannel::Preview,
-                settings_path: PathBuf::from(r"c:\users\me\SETTINGS.JSON"),
-            },
-        ];
-        let error =
-            ensure_distinct_targets(&targets).expect_err("case-only duplicates must be rejected");
-        assert!(matches!(error, AppError::InvalidConfiguration(_)));
-    }
-
-    #[test]
     fn ownership_survives_a_localappdata_casing_change() {
         let temp = tempfile::tempdir().expect("temporary directory should be created");
         stable_settings(temp.path(), b"{}\n");
@@ -1661,22 +910,5 @@ mod tests {
         assert_eq!(report.targets[0].status, ChangeStatus::Removed);
         assert!(!config.fragment_path().exists());
         assert!(!config.manifest_path().exists());
-    }
-
-    #[test]
-    fn undo_registration_is_conservative_when_the_state_cannot_be_read() {
-        let temp = tempfile::tempdir().expect("temporary directory should be created");
-        let path = temp.path().join("unreadable-as-file");
-        fs::create_dir(&path).expect("directory fixture should be created");
-        let mut applied = Vec::new();
-
-        let result = apply_install_change(&path, None, b"{}", &mut applied);
-
-        assert!(result.is_err());
-        assert_eq!(
-            applied.len(),
-            1,
-            "an unknown applied state must still register an undo operation"
-        );
     }
 }

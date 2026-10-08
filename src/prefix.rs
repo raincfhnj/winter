@@ -4,6 +4,7 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use crate::model::{Direction, TerminalAction, WindowIdentity};
+use crate::registry;
 
 pub const DEFAULT_PREFIX_TIMEOUT: Duration = Duration::from_millis(1_500);
 
@@ -189,200 +190,12 @@ pub struct ShortcutSpec {
     pub allow_disabled: bool,
 }
 
-const fn chord(key: LogicalKey, ctrl: bool, alt: bool, shift: bool) -> KeyChord {
+pub(crate) const fn chord(key: LogicalKey, ctrl: bool, alt: bool, shift: bool) -> KeyChord {
     KeyChord::new(key, Modifiers::new(ctrl, alt, shift, false))
 }
 
-const fn terminal_spec(
-    name: &'static str,
-    default_chord: KeyChord,
-    action: TerminalAction,
-) -> ShortcutSpec {
-    ShortcutSpec {
-        name,
-        default_chord,
-        command: ShortcutCommand::Terminal(action),
-        allow_disabled: true,
-    }
-}
-
-static SHORTCUT_SPECS: &[ShortcutSpec] = &[
-    terminal_spec(
-        "focus_left",
-        chord(LogicalKey::Arrow(Direction::Left), false, false, false),
-        TerminalAction::FocusPane {
-            direction: Direction::Left,
-        },
-    ),
-    terminal_spec(
-        "focus_right",
-        chord(LogicalKey::Arrow(Direction::Right), false, false, false),
-        TerminalAction::FocusPane {
-            direction: Direction::Right,
-        },
-    ),
-    terminal_spec(
-        "focus_up",
-        chord(LogicalKey::Arrow(Direction::Up), false, false, false),
-        TerminalAction::FocusPane {
-            direction: Direction::Up,
-        },
-    ),
-    terminal_spec(
-        "focus_down",
-        chord(LogicalKey::Arrow(Direction::Down), false, false, false),
-        TerminalAction::FocusPane {
-            direction: Direction::Down,
-        },
-    ),
-    terminal_spec(
-        "split_left",
-        chord(LogicalKey::Arrow(Direction::Left), false, false, true),
-        TerminalAction::SplitPane {
-            direction: Direction::Left,
-        },
-    ),
-    terminal_spec(
-        "split_right",
-        chord(LogicalKey::Arrow(Direction::Right), false, false, true),
-        TerminalAction::SplitPane {
-            direction: Direction::Right,
-        },
-    ),
-    terminal_spec(
-        "split_up",
-        chord(LogicalKey::Arrow(Direction::Up), false, false, true),
-        TerminalAction::SplitPane {
-            direction: Direction::Up,
-        },
-    ),
-    terminal_spec(
-        "split_down",
-        chord(LogicalKey::Arrow(Direction::Down), false, false, true),
-        TerminalAction::SplitPane {
-            direction: Direction::Down,
-        },
-    ),
-    terminal_spec(
-        "resize_left",
-        chord(LogicalKey::Arrow(Direction::Left), true, false, false),
-        TerminalAction::ResizePane {
-            direction: Direction::Left,
-        },
-    ),
-    terminal_spec(
-        "resize_right",
-        chord(LogicalKey::Arrow(Direction::Right), true, false, false),
-        TerminalAction::ResizePane {
-            direction: Direction::Right,
-        },
-    ),
-    terminal_spec(
-        "resize_up",
-        chord(LogicalKey::Arrow(Direction::Up), true, false, false),
-        TerminalAction::ResizePane {
-            direction: Direction::Up,
-        },
-    ),
-    terminal_spec(
-        "resize_down",
-        chord(LogicalKey::Arrow(Direction::Down), true, false, false),
-        TerminalAction::ResizePane {
-            direction: Direction::Down,
-        },
-    ),
-    terminal_spec(
-        "new_tab",
-        chord(LogicalKey::Character('c'), false, false, false),
-        TerminalAction::NewTab,
-    ),
-    terminal_spec(
-        "next_tab",
-        chord(LogicalKey::Character('n'), false, false, false),
-        TerminalAction::NextTab,
-    ),
-    terminal_spec(
-        "previous_tab",
-        chord(LogicalKey::Character('p'), false, false, false),
-        TerminalAction::PreviousTab,
-    ),
-    terminal_spec(
-        "activate_tab_0",
-        chord(LogicalKey::Character('0'), false, false, false),
-        TerminalAction::ActivateTab { index: 0 },
-    ),
-    terminal_spec(
-        "activate_tab_1",
-        chord(LogicalKey::Character('1'), false, false, false),
-        TerminalAction::ActivateTab { index: 1 },
-    ),
-    terminal_spec(
-        "activate_tab_2",
-        chord(LogicalKey::Character('2'), false, false, false),
-        TerminalAction::ActivateTab { index: 2 },
-    ),
-    terminal_spec(
-        "activate_tab_3",
-        chord(LogicalKey::Character('3'), false, false, false),
-        TerminalAction::ActivateTab { index: 3 },
-    ),
-    terminal_spec(
-        "activate_tab_4",
-        chord(LogicalKey::Character('4'), false, false, false),
-        TerminalAction::ActivateTab { index: 4 },
-    ),
-    terminal_spec(
-        "activate_tab_5",
-        chord(LogicalKey::Character('5'), false, false, false),
-        TerminalAction::ActivateTab { index: 5 },
-    ),
-    terminal_spec(
-        "activate_tab_6",
-        chord(LogicalKey::Character('6'), false, false, false),
-        TerminalAction::ActivateTab { index: 6 },
-    ),
-    terminal_spec(
-        "activate_tab_7",
-        chord(LogicalKey::Character('7'), false, false, false),
-        TerminalAction::ActivateTab { index: 7 },
-    ),
-    terminal_spec(
-        "activate_tab_8",
-        chord(LogicalKey::Character('8'), false, false, false),
-        TerminalAction::ActivateTab { index: 8 },
-    ),
-    terminal_spec(
-        "activate_tab_9",
-        chord(LogicalKey::Character('9'), false, false, false),
-        TerminalAction::ActivateTab { index: 9 },
-    ),
-    terminal_spec(
-        "close_pane",
-        chord(LogicalKey::Character('x'), false, false, false),
-        TerminalAction::ClosePane,
-    ),
-    terminal_spec(
-        "toggle_zoom",
-        chord(LogicalKey::Character('z'), false, false, false),
-        TerminalAction::TogglePaneZoom,
-    ),
-    terminal_spec(
-        "rename_tab",
-        chord(LogicalKey::Character(','), false, false, false),
-        TerminalAction::RenameTab,
-    ),
-    terminal_spec(
-        "send_prefix_literal",
-        chord(LogicalKey::Character('b'), false, false, false),
-        TerminalAction::SendPrefixLiteral,
-    ),
-    ShortcutSpec {
-        name: "shutdown",
-        default_chord: chord(LogicalKey::Character('q'), false, false, false),
-        command: ShortcutCommand::Shutdown,
-        allow_disabled: false,
-    },
-];
+/// Shortcut specs derived from the canonical action registry at compile time.
+static SHORTCUT_SPECS: [ShortcutSpec; registry::ACTION_COUNT] = registry::build_shortcut_specs();
 
 #[must_use]
 pub const fn default_prefix_chord() -> KeyChord {
@@ -391,7 +204,7 @@ pub const fn default_prefix_chord() -> KeyChord {
 
 #[must_use]
 pub fn shortcut_specs() -> &'static [ShortcutSpec] {
-    SHORTCUT_SPECS
+    &SHORTCUT_SPECS
 }
 
 /// Whether a chord is owned by Windows or Windows Terminal and must never be
@@ -468,76 +281,15 @@ fn set_modifier(target: &mut bool, name: &str) -> Result<(), KeyChordParseError>
 }
 
 fn parse_logical_key_name(value: &str) -> Result<LogicalKey, KeyChordParseError> {
-    let named = match value {
-        "left" => Some(LogicalKey::Arrow(Direction::Left)),
-        "right" => Some(LogicalKey::Arrow(Direction::Right)),
-        "up" => Some(LogicalKey::Arrow(Direction::Up)),
-        "down" => Some(LogicalKey::Arrow(Direction::Down)),
-        "escape" | "esc" => Some(LogicalKey::Escape),
-        "tab" => Some(LogicalKey::Tab),
-        "space" => Some(LogicalKey::Character(' ')),
-        "comma" => Some(LogicalKey::Character(',')),
-        "period" | "dot" => Some(LogicalKey::Character('.')),
-        "semicolon" => Some(LogicalKey::Character(';')),
-        "slash" => Some(LogicalKey::Character('/')),
-        "backslash" => Some(LogicalKey::Character('\\')),
-        "minus" => Some(LogicalKey::Character('-')),
-        "equals" => Some(LogicalKey::Character('=')),
-        "quote" => Some(LogicalKey::Character('\'')),
-        "backtick" => Some(LogicalKey::Character('`')),
-        "left-bracket" | "left_bracket" => Some(LogicalKey::Character('[')),
-        "right-bracket" | "right_bracket" => Some(LogicalKey::Character(']')),
-        _ => None,
-    };
-    if let Some(key) = named {
-        return Ok(key);
-    }
-
-    if let Some(number) = value
-        .strip_prefix('f')
-        .and_then(|number| number.parse::<u8>().ok())
-        .filter(|number| (1..=12).contains(number))
-    {
-        return Ok(LogicalKey::Function(number));
-    }
-
-    let mut characters = value.chars();
-    if let (Some(character), None) = (characters.next(), characters.next())
-        && (character.is_ascii_alphanumeric() || ",.;/\\-='[]`".contains(character))
-    {
-        return Ok(LogicalKey::Character(character.to_ascii_lowercase()));
-    }
-
-    Err(KeyChordParseError::new(format!(
-        "unsupported key {value:?}; use a-z, 0-9, arrows, F1-F12, or a documented key name"
-    )))
+    crate::keys::parse_key_name(value).ok_or_else(|| {
+        KeyChordParseError::new(format!(
+            "unsupported key {value:?}; use a-z, 0-9, arrows, F1-F12, or a documented key name"
+        ))
+    })
 }
 
 fn logical_key_name(key: LogicalKey) -> String {
-    match key {
-        LogicalKey::Character(' ') => "space".to_owned(),
-        LogicalKey::Character(',') => "comma".to_owned(),
-        LogicalKey::Character('.') => "period".to_owned(),
-        LogicalKey::Character(';') => "semicolon".to_owned(),
-        LogicalKey::Character('/') => "slash".to_owned(),
-        LogicalKey::Character('\\') => "backslash".to_owned(),
-        LogicalKey::Character('-') => "minus".to_owned(),
-        LogicalKey::Character('=') => "equals".to_owned(),
-        LogicalKey::Character('\'') => "quote".to_owned(),
-        LogicalKey::Character('`') => "backtick".to_owned(),
-        LogicalKey::Character('[') => "left-bracket".to_owned(),
-        LogicalKey::Character(']') => "right-bracket".to_owned(),
-        LogicalKey::Character(character) => character.to_string(),
-        LogicalKey::Arrow(Direction::Left) => "left".to_owned(),
-        LogicalKey::Arrow(Direction::Right) => "right".to_owned(),
-        LogicalKey::Arrow(Direction::Up) => "up".to_owned(),
-        LogicalKey::Arrow(Direction::Down) => "down".to_owned(),
-        LogicalKey::Escape => "escape".to_owned(),
-        LogicalKey::Tab => "tab".to_owned(),
-        LogicalKey::Function(number) => format!("f{number}"),
-        LogicalKey::Modifier => "modifier".to_owned(),
-        LogicalKey::Other => "other".to_owned(),
-    }
+    crate::keys::logical_key_name(key)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -974,6 +726,48 @@ mod tests {
         assert!("ctrl+a+b".parse::<KeyChord>().is_err());
     }
 
+    /// Every canonical table row round-trips through the public chord
+    /// parser and formatter: each accepted name parses to the row's key,
+    /// display emits the canonical spelling, and that spelling parses back
+    /// to the same key.
+    #[test]
+    fn canonical_key_rows_round_trip_through_chord_parse_and_display() {
+        for row in crate::keys::KEY_DEFS {
+            for name in row.names {
+                let chord = name
+                    .parse::<KeyChord>()
+                    .unwrap_or_else(|error| panic!("{name:?} must parse: {error}"));
+                assert_eq!(chord.key, row.key, "parse({name:?})");
+            }
+
+            let display = KeyChord::new(row.key, Modifiers::default()).to_string();
+            assert_eq!(display, row.canonical, "display({:?})", row.key);
+
+            let reparsed = display
+                .parse::<KeyChord>()
+                .unwrap_or_else(|error| panic!("{display:?} must reparse: {error}"));
+            assert_eq!(reparsed.key, row.key, "reparse({display:?})");
+        }
+    }
+
+    /// Spellings owned by other layers (Windows Terminal chord syntax from
+    /// the integration normalizer, runtime-only sentinels, or malformed
+    /// forms) must keep failing to parse so configuration acceptance stays
+    /// byte-identical.
+    #[test]
+    fn non_prefix_spellings_stay_rejected() {
+        let rejected = [
+            "plus", "oemplus", "enter", "return", "pgup", "pgdn", "windows", "super", "modifier",
+            "other", "f0", "f13", "f100", "ab", ":", "+", "_", "spacebar",
+        ];
+        for value in rejected {
+            assert!(
+                value.parse::<KeyChord>().is_err(),
+                "{value:?} must stay rejected"
+            );
+        }
+    }
+
     #[test]
     fn shortcut_specs_are_unique_and_complete() {
         let names = shortcut_specs()
@@ -985,7 +779,7 @@ mod tests {
             .map(|spec| spec.default_chord)
             .collect::<HashSet<_>>();
 
-        assert_eq!(shortcut_specs().len(), 30);
+        assert_eq!(shortcut_specs().len(), registry::ACTION_COUNT);
         assert_eq!(names.len(), shortcut_specs().len());
         assert_eq!(chords.len(), shortcut_specs().len());
     }

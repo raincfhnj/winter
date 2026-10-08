@@ -1,6 +1,6 @@
 use windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY;
 
-use crate::model::{Direction, WindowIdentity};
+use crate::model::WindowIdentity;
 use crate::platform::windows::{KeyTransition as RawTransition, RawKeyEvent, key_is_down};
 use crate::prefix::{KeyEvent, KeyTransition, LogicalKey, Modifiers, PhysicalKey};
 
@@ -93,18 +93,9 @@ impl KeyboardNormalizer {
     }
 }
 
-const VK_TAB: u32 = 0x09;
 const VK_SHIFT: u32 = 0x10;
 const VK_CONTROL: u32 = 0x11;
 const VK_MENU: u32 = 0x12;
-const VK_ESCAPE: u32 = 0x1b;
-const VK_SPACE: u32 = 0x20;
-const VK_LEFT: u32 = 0x25;
-const VK_UP: u32 = 0x26;
-const VK_RIGHT: u32 = 0x27;
-const VK_DOWN: u32 = 0x28;
-const VK_F1: u32 = 0x70;
-const VK_F12: u32 = 0x7b;
 const VK_LSHIFT: u32 = 0xa0;
 const VK_RSHIFT: u32 = 0xa1;
 const VK_LCONTROL: u32 = 0xa2;
@@ -113,84 +104,38 @@ const VK_LMENU: u32 = 0xa4;
 const VK_RMENU: u32 = 0xa5;
 const VK_LWIN: u32 = 0x5b;
 const VK_RWIN: u32 = 0x5c;
-const VK_OEM_SEMICOLON: u32 = 0xba;
-const VK_OEM_EQUALS: u32 = 0xbb;
-const VK_OEM_COMMA: u32 = 0xbc;
-const VK_OEM_MINUS: u32 = 0xbd;
-const VK_OEM_PERIOD: u32 = 0xbe;
-const VK_OEM_SLASH: u32 = 0xbf;
-const VK_OEM_BACKTICK: u32 = 0xc0;
-const VK_OEM_LEFT_BRACKET: u32 = 0xdb;
-const VK_OEM_BACKSLASH: u32 = 0xdc;
-const VK_OEM_RIGHT_BRACKET: u32 = 0xdd;
-const VK_OEM_QUOTE: u32 = 0xde;
 
 fn is_alt_key(virtual_key: u32) -> bool {
     matches!(virtual_key, VK_MENU | VK_LMENU | VK_RMENU)
 }
 
+/// Normalizes a raw virtual key: modifier keys become
+/// [`LogicalKey::Modifier`], everything else is resolved through the
+/// canonical key table in [`crate::keys`].
 fn logical_key(virtual_key: u32) -> LogicalKey {
     match virtual_key {
-        VK_LEFT => LogicalKey::Arrow(Direction::Left),
-        VK_RIGHT => LogicalKey::Arrow(Direction::Right),
-        VK_UP => LogicalKey::Arrow(Direction::Up),
-        VK_DOWN => LogicalKey::Arrow(Direction::Down),
-        VK_ESCAPE => LogicalKey::Escape,
-        VK_TAB => LogicalKey::Tab,
-        VK_SPACE => LogicalKey::Character(' '),
-        value @ VK_F1..=VK_F12 => LogicalKey::Function((value - VK_F1 + 1) as u8),
         VK_SHIFT | VK_CONTROL | VK_MENU | VK_LSHIFT | VK_RSHIFT | VK_LCONTROL | VK_RCONTROL
         | VK_LMENU | VK_RMENU | VK_LWIN | VK_RWIN => LogicalKey::Modifier,
-        VK_OEM_SEMICOLON => LogicalKey::Character(';'),
-        VK_OEM_EQUALS => LogicalKey::Character('='),
-        VK_OEM_COMMA => LogicalKey::Character(','),
-        VK_OEM_MINUS => LogicalKey::Character('-'),
-        VK_OEM_PERIOD => LogicalKey::Character('.'),
-        VK_OEM_SLASH => LogicalKey::Character('/'),
-        VK_OEM_BACKTICK => LogicalKey::Character('`'),
-        VK_OEM_LEFT_BRACKET => LogicalKey::Character('['),
-        VK_OEM_BACKSLASH => LogicalKey::Character('\\'),
-        VK_OEM_RIGHT_BRACKET => LogicalKey::Character(']'),
-        VK_OEM_QUOTE => LogicalKey::Character('\''),
-        value @ 0x30..=0x39 => LogicalKey::Character((value as u8) as char),
-        value @ 0x41..=0x5a => LogicalKey::Character(((value as u8) + (b'a' - b'A')) as char),
-        _ => LogicalKey::Other,
+        value => crate::keys::logical_key_for_vk(value).unwrap_or(LogicalKey::Other),
     }
 }
 
 /// Reverse of [`logical_key`] for the keys a Prefix chord may use.
 ///
-/// Returns `None` for keys that cannot be injected (modifiers, Escape, and
-/// layout-specific keys) so callers fail closed instead of guessing.
+/// Returns `None` for keys without an injectable virtual key in the
+/// canonical table: Escape (recognized for cancellation but rejected by
+/// configuration), modifiers, [`LogicalKey::Other`], characters outside the
+/// US-layout table, and out-of-range function keys. Callers fail closed
+/// instead of guessing.
 pub(super) fn virtual_key_for_logical_key(key: LogicalKey) -> Option<u16> {
-    Some(match key {
-        LogicalKey::Character(' ') => VK_SPACE as u16,
-        LogicalKey::Character(character @ 'a'..='z') => u16::from(character as u8 - b'a' + b'A'),
-        LogicalKey::Character(character @ '0'..='9') => u16::from(character as u8),
-        LogicalKey::Character(';') => VK_OEM_SEMICOLON as u16,
-        LogicalKey::Character('=') => VK_OEM_EQUALS as u16,
-        LogicalKey::Character(',') => VK_OEM_COMMA as u16,
-        LogicalKey::Character('-') => VK_OEM_MINUS as u16,
-        LogicalKey::Character('.') => VK_OEM_PERIOD as u16,
-        LogicalKey::Character('/') => VK_OEM_SLASH as u16,
-        LogicalKey::Character('`') => VK_OEM_BACKTICK as u16,
-        LogicalKey::Character('[') => VK_OEM_LEFT_BRACKET as u16,
-        LogicalKey::Character('\\') => VK_OEM_BACKSLASH as u16,
-        LogicalKey::Character(']') => VK_OEM_RIGHT_BRACKET as u16,
-        LogicalKey::Character('\'') => VK_OEM_QUOTE as u16,
-        LogicalKey::Arrow(Direction::Left) => VK_LEFT as u16,
-        LogicalKey::Arrow(Direction::Right) => VK_RIGHT as u16,
-        LogicalKey::Arrow(Direction::Up) => VK_UP as u16,
-        LogicalKey::Arrow(Direction::Down) => VK_DOWN as u16,
-        LogicalKey::Tab => VK_TAB as u16,
-        LogicalKey::Function(number @ 1..=12) => VK_F1 as u16 + u16::from(number) - 1,
-        _ => return None,
-    })
+    crate::keys::virtual_key_for_logical_key(key)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keys::{VK_ESCAPE, VK_F12, VK_LEFT, VK_OEM_COMMA, VK_SPACE};
+    use crate::model::Direction;
 
     fn raw(virtual_key: u32, transition: RawTransition) -> RawKeyEvent {
         RawKeyEvent {
@@ -337,5 +282,39 @@ mod tests {
         );
         assert_eq!(virtual_key_for_logical_key(LogicalKey::Escape), None);
         assert_eq!(virtual_key_for_logical_key(LogicalKey::Modifier), None);
+    }
+
+    /// Every canonical table row with a virtual key forms an inverse pair:
+    /// forward(VK) resolves to the row's logical key and reverse maps that
+    /// logical key back to the same VK.
+    #[test]
+    fn canonical_table_forward_and_reverse_maps_are_inverse() {
+        for row in crate::keys::KEY_DEFS {
+            let Some(virtual_key) = row.vk else {
+                continue;
+            };
+            assert_eq!(
+                logical_key(u32::from(virtual_key)),
+                row.key,
+                "forward map for {virtual_key:#x}"
+            );
+            assert_eq!(
+                virtual_key_for_logical_key(row.key),
+                Some(virtual_key),
+                "reverse map for {:?}",
+                row.key
+            );
+        }
+    }
+
+    /// The documented non-injectable exception: Escape is recognized for
+    /// prefix cancellation but can never be injected, and unmapped keys
+    /// normalize to `Other` instead of a phantom logical key.
+    #[test]
+    fn escape_is_recognized_but_never_injectable() {
+        assert_eq!(logical_key(VK_ESCAPE), LogicalKey::Escape);
+        assert_eq!(virtual_key_for_logical_key(LogicalKey::Escape), None);
+        assert_eq!(logical_key(0x0d), LogicalKey::Other);
+        assert_eq!(logical_key(0x1_0000), LogicalKey::Other);
     }
 }

@@ -145,6 +145,11 @@ pub(crate) fn remove_manifest_if_unchanged(
         return Ok(false);
     };
     if snapshot.sha256 != expected_sha256 {
+        // A hash mismatch means another actor edited the manifest between load
+        // and removal: the same concurrent-user-edit situation as the
+        // compare-and-swap check in `transaction.rs`, so this stays a
+        // user-resolvable `SettingsConflict` (the file is retained for
+        // inspection) instead of `OperationIncomplete`.
         return Err(AppError::SettingsConflict(format!(
             "{} changed during uninstall; it was retained",
             path.display()

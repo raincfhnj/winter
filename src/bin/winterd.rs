@@ -7,6 +7,9 @@ use std::panic::{Location, PanicHookInfo};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use clap::Parser;
+use clap::error::{Error as ClapError, ErrorKind};
+
 use winterminalp::integration::{IntegrationConfig, doctor};
 use winterminalp::platform::windows::{launch_windows_terminal, relaunch_current_process_elevated};
 use winterminalp::{
@@ -20,7 +23,11 @@ const FALLBACK_ERROR_FILE: &str = "winterminalp-last-error.log";
 
 fn main() -> ExitCode {
     install_panic_hook();
-    match execute() {
+    let cli = match DaemonCli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => return handle_clap_error(error),
+    };
+    match execute(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             write_last_error(&error);
@@ -29,12 +36,10 @@ fn main() -> ExitCode {
     }
 }
 
-fn execute() -> AppResult<()> {
-    let launch_mode = parse_launch_mode()?;
+fn execute(cli: DaemonCli) -> AppResult<()> {
+    let launch_mode = cli.launch_mode()?;
     let elevation_arguments = launch_mode.elevation_arguments();
-    if relaunch_current_process_elevated(elevation_arguments)
-        .map_err(|error| AppError::Native(error.to_string()))?
-    {
+    if relaunch_current_process_elevated(elevation_arguments).map_err(AppError::platform)? {
         return Ok(());
     }
     let integration = IntegrationConfig::from_environment()?;
@@ -59,8 +64,7 @@ fn execute() -> AppResult<()> {
 
     match result {
         Err(AppError::ControllerAlreadyRunning) if should_launch => {
-            let _child =
-                launch_windows_terminal().map_err(|error| AppError::Native(error.to_string()))?;
+            let _child = launch_windows_terminal().map_err(AppError::platform)?;
             Ok(())
         }
         Err(AppError::ControllerAlreadyRunning) => Ok(()),
@@ -93,25 +97,69 @@ impl DaemonLaunchMode {
     }
 }
 
-fn parse_launch_mode() -> AppResult<DaemonLaunchMode> {
-    let mut launch_mode = DaemonLaunchMode::Config;
-    for argument in env::args_os().skip(1) {
-        match argument.to_string_lossy().as_ref() {
-            "--launch" if launch_mode == DaemonLaunchMode::Config => {
-                launch_mode = DaemonLaunchMode::Force;
-            }
-            "--no-launch" if launch_mode == DaemonLaunchMode::Config => {
-                launch_mode = DaemonLaunchMode::Suppress;
-            }
-            _ => {
-                return Err(AppError::InvalidConfiguration(format!(
-                    "unknown or conflicting daemon argument: {}",
-                    argument.to_string_lossy()
-                )));
-            }
+/// Command line surface of the hidden `winterd` daemon.
+///
+/// The daemon is started with no arguments (double-click), with `--launch`
+/// (spawned by `winter launch` and by the daemon's own UAC relaunch), or
+/// with `--no-launch` (elevated suppression). Every other input is rejected
+/// before the controller runs. `--help`/`-V` succeed and print to stdout so
+/// typos stay distinguishable from valid modes without a console.
+#[derive(Debug, Parser)]
+#[command(name = "winterd", version, arg_required_else_help = false)]
+struct DaemonCli {
+    /// Open Windows Terminal on start regardless of the configured value.
+    #[arg(long, action = clap::ArgAction::Count)]
+    launch: u8,
+    /// Keep Windows Terminal closed on start regardless of the configured value.
+    #[arg(long, action = clap::ArgAction::Count)]
+    no_launch: u8,
+}
+
+impl DaemonCli {
+    /// Maps the parsed flags onto the daemon launch mode.
+    ///
+    /// Reproduces the pre-clap hand parser exactly: no flags resolve to the
+    /// configured default, a single flag forces or suppresses the launch,
+    /// and a repeated or combined flag is rejected as conflicting.
+    fn launch_mode(&self) -> AppResult<DaemonLaunchMode> {
+        match (self.launch, self.no_launch) {
+            (0, 0) => Ok(DaemonLaunchMode::Config),
+            (1, 0) => Ok(DaemonLaunchMode::Force),
+            (0, 1) => Ok(DaemonLaunchMode::Suppress),
+            _ => Err(AppError::InvalidConfiguration(
+                "unknown or conflicting daemon argument: --launch/--no-launch".to_owned(),
+            )),
         }
     }
-    Ok(launch_mode)
+}
+
+/// Maps a failed clap parse onto the daemon's exit contract.
+///
+/// Help and version requests print to stdout — invisible for a
+/// double-clicked GUI-subsystem binary, but harmless — and exit 0. Every
+/// other parse failure is written to `last-error.log` and exits 1: the
+/// daemon has no console for clap's default stderr message and exit code 2,
+/// and the pre-clap hand parser logged invalid arguments the same way.
+fn handle_clap_error(error: ClapError) -> ExitCode {
+    if is_informational(error.kind()) {
+        let _ = error.print();
+        return ExitCode::SUCCESS;
+    }
+    let rendered = error.render();
+    write_last_error(&AppError::InvalidConfiguration(format!(
+        "invalid daemon arguments: {rendered}"
+    )));
+    ExitCode::FAILURE
+}
+
+/// Reports whether a clap error is a successful help or version request.
+const fn is_informational(kind: ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::DisplayHelp
+            | ErrorKind::DisplayVersion
+            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+    )
 }
 
 /// Installs the panic hook used for the whole daemon lifetime.
@@ -228,9 +276,12 @@ mod tests {
     use std::panic::Location;
     use std::path::PathBuf;
 
+    use clap::Parser;
+    use clap::error::ErrorKind;
+
     use super::{
-        DaemonLaunchMode, FALLBACK_ERROR_FILE, LAST_ERROR_FILE, error_log_paths, format_panic,
-        panic_description, write_message_to_paths,
+        DaemonCli, DaemonLaunchMode, FALLBACK_ERROR_FILE, LAST_ERROR_FILE, error_log_paths,
+        format_panic, is_informational, panic_description, write_message_to_paths,
     };
 
     #[test]
@@ -239,6 +290,56 @@ mod tests {
         assert!(!DaemonLaunchMode::Config.should_launch(false));
         assert!(DaemonLaunchMode::Force.should_launch(false));
         assert!(!DaemonLaunchMode::Suppress.should_launch(true));
+    }
+
+    #[test]
+    fn no_arguments_resolve_to_config_launch_mode() {
+        let cli = DaemonCli::try_parse_from(["winterd"]).unwrap();
+        assert_eq!(cli.launch_mode().unwrap(), DaemonLaunchMode::Config);
+    }
+
+    #[test]
+    fn launch_flag_forces_terminal_launch() {
+        let cli = DaemonCli::try_parse_from(["winterd", "--launch"]).unwrap();
+        assert_eq!(cli.launch_mode().unwrap(), DaemonLaunchMode::Force);
+    }
+
+    #[test]
+    fn no_launch_flag_suppresses_terminal_launch() {
+        let cli = DaemonCli::try_parse_from(["winterd", "--no-launch"]).unwrap();
+        assert_eq!(cli.launch_mode().unwrap(), DaemonLaunchMode::Suppress);
+    }
+
+    #[test]
+    fn unknown_arguments_are_rejected_before_execution() {
+        let unknown = DaemonCli::try_parse_from(["winterd", "--lanch"]).unwrap_err();
+        assert_eq!(unknown.kind(), ErrorKind::UnknownArgument);
+        assert!(!is_informational(unknown.kind()));
+        // `run` belongs to `winter`, never to `winterd`.
+        let run_style = DaemonCli::try_parse_from(["winterd", "run", "--no-launch"]).unwrap_err();
+        assert!(!is_informational(run_style.kind()));
+    }
+
+    #[test]
+    fn repeated_or_conflicting_flags_are_rejected() {
+        let both = DaemonCli::try_parse_from(["winterd", "--launch", "--no-launch"]).unwrap();
+        assert!(both.launch_mode().is_err());
+        let repeated_force =
+            DaemonCli::try_parse_from(["winterd", "--launch", "--launch"]).unwrap();
+        assert!(repeated_force.launch_mode().is_err());
+        let repeated_suppress =
+            DaemonCli::try_parse_from(["winterd", "--no-launch", "--no-launch"]).unwrap();
+        assert!(repeated_suppress.launch_mode().is_err());
+    }
+
+    #[test]
+    fn help_and_version_exit_successfully_as_informational_requests() {
+        let help = DaemonCli::try_parse_from(["winterd", "--help"]).unwrap_err();
+        assert_eq!(help.kind(), ErrorKind::DisplayHelp);
+        assert!(is_informational(help.kind()));
+        let version = DaemonCli::try_parse_from(["winterd", "-V"]).unwrap_err();
+        assert_eq!(version.kind(), ErrorKind::DisplayVersion);
+        assert!(is_informational(version.kind()));
     }
 
     #[test]

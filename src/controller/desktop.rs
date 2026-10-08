@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use crate::config::MouseResizeConfig;
 use crate::model::WindowIdentity;
 use crate::pane_layout::PaneLayout;
-use crate::platform::windows::{TerminalAccessibility, foreground_hwnd, terminal_window_identity};
+use crate::platform::windows::{
+    PlatformError, TerminalAccessibility, foreground_hwnd, terminal_window_identity,
+};
 use crate::{AppError, AppResult};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -72,7 +74,10 @@ impl DesktopCache {
             }),
             Ok(Err(error)) => {
                 let _ = join.join();
-                Err(AppError::Native(error))
+                Err(AppError::Platform {
+                    source: error,
+                    context: " (while starting the pane geometry observer)".to_owned(),
+                })
             }
             Err(_) => {
                 let _ = join.join();
@@ -122,15 +127,13 @@ fn run_observer(
     last_pane_geometry_error: Arc<RwLock<Option<String>>>,
     foreground_poll_interval: Duration,
     mouse_resize: MouseResizeConfig,
-    ready_sender: mpsc::SyncSender<Result<(), String>>,
+    ready_sender: mpsc::SyncSender<Result<(), PlatformError>>,
 ) {
     let accessibility = if mouse_resize.enabled {
         match TerminalAccessibility::initialize() {
             Ok(accessibility) => Some(accessibility),
             Err(error) => {
-                let _ = ready_sender.send(Err(format!(
-                    "failed to initialize pane geometry observer: {error}"
-                )));
+                let _ = ready_sender.send(Err(error));
                 return;
             }
         }

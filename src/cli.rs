@@ -307,8 +307,7 @@ fn spawn_background_controller() -> AppResult<()> {
 }
 
 fn relaunch_controller_elevated(arguments: &[&str]) -> AppResult<bool> {
-    relaunch_current_process_elevated(arguments)
-        .map_err(|error| AppError::Native(error.to_string()))
+    relaunch_current_process_elevated(arguments).map_err(AppError::platform)
 }
 
 fn print_json(value: &impl Serialize) -> AppResult<()> {

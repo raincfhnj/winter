@@ -3,7 +3,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::model::{Direction, TerminalAction};
+use crate::model::TerminalAction;
+use crate::registry;
 
 const ACTION_ID_PREFIX: &str = "User.WinTerminalP.";
 
@@ -115,184 +116,11 @@ impl ManagedBinding {
     }
 }
 
-const fn chord(ctrl: bool, alt: bool, shift: bool, function_key: u8) -> BridgeChord {
-    BridgeChord::new(ctrl, alt, shift, function_key)
-}
-
-const MANAGED_BINDINGS: [ManagedBinding; 29] = [
-    ManagedBinding {
-        action: TerminalAction::SplitPane {
-            direction: Direction::Left,
-        },
-        action_id: "User.WinTerminalP.SplitLeft",
-        bridge_chord: chord(true, true, true, 13),
-    },
-    ManagedBinding {
-        action: TerminalAction::SplitPane {
-            direction: Direction::Right,
-        },
-        action_id: "User.WinTerminalP.SplitRight",
-        bridge_chord: chord(true, true, true, 14),
-    },
-    ManagedBinding {
-        action: TerminalAction::SplitPane {
-            direction: Direction::Up,
-        },
-        action_id: "User.WinTerminalP.SplitUp",
-        bridge_chord: chord(true, true, true, 15),
-    },
-    ManagedBinding {
-        action: TerminalAction::SplitPane {
-            direction: Direction::Down,
-        },
-        action_id: "User.WinTerminalP.SplitDown",
-        bridge_chord: chord(true, true, true, 18),
-    },
-    ManagedBinding {
-        action: TerminalAction::FocusPane {
-            direction: Direction::Left,
-        },
-        action_id: "User.WinTerminalP.FocusLeft",
-        bridge_chord: chord(true, true, true, 19),
-    },
-    ManagedBinding {
-        action: TerminalAction::FocusPane {
-            direction: Direction::Right,
-        },
-        action_id: "User.WinTerminalP.FocusRight",
-        bridge_chord: chord(true, true, true, 20),
-    },
-    ManagedBinding {
-        action: TerminalAction::FocusPane {
-            direction: Direction::Up,
-        },
-        action_id: "User.WinTerminalP.FocusUp",
-        bridge_chord: chord(true, true, true, 21),
-    },
-    ManagedBinding {
-        action: TerminalAction::FocusPane {
-            direction: Direction::Down,
-        },
-        action_id: "User.WinTerminalP.FocusDown",
-        bridge_chord: chord(true, true, true, 22),
-    },
-    ManagedBinding {
-        action: TerminalAction::ResizePane {
-            direction: Direction::Left,
-        },
-        action_id: "User.WinTerminalP.ResizeLeft",
-        bridge_chord: chord(true, true, true, 23),
-    },
-    ManagedBinding {
-        action: TerminalAction::ResizePane {
-            direction: Direction::Right,
-        },
-        action_id: "User.WinTerminalP.ResizeRight",
-        bridge_chord: chord(true, true, true, 24),
-    },
-    ManagedBinding {
-        action: TerminalAction::ResizePane {
-            direction: Direction::Up,
-        },
-        action_id: "User.WinTerminalP.ResizeUp",
-        bridge_chord: chord(true, false, true, 13),
-    },
-    ManagedBinding {
-        action: TerminalAction::ResizePane {
-            direction: Direction::Down,
-        },
-        action_id: "User.WinTerminalP.ResizeDown",
-        bridge_chord: chord(true, false, true, 14),
-    },
-    // The controller now injects the configured Prefix directly, so this static
-    // action and chord are never dispatched. They are retained so existing
-    // installs keep a valid action reference and their managed count stays put.
-    ManagedBinding {
-        action: TerminalAction::SendPrefixLiteral,
-        action_id: "User.WinTerminalP.SendPrefixLiteral",
-        bridge_chord: chord(true, false, true, 15),
-    },
-    ManagedBinding {
-        action: TerminalAction::NewTab,
-        action_id: "User.WinTerminalP.NewTab",
-        bridge_chord: chord(true, false, true, 18),
-    },
-    ManagedBinding {
-        action: TerminalAction::NextTab,
-        action_id: "User.WinTerminalP.NextTab",
-        bridge_chord: chord(true, false, true, 19),
-    },
-    ManagedBinding {
-        action: TerminalAction::PreviousTab,
-        action_id: "User.WinTerminalP.PreviousTab",
-        bridge_chord: chord(true, false, true, 20),
-    },
-    ManagedBinding {
-        action: TerminalAction::ActivateTab { index: 0 },
-        action_id: "User.WinTerminalP.ActivateTab0",
-        bridge_chord: chord(true, false, true, 21),
-    },
-    ManagedBinding {
-        action: TerminalAction::ActivateTab { index: 1 },
-        action_id: "User.WinTerminalP.ActivateTab1",
-        bridge_chord: chord(true, false, true, 22),
-    },
-    ManagedBinding {
-        action: TerminalAction::ActivateTab { index: 2 },
-        action_id: "User.WinTerminalP.ActivateTab2",
-        bridge_chord: chord(true, false, true, 23),
-    },
-    ManagedBinding {
-        action: TerminalAction::ActivateTab { index: 3 },
-        action_id: "User.WinTerminalP.ActivateTab3",
-        bridge_chord: chord(true, false, true, 24),
-    },
-    ManagedBinding {
-        action: TerminalAction::ActivateTab { index: 4 },
-        action_id: "User.WinTerminalP.ActivateTab4",
-        bridge_chord: chord(false, true, true, 13),
-    },
-    ManagedBinding {
-        action: TerminalAction::ActivateTab { index: 5 },
-        action_id: "User.WinTerminalP.ActivateTab5",
-        bridge_chord: chord(false, true, true, 14),
-    },
-    ManagedBinding {
-        action: TerminalAction::ActivateTab { index: 6 },
-        action_id: "User.WinTerminalP.ActivateTab6",
-        bridge_chord: chord(false, true, true, 15),
-    },
-    ManagedBinding {
-        action: TerminalAction::ActivateTab { index: 7 },
-        action_id: "User.WinTerminalP.ActivateTab7",
-        bridge_chord: chord(false, true, true, 18),
-    },
-    ManagedBinding {
-        action: TerminalAction::ActivateTab { index: 8 },
-        action_id: "User.WinTerminalP.ActivateTab8",
-        bridge_chord: chord(false, true, true, 19),
-    },
-    ManagedBinding {
-        action: TerminalAction::ActivateTab { index: 9 },
-        action_id: "User.WinTerminalP.ActivateTab9",
-        bridge_chord: chord(false, true, true, 20),
-    },
-    ManagedBinding {
-        action: TerminalAction::ClosePane,
-        action_id: "User.WinTerminalP.ClosePane",
-        bridge_chord: chord(false, true, true, 21),
-    },
-    ManagedBinding {
-        action: TerminalAction::TogglePaneZoom,
-        action_id: "User.WinTerminalP.TogglePaneZoom",
-        bridge_chord: chord(false, true, true, 22),
-    },
-    ManagedBinding {
-        action: TerminalAction::RenameTab,
-        action_id: "User.WinTerminalP.RenameTab",
-        bridge_chord: chord(false, true, true, 23),
-    },
-];
+/// Managed bindings derived from the canonical action registry at compile
+/// time. The registry order is preserved verbatim so installed fragments and
+/// keybindings stay byte-identical across releases.
+static MANAGED_BINDINGS: [ManagedBinding; registry::MANAGED_COUNT] =
+    registry::build_managed_bindings();
 
 #[must_use]
 pub fn managed_bindings() -> &'static [ManagedBinding] {
@@ -316,10 +144,11 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+    use crate::model::Direction;
 
     #[test]
     fn managed_table_is_complete_and_unique() {
-        assert_eq!(managed_bindings().len(), 29);
+        assert_eq!(managed_bindings().len(), registry::MANAGED_COUNT);
 
         let actions = managed_bindings()
             .iter()
@@ -334,9 +163,9 @@ mod tests {
             .map(|binding| binding.bridge_chord)
             .collect::<HashSet<_>>();
 
-        assert_eq!(actions.len(), 29);
-        assert_eq!(ids.len(), 29);
-        assert_eq!(chords.len(), 29);
+        assert_eq!(actions.len(), registry::MANAGED_COUNT);
+        assert_eq!(ids.len(), registry::MANAGED_COUNT);
+        assert_eq!(chords.len(), registry::MANAGED_COUNT);
         assert!(
             managed_bindings()
                 .iter()

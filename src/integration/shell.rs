@@ -342,8 +342,10 @@ fn decode_profile(path: &Path, bytes: &[u8]) -> AppResult<(ProfileEncoding, Stri
             });
         }
         let units = content
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
             .collect::<Vec<_>>();
         let text = String::from_utf16(&units).map_err(|_| AppError::Settings {
             path: path.to_path_buf(),
@@ -572,8 +574,10 @@ mod tests {
         assert_eq!(&written[..2], &[0xff, 0xfe]);
         let text = String::from_utf16(
             &written[2..]
-                .chunks_exact(2)
-                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u16::from_le_bytes(*pair))
                 .collect::<Vec<_>>(),
         )
         .expect("utf16 profile should decode");

@@ -80,7 +80,7 @@ pub(super) fn prepare_fragment(
         Some(_) => (
             ChangeStatus::Conflict,
             Some(format!(
-                "{} already exists but is not the fragment recorded by WinTerminalP",
+                "{} already exists but is not the fragment recorded by Winter",
                 path.display()
             )),
         ),

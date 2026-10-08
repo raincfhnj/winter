@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: Security report
-    url: https://github.com/raincfhnj/winterminalp/security/advisories/new
+    url: https://github.com/raincfhnj/winter/security/advisories/new
     about: Please report security vulnerabilities privately, not as public issues.
   - name: Documentation
-    url: https://github.com/raincfhnj/winterminalp/tree/master/docs
+    url: https://github.com/raincfhnj/winter/tree/master/docs
     about: Read the architecture, testing, and shortcut documentation before filing.

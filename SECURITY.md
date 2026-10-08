@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-WinTerminalP is pre-1.0. Security fixes are applied to the latest release on the
+Winter is pre-1.0. Security fixes are applied to the latest release on the
 `master` branch.
 
 | Version | Supported |
@@ -15,7 +15,7 @@ WinTerminalP is pre-1.0. Security fixes are applied to the latest release on the
 Please **do not** open a public issue for security problems.
 
 Report privately through GitHub's
-[private vulnerability reporting](https://github.com/raincfhnj/winterminalp/security/advisories/new)
+[private vulnerability reporting](https://github.com/raincfhnj/winter/security/advisories/new)
 (Security tab → Report a vulnerability). Include:
 
 - A description of the issue and its impact.
@@ -28,7 +28,7 @@ to ship a fix before public disclosure.
 
 ## Threat model and scope
 
-WinTerminalP installs a global low-level keyboard and mouse hook and runs elevated, so
+Winter installs a global low-level keyboard and mouse hook and runs elevated, so
 the following are in scope:
 
 - Unintended interception, logging, or transmission of keystrokes or pointer data.
@@ -44,9 +44,9 @@ The following are **not** treated as vulnerabilities by themselves:
 - The controller must run elevated to control an elevated Windows Terminal; this is
   documented and intentional.
 - Physical access to an already-compromised elevated desktop.
-- Windows Terminal or Shell behavior outside WinTerminalP's control.
+- Windows Terminal or Shell behavior outside Winter's control.
 
 ## Privacy
 
-WinTerminalP does not collect telemetry, open network ports, or store terminal content
+Winter does not collect telemetry, open network ports, or store terminal content
 or keystroke history. If you find any code that contradicts this, please report it.

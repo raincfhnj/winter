@@ -76,7 +76,7 @@ pub(super) fn rollback_install(applied: &mut Vec<UndoOperation>) -> AppResult<()
                 Ok(true) => Ok(()),
                 Ok(false) if !path.exists() => Ok(()),
                 Ok(false) => Err(AppError::SettingsConflict(format!(
-                    "{} changed after WinTerminalP created it; user bytes were preserved",
+                    "{} changed after Winter created it; user bytes were preserved",
                     path.display()
                 ))),
                 Err(error) => Err(error),

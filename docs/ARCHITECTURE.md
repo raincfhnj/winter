@@ -1,8 +1,8 @@
-# WinTerminalP v0.2 架构
+# Winter v0.2 架构
 
 ## 1. 架构结论
 
-WinTerminalP 是 Windows Terminal 的无界面输入增强层，不是终端模拟器。
+Winter 是 Windows Terminal 的无界面输入增强层，不是终端模拟器。
 
 - Windows Terminal：唯一 UI、终端渲染、窗格树、标签页和 Shell 生命周期权威。
 - Rust Prefix Core：两段式快捷键状态权威。
@@ -118,6 +118,8 @@ Bridge 分两层：
 1. `%LOCALAPPDATA%\Microsoft\Windows Terminal\Fragments\WinTerminalP\actions.json` 提供命名 Action。
 2. 每个 Terminal 通道的用户 `settings.json` 只绑定产品隐藏 chord 到这些 Action ID。
 
+> 说明：`WinTerminalP`（配置路径、Action ID、fragment 目录、Shell 标记）是历史集成名，为安装兼容性保留。
+
 桥接表使用 F13、F14、F15、F18–F24 的三组修饰键组合。F16/F17 已在 Stable 1.24 真实输入链路中判定为不可靠并由单元测试禁止重新进入托管表。`send_prefix_literal` 是唯一例外：控制器按当前配置的 Prefix 直接注入对应 chord，不经过静态桥接，因此自定义 Prefix 无需重新安装桥接。
 
 两张表不再靠手工同步：`src/registry.rs` 的 `ACTIONS` 是唯一动作注册表，`keymap::MANAGED_BINDINGS`（29 条托管绑定，保持注册表顺序以保证已安装 fragment/keybindings 字节稳定）与 `prefix::SHORTCUT_SPECS`（30 条快捷键规格，按 `SPEC_ORDER` 置换为用户可见顺序）都在编译期由注册表派生；模块底部的 `const` 断言在编译期拒绝重复或不完整的注册表。引入新的 `TerminalAction` 只需在注册表加一条记录。
@@ -226,5 +228,5 @@ Windows Terminal 只有在 Shell 通过 `OSC 9;9` 报告 CWD 时，才会让 `sp
 - UI Automation 只暴露可见 `TermControl` 的屏幕矩形，不暴露真实 pane tree；因此拖动以可见相邻矩形推导分隔线，并使用 Terminal 原生约 5% 父区域步长，而不是像素级重排。
 - SendInput 在重验目标和实际输入之间存在不可完全消除的微小竞争窗口。
 - 控制器只能提供 tmux 风格操作，不提供 tmux 的后台 session server。
-- 当前目录复制由 Windows Terminal 的 `duplicate` 语义加 Shell Integration 提供；WinTerminalP 只负责安装受管的 `OSC 9;9` 提示符包装，Shell 不加载 Profile 时仍回退到 Windows Terminal 默认目录。
+- 当前目录复制由 Windows Terminal 的 `duplicate` 语义加 Shell Integration 提供；Winter 只负责安装受管的 `OSC 9;9` 提示符包装，Shell 不加载 Profile 时仍回退到 Windows Terminal 默认目录。
 - Windows Terminal 不公开 Action 执行回执或 pane tree 查询；`SendInput` 成功只证明事件已插入，不能单独证明布局已改变。

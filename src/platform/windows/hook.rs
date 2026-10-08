@@ -139,7 +139,7 @@ impl InputHook {
         let thread_health = Arc::clone(&health);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let join = thread::Builder::new()
-            .name("winterminalp-input-hook".to_owned())
+            .name("winter-input-hook".to_owned())
             .spawn(move || hook_thread_main(handler, include_mouse, thread_health, ready_tx))
             .map_err(|source| PlatformError::HookThreadSpawn { source })?;
 

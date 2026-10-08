@@ -118,6 +118,24 @@ impl PaneDivider {
         self.axis
     }
 
+    /// Screen coordinate of the divider line on its own axis.
+    #[must_use]
+    pub const fn coordinate(&self) -> i32 {
+        self.coordinate
+    }
+
+    /// Start of the divider span on the axis it does not lie on.
+    #[must_use]
+    pub const fn span_start(&self) -> i32 {
+        self.span_start
+    }
+
+    /// End of the divider span on the axis it does not lie on.
+    #[must_use]
+    pub const fn span_end(&self) -> i32 {
+        self.span_end
+    }
+
     #[must_use]
     pub const fn native_step_pixels(&self) -> i32 {
         self.native_step_pixels

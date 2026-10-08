@@ -9,7 +9,7 @@ use crate::registry;
 
 const ACTION_ID_PREFIX: &str = "User.WinTerminalP.";
 
-/// A synthetic function-key chord managed by WinTerminalP.
+/// A synthetic function-key chord managed by Winter.
 ///
 /// Managed chords deliberately use synthetic high function keys so they do not
 /// overlap with the product's user-facing prefix bindings. F16 and F17 are

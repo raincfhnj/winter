@@ -97,7 +97,7 @@ pub enum PlatformError {
         os_error: u32,
     },
 
-    #[error("another WinTerminalP controller instance is already running")]
+    #[error("another Winter controller instance is already running")]
     AlreadyRunning,
 
     #[error("invalid named mutex: {0}")]

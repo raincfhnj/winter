@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a reproducible problem with WinTerminalP
+description: Report a reproducible problem with Winter
 title: "[Bug]: "
 labels: ["bug", "needs-triage"]
 body:
@@ -21,7 +21,7 @@ body:
   - type: input
     id: version
     attributes:
-      label: WinTerminalP version
+      label: Winter version
       description: Output of `winter --version` or the release you installed.
       placeholder: "0.2.0"
     validations:

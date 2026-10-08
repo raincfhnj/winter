@@ -11,7 +11,7 @@ use crate::integration::{DoctorReport, IntegrationConfig, doctor, install, plan,
 use crate::platform::windows::relaunch_current_process_elevated;
 use crate::{
     AppError, AppResult, ControllerConfig, ControllerOptions, bridge_is_ready,
-    config::default_config_path, run_controller,
+    config::default_config_path, dashboard::dashboard_path, run_controller, ui,
 };
 
 #[derive(Debug, Parser)]
@@ -41,7 +41,7 @@ enum CliCommand {
     Plan,
     /// Install the managed action fragment and hidden bridge keybindings.
     Install,
-    /// Remove only integration entries still owned by WinTerminalP.
+    /// Remove only integration entries still owned by Winter.
     Uninstall,
     /// Diagnose the current Windows Terminal integration.
     ///
@@ -55,6 +55,14 @@ enum CliCommand {
     },
     /// Start a background controller and open native Windows Terminal.
     Launch,
+    /// Show a live dashboard of panes, focus, and prefix state in this terminal
+    Ui {
+        #[arg(long)]
+        once: bool,
+        /// State file override (testing)
+        #[arg(long, hide = true)]
+        path: Option<PathBuf>,
+    },
 }
 
 /// Parses `args` using `bin_name` for usage text and runs the selected command.
@@ -77,6 +85,13 @@ fn execute(cli: Cli) -> AppResult<ExitCode> {
     let command = cli.command.unwrap_or(CliCommand::Launch);
     if let CliCommand::Config { path_only, edit } = command {
         return configure(path_only, edit);
+    }
+    if let CliCommand::Ui { once, path } = &command {
+        let path = match path {
+            Some(path) => path.clone(),
+            None => dashboard_path()?,
+        };
+        return ui::run(ui::UiOptions { path, once: *once });
     }
 
     let integration = IntegrationConfig::from_environment()?;
@@ -108,6 +123,7 @@ fn execute(cli: Cli) -> AppResult<ExitCode> {
         CliCommand::Run { no_launch } => run_command(&integration, no_launch),
         CliCommand::Launch => launch(&integration),
         CliCommand::Config { .. } => unreachable!("config is handled before integration is loaded"),
+        CliCommand::Ui { .. } => unreachable!("ui is handled before integration is loaded"),
     }
 }
 
@@ -255,7 +271,7 @@ fn launch(integration: &IntegrationConfig) -> AppResult<ExitCode> {
     ensure_bridge_ready(integration)?;
 
     spawn_background_controller()?;
-    eprintln!("WinTerminalP elevated controller is starting; Windows Terminal will open elevated.");
+    eprintln!("Winter elevated controller is starting; Windows Terminal will open elevated.");
     Ok(ExitCode::SUCCESS)
 }
 

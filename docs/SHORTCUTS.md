@@ -1,4 +1,4 @@
-# WinTerminalP 快捷键
+# Winter 快捷键
 
 所有快捷键仅在 Windows Terminal 位于前台时生效。先按下并释放 `Ctrl+B`，再按第二个键。
 
@@ -15,7 +15,7 @@
 | `Z` | 放大或恢复活动窗格 |
 | `,` | 打开标签页重命名框 |
 | `B` | 向 Shell 发送原始 Prefix（默认 Ctrl+B；自定义 Prefix 时发送对应组合） |
-| `Q` | 退出 WinTerminalP 控制器，不关闭 Terminal |
+| `Q` | 退出 Winter 控制器，不关闭 Terminal |
 | `Escape` | 取消 Prefix |
 
 ## 鼠标调整窗格

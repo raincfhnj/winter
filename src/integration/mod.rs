@@ -1,7 +1,7 @@
 //! Safe Windows Terminal settings integration.
 //!
 //! Windows Terminal 1.21+ loads action definitions from a fragment, but ignores
-//! fragment key chords. WinTerminalP therefore installs commands in the fragment
+//! fragment key chords. Winter therefore installs commands in the fragment
 //! and losslessly merges only their synthetic bridge chords into each initialized
 //! channel's root `keybindings` array.
 
@@ -313,7 +313,7 @@ pub fn doctor(config: &IntegrationConfig) -> AppResult<DoctorReport> {
         fragment.report.status,
         ChangeStatus::Create | ChangeStatus::Update | ChangeStatus::Missing
     ) {
-        issues.push("WinTerminalP action fragment is missing or requires an update".to_owned());
+        issues.push("Winter action fragment is missing or requires an update".to_owned());
     }
     if targets.is_empty() {
         issues.push("no initialized Windows Terminal settings files were found".to_owned());

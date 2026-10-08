@@ -13,6 +13,7 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -177,4 +178,83 @@ fn version_exits_zero_and_prints_the_cargo_version() {
         // `env!("CARGO_PKG_VERSION")` is read from the same Cargo.toml the
         // clap `version` attribute embeds in the binary.
         .stdout(predicate::str::contains(env!("CARGO_PKG_VERSION")));
+}
+
+#[test]
+fn help_documents_the_ui_subcommand() {
+    Command::cargo_bin("winter")
+        .expect("winter binary should build")
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ui"))
+        .stdout(predicate::str::contains("live dashboard"));
+}
+
+#[test]
+fn ui_once_renders_a_fixture_dashboard() {
+    let temp = tempdir().expect("temporary directory should be created");
+    let fixture = temp.path().join("dashboard.json");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the clock must be past the Unix epoch")
+        .as_millis() as u64;
+    let state = serde_json::json!({
+        "schemaVersion": 1,
+        "updatedUnixMs": now,
+        "controllerRunning": true,
+        "prefixArmed": true,
+        "mouseResizeEnabled": false,
+        "terminalPresent": true,
+        "panes": [
+            { "x": 0, "y": 0, "width": 40, "height": 12, "focused": true },
+            { "x": 40, "y": 0, "width": 40, "height": 12, "focused": false },
+            { "x": 0, "y": 12, "width": 80, "height": 12, "focused": false }
+        ],
+        "dividers": []
+    });
+    fs::write(
+        &fixture,
+        serde_json::to_vec(&state).expect("fixture dashboard should serialize"),
+    )
+    .expect("fixture dashboard should be written");
+
+    let assert = Command::cargo_bin("winter")
+        .expect("winter binary should build")
+        .args(["ui", "--once", "--path"])
+        .arg(&fixture)
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    assert!(stdout.contains("winter ui"), "missing header: {stdout}");
+    assert!(stdout.contains("3 panes"), "missing pane count: {stdout}");
+    assert!(
+        stdout.contains("prefix: ARMED"),
+        "missing prefix state: {stdout}"
+    );
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "--once must not emit ANSI sequences: {stdout:?}"
+    );
+}
+
+#[test]
+fn ui_once_reports_offline_for_a_missing_state_file() {
+    let temp = tempdir().expect("temporary directory should be created");
+    let missing = temp.path().join("dashboard.json");
+
+    let assert = Command::cargo_bin("winter")
+        .expect("winter binary should build")
+        .args(["ui", "--once", "--path"])
+        .arg(&missing)
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    assert!(
+        stdout.contains("CONTROLLER OFFLINE"),
+        "a missing state file must render the offline banner: {stdout}"
+    );
+    assert!(stdout.contains("winter ui"), "missing header: {stdout}");
 }

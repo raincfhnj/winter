@@ -10,16 +10,16 @@ use std::process::ExitCode;
 use clap::Parser;
 use clap::error::{Error as ClapError, ErrorKind};
 
-use winterminalp::integration::{IntegrationConfig, doctor};
-use winterminalp::platform::windows::{launch_windows_terminal, relaunch_current_process_elevated};
-use winterminalp::{
+use winter::integration::{IntegrationConfig, doctor};
+use winter::platform::windows::{launch_windows_terminal, relaunch_current_process_elevated};
+use winter::{
     AppError, AppResult, ControllerConfig, ControllerOptions, bridge_is_ready,
     config::{default_app_data_dir, default_config_path},
     run_controller,
 };
 
 const LAST_ERROR_FILE: &str = "last-error.log";
-const FALLBACK_ERROR_FILE: &str = "winterminalp-last-error.log";
+const FALLBACK_ERROR_FILE: &str = "winter-last-error.log";
 
 fn main() -> ExitCode {
     install_panic_hook();
@@ -345,7 +345,7 @@ mod tests {
     #[test]
     fn primary_dir_yields_app_data_log_before_temp_fallback() {
         let primary_dir = PathBuf::from(r"C:\invalid\readonly\WinTerminalP");
-        let fallback = PathBuf::from(r"C:\temp\winterminalp-last-error.log");
+        let fallback = PathBuf::from(r"C:\temp\winter-last-error.log");
         let [primary, chosen_fallback] =
             error_log_paths(Some(primary_dir.clone()), fallback.clone());
         assert_eq!(primary, primary_dir.join(LAST_ERROR_FILE));
@@ -355,7 +355,7 @@ mod tests {
 
     #[test]
     fn missing_primary_dir_falls_back_to_temp_path() {
-        let fallback = PathBuf::from(r"C:\temp\winterminalp-last-error.log");
+        let fallback = PathBuf::from(r"C:\temp\winter-last-error.log");
         let [primary, chosen_fallback] = error_log_paths(None, fallback.clone());
         assert_eq!(primary, fallback);
         assert_eq!(primary, chosen_fallback);

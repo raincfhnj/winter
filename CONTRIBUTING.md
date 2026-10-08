@@ -1,6 +1,6 @@
-# Contributing to WinTerminalP
+# Contributing to Winter
 
-Thanks for your interest in improving WinTerminalP. This document explains how to set
+Thanks for your interest in improving Winter. This document explains how to set
 up the project, run the quality gate, and submit changes.
 
 ## Prerequisites

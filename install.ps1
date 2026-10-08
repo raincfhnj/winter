@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    One-time setup for WinTerminalP.
+    One-time setup for Winter.
 
 .DESCRIPTION
     Builds the release binaries, installs the `winter` command into the Cargo
@@ -33,7 +33,7 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
 $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Push-Location $repoRoot
 try {
-    Write-Host 'Installing winter, winterminalp, and winterd (release build)...' -ForegroundColor Cyan
+    Write-Host 'Installing winter, winterminalp (compatibility alias), and winterd (release build)...' -ForegroundColor Cyan
     cargo install --path . --bins --locked --force
     if ($LASTEXITCODE -ne 0) {
         throw "cargo install failed with exit code $LASTEXITCODE"

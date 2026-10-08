@@ -1,15 +1,15 @@
-# WinTerminalP
+# Winter
 
-[![CI](https://github.com/raincfhnj/winterminalp/actions/workflows/ci.yml/badge.svg)](https://github.com/raincfhnj/winterminalp/actions/workflows/ci.yml)
+[![CI](https://github.com/raincfhnj/winter/actions/workflows/ci.yml/badge.svg)](https://github.com/raincfhnj/winter/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#许可证)
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 
-**给原生 Windows Terminal 加上 tmux 风格的键盘控制，而不是替代它。**
+**tmux 式键盘控制 Windows Terminal —— 无需替换它。**
 
-WinTerminalP 是一个常驻、无界面的 Rust 控制器，为你正在使用的 Windows Terminal
+Winter 是一个常驻、无界面的 Rust 控制器，为你正在使用的 Windows Terminal
 增加 tmux 式的两段式 Prefix（先按 `Ctrl+B`，再按第二个键）。它不绘制任何窗口、不内嵌
 终端、也不管理 PTY。Windows Terminal 仍然是唯一的界面、渲染器、窗格树、标签页和 Shell
-所有者；WinTerminalP 只负责把 Prefix 组合翻译成 Windows Terminal 原生动作。
+所有者；Winter 只负责把 Prefix 组合翻译成 Windows Terminal 原生动作。
 
 ```text
 Ctrl+B, Shift+Right   →  向右分屏
@@ -22,9 +22,11 @@ Ctrl+B, X / Z / ,     →  关闭窗格 / 放大 / 重命名标签页
 ## 为什么
 
 Windows Terminal 没有 tmux 式的 Prefix 模式，其 keybinding 也只能表达“修饰键 + 一个非
-修饰键”。WinTerminalP 运行一个很小的低级键盘 Hook，仅在 Windows Terminal 位于前台时
+修饰键”。Winter 运行一个很小的低级键盘 Hook，仅在 Windows Terminal 位于前台时
 识别 Prefix，然后注入一个隐藏的单组合桥接键，该键绑定到 `User.WinTerminalP.*` 动作。
 你的现有 Profile、主题、字体、Shell 和快捷键都不受影响。
+
+> 说明：动作 ID 与磁盘路径中的 `WinTerminalP` 是历史集成名，为安装兼容性保留。
 
 ## 功能
 
@@ -39,6 +41,10 @@ Windows Terminal 没有 tmux 式的 Prefix 模式，其 keybinding 也只能表�
 - **默认透明**：非 Terminal 前台应用的按键全部透传，注入输入永不激活 Prefix。
 - **无遥测**：不访问网络，不记录终端内容或按键。
 
+Winter 不止于 tmux 对等：规划方向包括窗格与标签页管理、工作区与类 session 能力、
+窗口导航和命令面板，并通过面向人类的 TUI 仪表盘（`winter ui`）呈现，而
+Agent 与自动化继续使用可脚本化的 CLI。
+
 ## 环境要求
 
 - Windows 10/11 x64
@@ -52,8 +58,8 @@ Windows Terminal 没有 tmux 式的 Prefix 模式，其 keybinding 也只能表�
 ## 快速开始
 
 ```powershell
-git clone https://github.com/raincfhnj/winterminalp.git
-cd winterminalp
+git clone https://github.com/raincfhnj/winter.git
+cd winter
 .\install.ps1   # 构建、把 winter 命令装进 PATH、并安装集成
 winter          # 启动控制器（会弹出 UAC 提权）
 ```
@@ -77,7 +83,7 @@ cargo build --release --bins
 | 二进制 | 用途 |
 |---|---|
 | `winter.exe` | 推荐命令入口 |
-| `winterminalp.exe` | 兼容别名，共用同一 CLI |
+| `winterminalp.exe` | Winter 的兼容别名，共用同一 CLI |
 | `winterd.exe` | 隐藏的后台控制器（可双击） |
 
 可直接运行 `target\release` 下的文件，或用
@@ -183,7 +189,7 @@ integration }`。
 target\release\winter.exe uninstall
 ```
 
-只移除仍属于 WinTerminalP 的 fragment、隐藏键位和 Shell 受管块。
+只移除仍属于 Winter 的 fragment、隐藏键位和 Shell 受管块。
 
 ## 工作原理
 

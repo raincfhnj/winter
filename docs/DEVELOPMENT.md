@@ -1,4 +1,4 @@
-# WinTerminalP 开发指南
+# Winter 开发指南
 
 ## 环境
 
@@ -52,7 +52,7 @@ cargo build --release --bins
 target\release\winterd.exe
 ```
 
-`winterd.exe` 可直接双击：集成已安装时，它在后台启动控制器并打开原生 Windows Terminal，不创建 WinTerminalP 界面。`winter.exe` 是推荐的短命令入口，`winterminalp.exe` 保留为兼容别名：
+`winterd.exe` 可直接双击：集成已安装时，它在后台启动控制器并打开原生 Windows Terminal，不创建 Winter 自己的界面。`winter.exe` 是推荐的短命令入口，`winterminalp.exe` 保留为 Winter 的兼容别名：
 
 ```powershell
 target\release\winter.exe

@@ -8,7 +8,7 @@ pub type AppResult<T> = Result<T, AppError>;
 
 #[derive(Debug, Error)]
 pub enum AppError {
-    #[error("WinTerminalP only supports Windows")]
+    #[error("Winter only supports Windows")]
     UnsupportedPlatform,
 
     #[error("invalid configuration: {0}")]
@@ -17,7 +17,7 @@ pub enum AppError {
     #[error("Windows Terminal is not installed or wt.exe is unavailable")]
     TerminalNotInstalled,
 
-    #[error("another WinTerminalP controller instance is already running")]
+    #[error("another Winter controller instance is already running")]
     ControllerAlreadyRunning,
 
     #[error("the controller must run elevated to control an elevated Windows Terminal")]

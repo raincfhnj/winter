@@ -1,15 +1,15 @@
-# WinTerminalP
+# Winter
 
-[![CI](https://github.com/raincfhnj/winterminalp/actions/workflows/ci.yml/badge.svg)](https://github.com/raincfhnj/winterminalp/actions/workflows/ci.yml)
+[![CI](https://github.com/raincfhnj/winter/actions/workflows/ci.yml/badge.svg)](https://github.com/raincfhnj/winter/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 
-**tmux-style keyboard control for the native Windows Terminal — without replacing it.**
+**tmux-style keyboard control for Windows Terminal — without replacing it.**
 
-WinTerminalP is a headless Rust controller that adds a tmux-like two-stage prefix
+Winter is a headless Rust controller that adds a tmux-like two-stage prefix
 (`Ctrl+B`, then a second key) to the Windows Terminal you already use. It never draws
 a window, never hosts a terminal, and never manages a PTY. Windows Terminal stays the
-only UI, renderer, pane tree, tab manager, and shell owner; WinTerminalP only turns
+only UI, renderer, pane tree, tab manager, and shell owner; Winter only turns
 prefix chords into native Windows Terminal actions.
 
 ```text
@@ -23,10 +23,13 @@ Ctrl+B, X / Z / ,     →  close pane / zoom / rename tab
 ## Why
 
 Windows Terminal has no tmux-style prefix mode, and its keybindings can only express
-"modifiers + one non-modifier key". WinTerminalP runs a small low-level keyboard hook
+"modifiers + one non-modifier key". Winter runs a small low-level keyboard hook
 that recognizes the prefix only while a Windows Terminal window is in the foreground,
 then injects a hidden single-chord bridge key that is bound to a `User.WinTerminalP.*`
 action. Your existing profiles, themes, fonts, shells, and keybindings are untouched.
+
+> Note: `WinTerminalP` in action ids and on-disk paths is the historical integration
+> name, kept for install compatibility.
 
 ## Features
 
@@ -44,6 +47,11 @@ action. Your existing profiles, themes, fonts, shells, and keybindings are untou
   and injected input never activates the prefix.
 - **No telemetry** — no network access, no terminal-buffer or keystroke logging.
 
+Winter is not limited to tmux parity: planned directions include pane and tab
+management, workspace and session-like features, window navigation, and a command
+palette, surfaced through a TUI dashboard (`winter ui`) for humans while agents and
+automation keep the scriptable CLI.
+
 ## Requirements
 
 - Windows 10/11 x64
@@ -58,8 +66,8 @@ administrator-elevated Windows Terminal windows. `winter run`, `winter launch`, 
 ## Quick start
 
 ```powershell
-git clone https://github.com/raincfhnj/winterminalp.git
-cd winterminalp
+git clone https://github.com/raincfhnj/winter.git
+cd winter
 .\install.ps1   # build, install the `winter` command, and set up the integration
 winter          # start the controller (Windows prompts for UAC)
 ```
@@ -85,7 +93,7 @@ This produces three binaries in `target\release`:
 | Binary | Purpose |
 |---|---|
 | `winter.exe` | Recommended command entry point |
-| `winterminalp.exe` | Compatibility alias with the same CLI |
+| `winterminalp.exe` | Compatibility alias of Winter with the same CLI |
 | `winterd.exe` | Hidden background controller (double-clickable) |
 
 Run them from `target\release`, or install them onto your `PATH` with
@@ -200,7 +208,7 @@ target\release\winter.exe uninstall
 ```
 
 This removes only the fragment, hidden keybindings, and shell block still owned by
-WinTerminalP.
+Winter.
 
 ## How it works
 

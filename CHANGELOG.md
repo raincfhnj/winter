@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `winter ui`: a live pane dashboard for the terminal it runs in — header
+  with prefix/mouse-resize state, a scaled map of panes with the focused
+  pane marked, and an offline banner when the controller stops. The
+  controller publishes the state to `%LOCALAPPDATA%\WinTerminalP\dashboard.json`
+  on every observable change; `--once` renders a single frame for scripts.
 - `winter doctor` now prints the stable JSON contract
   `{ schema_version, healthy, config: { path, ok, error }, integration }`, and
   the CLI documents exit codes: `0` success/healthy, `1` hard failure, `2`
@@ -53,6 +58,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The project is renamed to **Winter**: GitHub repo `raincfhnj/winter` (the old
+  repository URL redirects there), package/crate `winter`, primary CLI
+  `winter` unchanged; the compatibility alias `winterminalp` is kept, and
+  on-disk integration identifiers (config directory, fragment path, action ids,
+  shell markers) retain the historical `WinTerminalP` token for install
+  compatibility.
 - Action metadata now lives in a single registry (`src/registry.rs`): the
   prefix shortcut specs and the managed bridge bindings are derived from one
   const table, with compile-time assertions replacing the runtime count checks
@@ -162,5 +173,5 @@ terminal into a headless controller that enhances the native Windows Terminal.
   positions and the drag delta advances.
 - Focus the leading pane once per drag instead of on every resize step.
 
-[Unreleased]: https://github.com/raincfhnj/winterminalp/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/raincfhnj/winterminalp/releases/tag/v0.2.0
+[Unreleased]: https://github.com/raincfhnj/winter/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/raincfhnj/winter/releases/tag/v0.2.0

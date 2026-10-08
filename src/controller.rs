@@ -76,11 +76,12 @@ pub fn bridge_is_ready(report: &DoctorReport) -> bool {
 
 #[cfg(target_os = "windows")]
 mod implementation {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex, RwLock};
     use std::time::{Duration, Instant};
 
+    use crate::dashboard;
     use crate::model::{TerminalAction, WindowIdentity};
     use crate::pane_layout::{PaneDivider, ScreenPoint, SplitAxis};
     use crate::platform::windows::{
@@ -126,8 +127,12 @@ mod implementation {
             let _child = launch_windows_terminal().map_err(map_platform_error)?;
         }
 
-        let desktop_cache =
-            DesktopCache::start(options.foreground_poll_interval, config.mouse_resize)?;
+        let prefix_armed = Arc::new(AtomicBool::new(false));
+        let desktop_cache = DesktopCache::start(
+            options.foreground_poll_interval,
+            config.mouse_resize,
+            Arc::clone(&prefix_armed),
+        )?;
         let cached_desktop = desktop_cache.shared();
         let dropped_actions = Arc::new(AtomicU64::new(0));
 
@@ -139,6 +144,7 @@ mod implementation {
         let mut dispatcher = HookDispatcher {
             prefix: PrefixMachine::new(prefix_runtime),
             prefix_chord,
+            prefix_armed: Arc::clone(&prefix_armed),
             normalizer: KeyboardNormalizer::default(),
             pending_shutdown_key: None,
             pointer_drag: PointerDragState::default(),
@@ -189,6 +195,12 @@ mod implementation {
 
         let hook_result = hook.stop().map_err(map_platform_error);
         let cache_result = desktop_cache.stop();
+        // The observer has stopped: removing the state file is how `winter ui`
+        // learns the controller is gone (a missing file reads as offline).
+        // Best-effort housekeeping — a stale file also goes offline by age.
+        if let Ok(path) = dashboard::dashboard_path() {
+            let _ = std::fs::remove_file(path);
+        }
         let worker_result = action_worker.stop();
 
         shutdown_result?;
@@ -355,6 +367,7 @@ mod implementation {
     struct HookDispatcher {
         prefix: PrefixMachine,
         prefix_chord: KeyChord,
+        prefix_armed: Arc<AtomicBool>,
         normalizer: KeyboardNormalizer,
         pending_shutdown_key: Option<(PhysicalKey, Instant)>,
         pointer_drag: PointerDragState,
@@ -373,6 +386,10 @@ mod implementation {
             let event = self.normalizer.normalize(raw, terminal);
             let now = Instant::now();
             let outcome = self.prefix.handle_key_event(event, now);
+            // The observer reads this flag every dashboard tick; one relaxed
+            // store on the keyboard path is the only dashboard work here.
+            self.prefix_armed
+                .store(self.prefix.is_armed(), Ordering::Relaxed);
 
             if let Some(command) = outcome.command {
                 match command {
@@ -500,6 +517,7 @@ mod implementation {
             HookDispatcher {
                 prefix: PrefixMachine::default(),
                 prefix_chord: KeyChord::new(LogicalKey::Character(' '), Modifiers::default()),
+                prefix_armed: Arc::new(AtomicBool::new(false)),
                 normalizer: KeyboardNormalizer::default(),
                 pending_shutdown_key: None,
                 pointer_drag: PointerDragState::default(),

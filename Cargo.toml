@@ -1,11 +1,11 @@
 [package]
-name = "winterminalp"
+name = "winter"
 version = "0.2.0"
-description = "A tmux-style input controller for native Windows Terminal panes"
+description = "Winter - tmux-style keyboard control for Windows Terminal"
 authors = ["raincfhnj"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/raincfhnj/winterminalp"
-homepage = "https://github.com/raincfhnj/winterminalp"
+repository = "https://github.com/raincfhnj/winter"
+homepage = "https://github.com/raincfhnj/winter"
 readme = "README.md"
 keywords = ["windows-terminal", "tmux", "keyboard", "shortcuts", "windows"]
 categories = ["command-line-utilities", "os::windows-apis"]
@@ -14,7 +14,7 @@ rust-version = "1.88"
 default-run = "winter"
 
 [lib]
-name = "winterminalp"
+name = "winter"
 
 [[bin]]
 name = "winterminalp"
@@ -41,6 +41,7 @@ windows = { version = "0.62.2", features = [
   "Win32_Security",
   "Win32_Storage_FileSystem",
   "Win32_System_Com",
+  "Win32_System_Console",
   "Win32_System_LibraryLoader",
   "Win32_System_Ole",
   "Win32_System_Threading",

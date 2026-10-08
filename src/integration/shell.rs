@@ -1,7 +1,7 @@
 //! Managed PowerShell shell integration.
 //!
 //! Windows Terminal only inherits the working directory of a duplicated pane
-//! when the shell reports it through the `OSC 9;9` sequence. WinTerminalP
+//! when the shell reports it through the `OSC 9;9` sequence. Winter
 //! therefore appends a small, reversible prompt wrapper to the PowerShell
 //! profiles so that `splitPane` with `splitMode: duplicate` starts in the same
 //! directory as the focused pane.

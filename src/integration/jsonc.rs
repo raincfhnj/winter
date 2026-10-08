@@ -531,7 +531,7 @@ fn references_desired_id(value: &Value, desired_ids: &HashSet<&str>) -> bool {
 ///
 /// Returns the optional managed `id`, every chord declared by `keys` (a string
 /// or an array of strings), and whether the entry is a bare `{id, keys}` object
-/// with a single string chord that WinTerminalP is allowed to remove.
+/// with a single string chord that Winter is allowed to remove.
 fn parse_binding_definition(value: &Value) -> Result<(Option<String>, Vec<String>, bool), String> {
     let object = value
         .as_object()

@@ -1,4 +1,4 @@
-# WinTerminalP 测试策略
+# Winter 测试策略
 
 ## 1. 自动化门槛
 

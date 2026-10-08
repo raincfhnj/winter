@@ -101,7 +101,7 @@ const fn shutdown_entry(default_chord: KeyChord) -> ActionEntry {
 /// Every configurable action in canonical bridge-table order.
 ///
 /// The derived bridge table keeps this order verbatim so installed fragments
-/// and keybindings stay byte-identical; [`SPEC_ORDER`] restates the
+/// and keybindings stay byte-identical; `SPEC_ORDER` restates the
 /// user-facing shortcut order when the prefix specs are derived.
 pub const ACTIONS: &[ActionEntry] = &[
     terminal_entry(

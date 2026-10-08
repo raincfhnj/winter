@@ -456,10 +456,9 @@ impl PrefixMachine {
                     ref mut prefix_key_released,
                     ..
                 } = self.state
+                    && prefix_key == event.physical_key
                 {
-                    if prefix_key == event.physical_key {
-                        *prefix_key_released = true;
-                    }
+                    *prefix_key_released = true;
                 }
             }
 

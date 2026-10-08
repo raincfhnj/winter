@@ -251,10 +251,10 @@ fn write_message_to_paths(message: &str, paths: &[PathBuf]) -> bool {
 
 /// Writes `message` plus a trailing newline to `path`, reporting success.
 fn try_write_message(path: &Path, message: &str) -> bool {
-    if let Some(directory) = path.parent() {
-        if fs::create_dir_all(directory).is_err() {
-            return false;
-        }
+    if let Some(directory) = path.parent()
+        && fs::create_dir_all(directory).is_err()
+    {
+        return false;
     }
     let Ok(mut file) = OpenOptions::new()
         .create(true)

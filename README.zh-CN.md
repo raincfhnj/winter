@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/raincfhnj/winterminalp/actions/workflows/ci.yml/badge.svg)](https://github.com/raincfhnj/winterminalp/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#许可证)
-[![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 
 **给原生 Windows Terminal 加上 tmux 风格的键盘控制，而不是替代它。**
 
@@ -43,7 +43,7 @@ Windows Terminal 没有 tmux 式的 Prefix 模式，其 keybinding 也只能表�
 
 - Windows 10/11 x64
 - Windows Terminal 1.21 或更高
-- 构建需要 Rust stable（1.85+）与 MSVC 工具链
+- 构建需要 Rust stable（1.88+）与 MSVC 工具链
 
 控制器需要提权，才能同时向普通与管理员权限的 Windows Terminal 注入输入。
 `winter run`、`winter launch` 和 `winterd.exe` 在需要时通过 UAC 自重启；
@@ -223,7 +223,7 @@ cargo build --release --bins --locked
 ```
 
 CI 在 `windows-latest` 上把它们拆成五个并行作业：格式化、Clippy 与文档、测试、
-Release 构建，以及在 Rust 1.85 上运行 `cargo check --all-targets --locked` 的
+Release 构建，以及在 Rust 1.88 上运行 `cargo check --all-targets --locked` 的
 MSRV 作业。
 
 ## 许可证

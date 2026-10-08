@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ready).
 - CLI contract tests (`tests/cli.rs`) covering `winter --help` and the
   `doctor` report, with `LOCALAPPDATA` redirected to a temporary directory.
-- CI: a dedicated MSRV job on Rust 1.85 (`cargo check --all-targets
+- CI: a dedicated MSRV job on Rust 1.88 (`cargo check --all-targets
   --locked`), `--locked` on every cargo command, a separate
   `cargo test --doc --locked` step, `cargo doc --no-deps` with
   `RUSTDOCFLAGS=-D warnings`, and `concurrency.cancel-in-progress`.
@@ -97,6 +97,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Reserved system chords now include `Ctrl+Tab`, `Ctrl+Shift+Tab`,
   `Ctrl+Shift+T`, and `Ctrl+Shift+W`, matching Windows Terminal's defaults
   and `is_reserved_system_chord`.
+
+- The MSRV is raised to Rust 1.88: `jsonc-parser` 0.33 uses let-chains,
+  which only compile from 1.88, so the previously declared 1.85 could never
+  have built the dependency graph (the claim was unverified until the CI MSRV
+  job was added).
 
 ### Breaking
 

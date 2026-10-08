@@ -6,7 +6,7 @@ up the project, run the quality gate, and submit changes.
 ## Prerequisites
 
 - Windows 10/11 x64
-- Rust stable 1.85 or newer (MSVC toolchain)
+- Rust stable 1.88 or newer (MSVC toolchain)
 - Windows Terminal 1.21+ for manual testing
 
 ## Build and test
@@ -22,7 +22,7 @@ cargo build --release --bins --locked
 
 All of these must pass before a pull request is merged. CI runs the same commands as
 five parallel jobs on `windows-latest` (format, clippy & docs, test, release build,
-and an MSRV job that runs `cargo check --all-targets --locked` on Rust 1.85).
+and an MSRV job that runs `cargo check --all-targets --locked` on Rust 1.88).
 
 Run the controller in the foreground during development:
 

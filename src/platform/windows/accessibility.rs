@@ -98,10 +98,11 @@ impl TerminalAccessibility {
         }
         // Only surface a failure when every enumerated control was unusable;
         // otherwise a transient stale element would discard a valid snapshot.
-        if panes.is_empty() && element_count > 0 {
-            if let Some(error) = first_error {
-                return Err(error);
-            }
+        if panes.is_empty()
+            && element_count > 0
+            && let Some(error) = first_error
+        {
+            return Err(error);
         }
         Ok(panes)
     }

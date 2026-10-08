@@ -13,7 +13,7 @@ $env:RUSTDOCFLAGS = '-D warnings'; cargo doc --no-deps --locked
 cargo build --release --bins --locked
 ```
 
-`cargo test --all-targets` 不跑 doc test，所以必须单独执行 `cargo test --doc --locked`；MSRV 作业另在 Rust 1.85 上运行 `cargo check --all-targets --locked`。
+`cargo test --all-targets` 不跑 doc test，所以必须单独执行 `cargo test --doc --locked`；MSRV 作业另在 Rust 1.88 上运行 `cargo check --all-targets --locked`。
 
 ## 2. Prefix 单元测试
 

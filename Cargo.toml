@@ -10,7 +10,7 @@ readme = "README.md"
 keywords = ["windows-terminal", "tmux", "keyboard", "shortcuts", "windows"]
 categories = ["command-line-utilities", "os::windows-apis"]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 default-run = "winter"
 
 [lib]

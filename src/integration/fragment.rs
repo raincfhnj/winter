@@ -153,10 +153,8 @@ pub(super) fn install_fragment(
                 if !hash_matches && !preparation.semantically_equal {
                     return None;
                 }
-                if !hash_matches {
-                    if let Some(current_sha256) = current_sha256 {
-                        record.installed_sha256 = current_sha256;
-                    }
+                if !hash_matches && let Some(current_sha256) = current_sha256 {
+                    record.installed_sha256 = current_sha256;
                 }
                 Some(record)
             });

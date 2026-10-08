@@ -3,7 +3,7 @@
 ## 环境
 
 - Windows 10/11 x64。
-- Rust stable，最低 Rust 1.85，项目当前使用 2024 Edition。
+- Rust stable，最低 Rust 1.88，项目当前使用 2024 Edition。
 - Windows Terminal 1.21+。
 - MSVC C++ Build Tools。
 
@@ -24,7 +24,7 @@ $env:RUSTDOCFLAGS = '-D warnings'; cargo doc --no-deps --locked
 cargo build --release --bins --locked
 ```
 
-MSRV 作业另在 Rust 1.85 工具链上运行 `cargo check --all-targets --locked`。
+MSRV 作业另在 Rust 1.88 工具链上运行 `cargo check --all-targets --locked`。
 
 开发期以前台模式运行控制器：
 

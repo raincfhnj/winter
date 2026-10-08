@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/raincfhnj/winterminalp/actions/workflows/ci.yml/badge.svg)](https://github.com/raincfhnj/winterminalp/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 
 **tmux-style keyboard control for the native Windows Terminal — without replacing it.**
 
@@ -48,7 +48,7 @@ action. Your existing profiles, themes, fonts, shells, and keybindings are untou
 
 - Windows 10/11 x64
 - Windows Terminal 1.21 or newer
-- To build: Rust stable (1.85+) with the MSVC toolchain
+- To build: Rust stable (1.88+) with the MSVC toolchain
 
 The controller runs elevated so it can inject input into both normal and
 administrator-elevated Windows Terminal windows. `winter run`, `winter launch`, and
@@ -245,7 +245,7 @@ cargo build --release --bins --locked
 ```
 
 CI runs these as five parallel jobs on `windows-latest`: format, clippy & docs, test,
-release build, and an MSRV job that checks Rust 1.85 with
+release build, and an MSRV job that checks Rust 1.88 with
 `cargo check --all-targets --locked`.
 
 ## License

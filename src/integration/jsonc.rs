@@ -154,7 +154,7 @@ fn keybinding_elements(root: &CstRootNode) -> AppResult<(Vec<CstNode>, Vec<Integ
 
 struct KeybindingScan {
     existing_binding_count: usize,
-    additions: Vec<ManagedKeybindingManifest>,
+    addition_indices: Vec<usize>,
     matching_binding_count: usize,
     conflicts: Vec<IntegrationConflict>,
     warnings: Vec<String>,
@@ -187,8 +187,8 @@ fn scan_keybindings(elements: Vec<CstNode>, desired: &[DesiredKeybinding]) -> Ke
     }
 
     let mut matching_binding_count = 0;
-    let mut additions = Vec::new();
-    for managed in desired {
+    let mut addition_indices = Vec::new();
+    for (managed_index, managed) in desired.iter().enumerate() {
         let canonical_id = managed.canonical_id.as_str();
         let canonical_chord = managed.canonical_chord.as_str();
         if existing_pairs.contains(&(canonical_id, canonical_chord)) {
@@ -219,12 +219,12 @@ fn scan_keybindings(elements: Vec<CstNode>, desired: &[DesiredKeybinding]) -> Ke
             ));
             continue;
         }
-        additions.push(to_manifest_binding(managed));
+        addition_indices.push(managed_index);
     }
     deduplicate_conflicts(&mut conflicts);
     KeybindingScan {
         existing_binding_count,
-        additions,
+        addition_indices,
         matching_binding_count,
         conflicts,
         warnings,
@@ -245,9 +245,14 @@ pub(crate) fn merge_keybindings(
         });
     }
     let scan = scan_keybindings(elements, desired);
-    if !scan.conflicts.is_empty() || scan.additions.is_empty() {
+    let additions = scan
+        .addition_indices
+        .iter()
+        .map(|&index| to_manifest_binding(&desired[index]))
+        .collect::<Vec<_>>();
+    if !scan.conflicts.is_empty() || additions.is_empty() {
         return Ok(SettingsEdit {
-            additions: scan.additions,
+            additions,
             conflicts: scan.conflicts,
             replacement: None,
         });
@@ -259,12 +264,12 @@ pub(crate) fn merge_keybindings(
     let array = root_object
         .array_value_or_create("keybindings")
         .ok_or_else(|| AppError::InvalidConfiguration("keybindings is not an array".to_owned()))?;
-    for addition in &scan.additions {
+    for addition in &additions {
         array.append(value_to_cst(&addition.definition)?);
     }
     let replacement = serialize_document(&document);
     Ok(SettingsEdit {
-        additions: scan.additions,
+        additions,
         conflicts: scan.conflicts,
         replacement: Some(replacement),
     })
@@ -292,7 +297,7 @@ pub fn analyze_keybindings(
     let scan = scan_keybindings(elements, desired);
     Ok(KeybindingAnalysis {
         existing_binding_count: scan.existing_binding_count,
-        bindings_to_add: scan.additions.len(),
+        bindings_to_add: scan.addition_indices.len(),
         managed_binding_count: scan.matching_binding_count,
         conflicts: scan.conflicts,
         warnings: scan.warnings,

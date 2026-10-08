@@ -26,7 +26,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum CliCommand {
-    /// Show, locate, or edit the user configuration file.
+    /// Show the full configuration, or locate or edit the user configuration file.
     Config {
         /// Print only the configuration file path.
         #[arg(long = "path", conflicts_with = "edit")]
@@ -259,19 +259,34 @@ fn launch(integration: &IntegrationConfig) -> AppResult<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Resolves which program runs the background controller for `current_exe`.
+///
+/// Returns the program, its arguments, and a warning to print when the
+/// dedicated `winterd.exe` daemon is missing and diagnostics (the
+/// last-error.log it writes) become unavailable.
+fn background_launch_plan(current_exe: &Path) -> (PathBuf, Vec<&'static str>, Option<String>) {
+    let sibling_daemon = current_exe.with_file_name("winterd.exe");
+    if sibling_daemon.is_file() {
+        (sibling_daemon, vec!["--launch"], None)
+    } else {
+        (
+            current_exe.to_path_buf(),
+            vec!["run", "--no-launch"],
+            Some(format!(
+                "warning: winterd.exe was not found next to {}; falling back to `run --no-launch`, so diagnostics (last-error.log) will be unavailable",
+                current_exe.display()
+            )),
+        )
+    }
+}
+
 fn spawn_background_controller() -> AppResult<()> {
     let current_exe = env::current_exe()
         .map_err(|error| AppError::io("resolve current executable", PathBuf::from("."), error))?;
-    let sibling_daemon = current_exe.with_file_name("winterd.exe");
-    let (program, arguments) = if sibling_daemon.is_file() {
-        (sibling_daemon, vec!["--launch"])
-    } else {
-        eprintln!(
-            "warning: winterd.exe was not found next to {}; falling back to `run --no-launch`, so diagnostics (last-error.log) will be unavailable",
-            current_exe.display()
-        );
-        (current_exe, vec!["run", "--no-launch"])
-    };
+    let (program, arguments, warning) = background_launch_plan(&current_exe);
+    if let Some(warning) = warning {
+        eprintln!("{warning}");
+    }
 
     let mut command = Command::new(&program);
     command
@@ -443,5 +458,31 @@ mod tests {
 
         assert_eq!(value["config"]["ok"], serde_json::Value::Bool(true));
         assert!(value["config"]["error"].is_null());
+    }
+
+    #[test]
+    fn background_launch_prefers_the_daemon_and_warns_on_the_fallback() {
+        let temp = tempdir().expect("temporary directory should be created");
+        let exe = temp.path().join("winter.exe");
+
+        let (program, arguments, warning) = background_launch_plan(&exe);
+        assert_eq!(program, exe, "without a daemon the current exe must run");
+        assert_eq!(arguments, ["run", "--no-launch"]);
+        let warning = warning.expect("a missing winterd.exe must warn");
+        assert!(
+            warning.contains("warning: winterd.exe was not found"),
+            "unexpected warning: {warning}"
+        );
+        assert!(
+            warning.contains("last-error.log"),
+            "the warning must explain the lost diagnostics: {warning}"
+        );
+
+        let daemon = temp.path().join("winterd.exe");
+        fs::write(&daemon, b"").expect("daemon fixture should be written");
+        let (program, arguments, warning) = background_launch_plan(&exe);
+        assert_eq!(program, daemon, "the dedicated daemon must be preferred");
+        assert_eq!(arguments, ["--launch"]);
+        assert!(warning.is_none(), "the daemon path must not warn");
     }
 }

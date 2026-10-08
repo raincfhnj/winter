@@ -42,6 +42,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `winterd` records panics in `last-error.log` (with a `%TEMP%` fallback) and
   exits instead of failing invisibly; `winter doctor` diagnoses invalid
   configurations instead of aborting before any report.
+- UTF-16LE `settings.json` (Notepad's default save encoding) is now parsed
+  and written back in its original encoding instead of failing with a UTF-8
+  error; UTF-16BE and truncated files get clear, actionable messages.
+- A left click now cancels an armed prefix even when `mouse_resize` is
+  disabled: the mouse hook is always installed, with a zero-work fast path
+  for move/release events while drag is off.
+- Integration backups are pruned to the newest ten per label after each
+  successful backup, so `state_dir/backups` no longer grows without bound.
 
 ### Changed
 

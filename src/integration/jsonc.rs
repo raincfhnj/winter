@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use jsonc_parser::ParseOptions;
@@ -6,10 +7,11 @@ use serde_json::Value;
 
 use crate::{AppError, AppResult};
 
+use super::encoding::{
+    UTF8_BOM, UTF16BE_BOM, UTF16LE_BOM, Utf16LeError, decode_utf16_le, encode_utf16_le_with_bom,
+};
 use super::manifest::ManagedKeybindingManifest;
 use super::{ConflictKind, IntegrationConflict};
-
-const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
 
 #[derive(Debug, Clone)]
 pub(crate) struct DesiredKeybinding {
@@ -44,10 +46,21 @@ pub struct KeybindingAnalysis {
     pub warnings: Vec<String>,
 }
 
+/// Encoding of the settings document as found on disk.
+///
+/// Serialization writes every edit back in exactly this encoding so
+/// `settings.json` round-trips losslessly no matter which editor saved it
+/// (Notepad on some systems defaults to UTF-16LE).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsEncoding {
+    Utf8 { bom: bool },
+    Utf16Le,
+}
+
 #[derive(Debug)]
 struct ParsedDocument {
     root: CstRootNode,
-    had_bom: bool,
+    encoding: SettingsEncoding,
 }
 
 #[derive(Debug, Clone)]
@@ -377,13 +390,7 @@ pub(crate) fn remove_managed_keybindings(
 }
 
 fn parse_document(raw: &[u8]) -> AppResult<ParsedDocument> {
-    let (had_bom, source) = match raw.strip_prefix(UTF8_BOM) {
-        Some(source) => (true, source),
-        None => (false, raw),
-    };
-    let source = std::str::from_utf8(source).map_err(|error| {
-        AppError::InvalidConfiguration(format!("settings is not valid UTF-8: {error}"))
-    })?;
+    let (encoding, source) = decode_settings(raw)?;
     let options = ParseOptions {
         allow_comments: true,
         allow_loose_object_property_names: false,
@@ -396,20 +403,67 @@ fn parse_document(raw: &[u8]) -> AppResult<ParsedDocument> {
         allow_extended_string_escapes: false,
         allow_non_finite_numbers: false,
     };
-    let root = CstRootNode::parse(source, &options).map_err(|error| {
+    let root = CstRootNode::parse(&source, &options).map_err(|error| {
         AppError::InvalidConfiguration(format!("settings JSONC could not be parsed: {error}"))
     })?;
-    Ok(ParsedDocument { root, had_bom })
+    Ok(ParsedDocument { root, encoding })
+}
+
+/// Decodes the settings bytes in their on-disk encoding, returning the
+/// encoding alongside the text so [`serialize_document`] can write the edit
+/// back in the same encoding.
+///
+/// Byte-order-mark detection: `EF BB BF` is UTF-8 with a BOM, `FF FE` is
+/// UTF-16LE, `FE FF` (UTF-16BE) is refused with a re-save hint, and no BOM
+/// means plain UTF-8 — exactly the historical semantics.
+fn decode_settings(raw: &[u8]) -> AppResult<(SettingsEncoding, Cow<'_, str>)> {
+    if let Some(content) = raw.strip_prefix(UTF8_BOM) {
+        return Ok((
+            SettingsEncoding::Utf8 { bom: true },
+            Cow::Borrowed(utf8_source(content)?),
+        ));
+    }
+    if raw.starts_with(UTF16BE_BOM) {
+        return Err(AppError::InvalidConfiguration(
+            "settings.json is UTF-16BE; re-save as UTF-8 or UTF-16LE".to_owned(),
+        ));
+    }
+    if let Some(content) = raw.strip_prefix(UTF16LE_BOM) {
+        let text = decode_utf16_le(content).map_err(|error| match error {
+            Utf16LeError::Truncated => AppError::InvalidConfiguration(
+                "settings.json has a truncated UTF-16LE byte sequence".to_owned(),
+            ),
+            Utf16LeError::Invalid => {
+                AppError::InvalidConfiguration("settings.json is not valid UTF-16LE".to_owned())
+            }
+        })?;
+        return Ok((SettingsEncoding::Utf16Le, Cow::Owned(text)));
+    }
+    Ok((
+        SettingsEncoding::Utf8 { bom: false },
+        Cow::Borrowed(utf8_source(raw)?),
+    ))
+}
+
+fn utf8_source(content: &[u8]) -> AppResult<&str> {
+    std::str::from_utf8(content).map_err(|error| {
+        AppError::InvalidConfiguration(format!("settings is not valid UTF-8: {error}"))
+    })
 }
 
 fn serialize_document(document: &ParsedDocument) -> Vec<u8> {
     let serialized = document.root.to_string();
-    let mut bytes = Vec::with_capacity(serialized.len() + usize::from(document.had_bom) * 3);
-    if document.had_bom {
-        bytes.extend_from_slice(UTF8_BOM);
+    match document.encoding {
+        SettingsEncoding::Utf8 { bom } => {
+            let mut bytes = Vec::with_capacity(serialized.len() + usize::from(bom) * 3);
+            if bom {
+                bytes.extend_from_slice(UTF8_BOM);
+            }
+            bytes.extend_from_slice(serialized.as_bytes());
+            bytes
+        }
+        SettingsEncoding::Utf16Le => encode_utf16_le_with_bom(&serialized),
     }
-    bytes.extend_from_slice(serialized.as_bytes());
-    bytes
 }
 
 /// Parses every root `keybindings` element, splitting them into usable
@@ -1003,5 +1057,105 @@ mod tests {
 
         let source = br#"{"keybindings":[{"id":"WinTerminalP.SplitLeft"}]}"#;
         assert!(remove_managed_keybindings(source, &records).is_err());
+    }
+
+    #[test]
+    fn utf16le_settings_merge_and_remove_round_trip_in_the_original_encoding() {
+        let text = "{\r\n  // keep this comment\r\n  \"profiles\": [],\r\n}\r\n";
+        let source = encode_utf16_le_with_bom(text);
+        let bindings = [desired("WinTerminalP.SplitLeft", "ctrl+f13")];
+
+        let first = merge_keybindings(&source, &bindings).expect("utf16le merge should succeed");
+        assert!(first.conflicts.is_empty());
+        let replacement = first.replacement.expect("binding should be appended");
+        assert_eq!(&replacement[..2], UTF16LE_BOM);
+        let decoded =
+            decode_utf16_le(&replacement[UTF16LE_BOM.len()..]).expect("result should decode");
+        assert!(decoded.contains("// keep this comment\r\n"));
+        assert!(decoded.contains("\"profiles\": []"));
+        assert!(decoded.contains("WinTerminalP.SplitLeft"));
+        assert_eq!(
+            encode_utf16_le_with_bom(&decoded),
+            replacement,
+            "re-encoding the decoded text must reproduce the written bytes"
+        );
+
+        let second = merge_keybindings(&replacement, &bindings).expect("second merge should work");
+        assert!(second.conflicts.is_empty());
+        assert!(second.replacement.is_none());
+
+        let record = to_manifest_binding(&bindings[0]);
+        let removal = remove_managed_keybindings(&replacement, std::slice::from_ref(&record))
+            .expect("utf16le removal should succeed");
+        let removed = removal.replacement.expect("binding should be removed");
+        assert_eq!(&removed[..2], UTF16LE_BOM);
+        let decoded = decode_utf16_le(&removed[UTF16LE_BOM.len()..]).expect("result should decode");
+        assert!(!decoded.contains("WinTerminalP.SplitLeft"));
+        assert!(decoded.contains("// keep this comment\r\n"));
+        assert_eq!(removal.removed_binding_count, 1);
+    }
+
+    #[test]
+    fn utf16le_analysis_matches_the_utf8_twin_and_needs_no_write() {
+        let text = "{\r\n  // keep this comment\r\n  \"keybindings\": [{\"id\": \"WinTerminalP.SplitLeft\", \"keys\": \"ctrl+f13\"}]\r\n}\r\n";
+        let utf8 = text.as_bytes().to_vec();
+        let utf16 = encode_utf16_le_with_bom(text);
+        let bindings = [desired("WinTerminalP.SplitLeft", "ctrl+f13")];
+
+        let utf8_analysis = analyze_keybindings(&utf8, &bindings).expect("utf8 analysis");
+        let utf16_analysis = analyze_keybindings(&utf16, &bindings).expect("utf16 analysis");
+        assert_eq!(
+            utf16_analysis.existing_binding_count,
+            utf8_analysis.existing_binding_count
+        );
+        assert_eq!(
+            utf16_analysis.bindings_to_add,
+            utf8_analysis.bindings_to_add
+        );
+        assert_eq!(
+            utf16_analysis.managed_binding_count,
+            utf8_analysis.managed_binding_count
+        );
+        assert_eq!(utf16_analysis.conflicts, utf8_analysis.conflicts);
+        assert_eq!(utf16_analysis.warnings, utf8_analysis.warnings);
+        assert_eq!(utf16_analysis.bindings_to_add, 0);
+
+        let edit = merge_keybindings(&utf16, &bindings).expect("utf16le merge should succeed");
+        assert!(edit.conflicts.is_empty());
+        assert_eq!(edit.additions.len(), 0);
+        assert!(
+            edit.replacement.is_none(),
+            "an unchanged utf16le document must not be rewritten"
+        );
+    }
+
+    #[test]
+    fn utf16be_and_truncated_utf16le_settings_are_rejected_with_clear_errors() {
+        let bindings = [desired("WinTerminalP.SplitLeft", "ctrl+f13")];
+
+        let mut utf16be = vec![0xfe, 0xff];
+        for unit in "{}".encode_utf16() {
+            utf16be.extend_from_slice(&unit.to_be_bytes());
+        }
+        let error = analyze_keybindings(&utf16be, &bindings)
+            .expect_err("utf16be settings must be rejected");
+        assert!(
+            matches!(&error, AppError::InvalidConfiguration(message)
+                if message == "settings.json is UTF-16BE; re-save as UTF-8 or UTF-16LE"),
+            "unexpected error: {error:?}"
+        );
+        assert!(merge_keybindings(&utf16be, &bindings).is_err());
+        assert!(remove_managed_keybindings(&utf16be, &[]).is_err());
+
+        // `FF FE` BOM plus `{`, `}` truncated by one byte: an odd payload.
+        let truncated = [0xff, 0xfe, 0x7b, 0x00, 0x7d];
+        let error = analyze_keybindings(&truncated, &bindings)
+            .expect_err("truncated utf16le settings must be rejected");
+        assert!(
+            matches!(&error, AppError::InvalidConfiguration(message)
+                if message == "settings.json has a truncated UTF-16LE byte sequence"),
+            "unexpected error: {error:?}"
+        );
+        assert!(merge_keybindings(&truncated, &bindings).is_err());
     }
 }

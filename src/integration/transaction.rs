@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -83,6 +84,7 @@ pub(crate) fn create_backup(
         let _ = fs::remove_file(&path);
         return Err(error);
     }
+    prune_backup_directory(&backup_dir);
 
     Ok(BackupManifest {
         source_path: source_path.to_path_buf(),
@@ -106,6 +108,70 @@ fn write_verified_backup(path: &Path, snapshot: &FileSnapshot) -> AppResult<()> 
         });
     }
     Ok(())
+}
+
+/// Maximum number of backup files kept per label by [`prune_backup_directory`].
+///
+/// Verified against every `create_backup` call site: `fragment` (fragment.rs:128) and the
+/// per-channel labels `stable`/`preview`/`canary`/`unpackaged`/`portable`
+/// (targets.rs:148) are the only manifest-referenced labels, each manifest record is written
+/// in the same install round as the backup it points at, and each label has at most one
+/// active record plus the just-created backup during a prune. `fragment-uninstall`
+/// (fragment.rs:226) and `<channel>-uninstall` (targets.rs:233) discard their paths, and
+/// `shell` (shell.rs:166/181/250) only reports its path without persisting a manifest, so
+/// those labels have zero active records. Ten comfortably exceeds the maximum simultaneous
+/// active count per label.
+const KEEP_BACKUPS_PER_LABEL: usize = 10;
+
+/// Housekeeping: keeps only the newest [`KEEP_BACKUPS_PER_LABEL`] backup files per label in
+/// `backup_dir` and deletes the rest so `state_dir/backups` cannot grow without bound.
+///
+/// Files created by [`create_backup`] are named `{label}.settings-{pid}-{nanos}-{seq}.json`
+/// through `unique_path`; sanitized labels never contain `.`, so grouping on the prefix
+/// before the first `.settings-` recovers the label exactly, and files that do not match
+/// that shape are never touched. Files are ranked by `symlink_metadata().modified()`,
+/// breaking ties by descending filename; the just-created backup was written last, so it
+/// always ranks inside the kept window and is never pruned. Deletions target only entries
+/// directly inside `backup_dir` and use `remove_file`, which can never remove a directory
+/// or anything outside the backups directory.
+///
+/// Housekeeping: errors are ignored so a locked old backup can never fail a fresh install —
+/// a locked, permission-denied, or otherwise unprunable entry simply stays on disk until a
+/// later prune succeeds.
+fn prune_backup_directory(backup_dir: &Path) {
+    let Ok(entries) = fs::read_dir(backup_dir) else {
+        return;
+    };
+    let mut groups: HashMap<String, Vec<(SystemTime, String, PathBuf)>> = HashMap::new();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if !name.ends_with(".json") {
+            continue;
+        }
+        let Some((label, _)) = name.split_once(".settings-") else {
+            continue;
+        };
+        if label.is_empty() {
+            continue;
+        }
+        let path = entry.path();
+        let modified = fs::symlink_metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(UNIX_EPOCH);
+        groups
+            .entry(label.to_owned())
+            .or_default()
+            .push((modified, name.to_owned(), path));
+    }
+    for (_, mut group) in groups {
+        group.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+        for (_, _, path) in group.into_iter().skip(KEEP_BACKUPS_PER_LABEL) {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 /// Replaces a file only if its current bytes still match the snapshot used to plan the edit.
@@ -291,6 +357,8 @@ fn replace_with_native_atomic_move(source: &Path, destination: &Path) -> AppResu
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -442,6 +510,166 @@ mod tests {
             backups.is_empty(),
             "mismatching backup file must be deleted, found {:?}",
             backups.iter().map(|entry| entry.path()).collect::<Vec<_>>()
+        );
+    }
+
+    fn seed_backup(directory: &Path, label: &str, index: u32) -> PathBuf {
+        fs::create_dir_all(directory).expect("backup directory should be created");
+        let path = directory.join(format!("{label}.settings-1-{index:04}-0.json"));
+        fs::write(&path, b"{\"seed\":true}").expect("backup fixture should be written");
+        path
+    }
+
+    fn set_backup_mtime(path: &Path, time: SystemTime) {
+        let file = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("backup fixture should be openable to set its mtime");
+        file.set_modified(time)
+            .expect("backup fixture mtime should be settable");
+    }
+
+    fn backup_entries(directory: &Path) -> Vec<PathBuf> {
+        fs::read_dir(directory)
+            .expect("backup directory should be readable")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect()
+    }
+
+    fn count_with_prefix(entries: &[PathBuf], prefix: &str) -> usize {
+        entries
+            .iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(prefix))
+            })
+            .count()
+    }
+
+    #[test]
+    fn prune_keeps_newest_ten_per_label() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let backups = temp.path().join("backups");
+        let base = SystemTime::now() - Duration::from_secs(3_600);
+        let seeded = (0..15u32)
+            .map(|index| {
+                let path = seed_backup(&backups, "alpha", index);
+                set_backup_mtime(&path, base + Duration::from_secs(u64::from(index)));
+                path
+            })
+            .collect::<Vec<_>>();
+
+        prune_backup_directory(&backups);
+
+        assert_eq!(
+            backup_entries(&backups).len(),
+            10,
+            "only the newest ten alpha backups must remain"
+        );
+        for (index, path) in seeded.iter().enumerate() {
+            assert_eq!(
+                path.exists(),
+                index >= 5,
+                "alpha backup {index} retention is wrong"
+            );
+        }
+    }
+
+    #[test]
+    fn prune_treats_labels_independently() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let backups = temp.path().join("backups");
+        let base = SystemTime::now() - Duration::from_secs(3_600);
+        for index in 0..15u32 {
+            let path = seed_backup(&backups, "alpha", index);
+            set_backup_mtime(&path, base + Duration::from_secs(u64::from(index)));
+        }
+        let beta = (0..3u32)
+            .map(|index| seed_backup(&backups, "beta", index))
+            .collect::<Vec<_>>();
+
+        prune_backup_directory(&backups);
+
+        let entries = backup_entries(&backups);
+        assert_eq!(
+            count_with_prefix(&entries, "alpha."),
+            10,
+            "alpha must be trimmed to the newest ten"
+        );
+        assert_eq!(
+            count_with_prefix(&entries, "beta."),
+            3,
+            "beta must keep all three backups"
+        );
+        for path in &beta {
+            assert!(path.exists(), "beta backups must survive an alpha prune");
+        }
+    }
+
+    #[test]
+    fn create_backup_never_prunes_its_own_fresh_file() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let source = temp.path().join("settings.json");
+        fs::write(&source, b"{\"value\":1}").expect("fixture should be written");
+        let snapshot = read_snapshot(&source).expect("fixture should be readable");
+        let base = SystemTime::now() - Duration::from_secs(3_600);
+
+        let mut created = Vec::new();
+        for index in 0..11u32 {
+            let backup = create_backup(temp.path(), "steady", &source, &snapshot)
+                .expect("backup should be created");
+            set_backup_mtime(
+                &backup.backup_path,
+                base + Duration::from_secs(u64::from(index)),
+            );
+            created.push(backup);
+        }
+
+        assert!(
+            !created[0].backup_path.exists(),
+            "the oldest backup must be pruned on the eleventh create"
+        );
+        for backup in &created[1..] {
+            assert!(
+                backup.backup_path.exists(),
+                "every surviving backup including the fresh one must remain"
+            );
+        }
+        assert_eq!(
+            backup_entries(&temp.path().join("backups")).len(),
+            10,
+            "prune after each create must settle at the newest ten"
+        );
+    }
+
+    #[test]
+    fn create_backup_survives_an_unprunable_stale_entry() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let backups = temp.path().join("backups");
+        fs::create_dir_all(&backups).expect("backup directory should be created");
+        // A directory that ranks as the oldest alpha backup: remove_file fails on it.
+        let blocked = backups.join("alpha.settings-0-0-0.json");
+        fs::create_dir(&blocked).expect("blocked directory fixture should be created");
+        fs::write(blocked.join("child.json"), b"[]").expect("fixture child should be written");
+        for index in 0..10u32 {
+            seed_backup(&backups, "alpha", index);
+        }
+        let source = temp.path().join("settings.json");
+        fs::write(&source, b"{\"value\":1}").expect("fixture should be written");
+        let snapshot = read_snapshot(&source).expect("fixture should be readable");
+
+        let backup = create_backup(temp.path(), "alpha", &source, &snapshot)
+            .expect("an unprunable stale entry must not fail a fresh backup");
+
+        assert!(
+            backup.backup_path.exists(),
+            "the fresh backup must survive the prune"
+        );
+        assert!(
+            blocked.is_dir(),
+            "the undeletable directory must be left in place"
         );
     }
 

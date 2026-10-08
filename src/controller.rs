@@ -136,7 +136,6 @@ mod implementation {
 
         let prefix_runtime = config.prefix_config()?;
         let prefix_chord = prefix_runtime.prefix_chord;
-        let mouse_resize_enabled = config.mouse_resize.enabled;
         let mut dispatcher = HookDispatcher {
             prefix: PrefixMachine::new(prefix_runtime),
             prefix_chord,
@@ -146,16 +145,21 @@ mod implementation {
             worker_sender: action_worker.sender(),
             shutdown_sender,
             dropped_actions_for_hook: Arc::clone(&dropped_actions),
+            mouse_resize_enabled: config.mouse_resize.enabled,
             divider_hit_slop_px: i32::from(config.mouse_resize.divider_hit_slop_px),
             snapshots: DesktopSnapshotSource::new(cached_desktop),
             last_cursor_axis: None,
         };
+        // The mouse hook is installed unconditionally: pointer input must be
+        // able to cancel an armed prefix (CancelReason::PointerInput) even
+        // when drag-resize is disabled. The flag only gates behavior inside
+        // `HookDispatcher::on_mouse`.
         let hook = InputHook::start(
             Box::new(move |raw_event| match raw_event {
                 RawInputEvent::Keyboard(raw_event) => dispatcher.on_keyboard(raw_event),
                 RawInputEvent::Mouse(raw_event) => dispatcher.on_mouse(raw_event),
             }),
-            mouse_resize_enabled,
+            true,
         );
         let hook = match hook {
             Ok(hook) => hook,
@@ -357,6 +361,7 @@ mod implementation {
         worker_sender: mpsc::SyncSender<WorkerMessage>,
         shutdown_sender: mpsc::SyncSender<()>,
         dropped_actions_for_hook: Arc<AtomicU64>,
+        mouse_resize_enabled: bool,
         divider_hit_slop_px: i32,
         snapshots: DesktopSnapshotSource,
         last_cursor_axis: Option<SplitAxis>,
@@ -407,6 +412,19 @@ mod implementation {
         }
 
         fn on_mouse(&mut self, raw: RawMouseEvent) -> HookDecision {
+            // Disabled path first: this hook runs at mouse-move frequency, so
+            // Move/LeftUp must reach the early return before any snapshot
+            // read, foreground lookup, or cursor call. Only LeftDown does
+            // work here: pointer input cancels an armed prefix.
+            if !self.mouse_resize_enabled {
+                return match raw.kind {
+                    MouseEventKind::LeftDown => {
+                        let _ = self.prefix.cancel(CancelReason::PointerInput);
+                        HookDecision::Pass
+                    }
+                    MouseEventKind::Move | MouseEventKind::LeftUp => HookDecision::Pass,
+                };
+            }
             let point = ScreenPoint::new(raw.x, raw.y);
             match raw.kind {
                 MouseEventKind::LeftDown => {
@@ -463,7 +481,9 @@ mod implementation {
     mod tests {
         use std::thread;
 
-        use crate::prefix::{LogicalKey, Modifiers};
+        use crate::model::TerminalChannel;
+        use crate::pane_layout::{PaneGeometry, PaneLayout, ScreenRect};
+        use crate::prefix::{KeyEvent, LogicalKey, Modifiers};
 
         use super::*;
 
@@ -471,6 +491,10 @@ mod implementation {
         const KEY_B: u8 = 0x1f;
 
         fn dispatcher() -> HookDispatcher {
+            dispatcher_with_mouse_resize(true)
+        }
+
+        fn dispatcher_with_mouse_resize(mouse_resize_enabled: bool) -> HookDispatcher {
             let (worker_sender, _worker_receiver) = mpsc::sync_channel(4);
             let (shutdown_sender, _shutdown_receiver) = mpsc::sync_channel(1);
             HookDispatcher {
@@ -482,11 +506,31 @@ mod implementation {
                 worker_sender,
                 shutdown_sender,
                 dropped_actions_for_hook: Arc::new(AtomicU64::new(0)),
+                mouse_resize_enabled,
                 divider_hit_slop_px: 8,
                 snapshots: DesktopSnapshotSource::new(Arc::new(RwLock::new(
                     DesktopSnapshot::default(),
                 ))),
                 last_cursor_axis: None,
+            }
+        }
+
+        fn target() -> WindowIdentity {
+            WindowIdentity {
+                hwnd: 42,
+                process_id: 7,
+                process_started_at_100ns: 9,
+                channel: TerminalChannel::Stable,
+            }
+        }
+
+        fn mouse_event(kind: MouseEventKind) -> RawMouseEvent {
+            RawMouseEvent {
+                x: 0,
+                y: 0,
+                kind,
+                injected: false,
+                timestamp_ms: 0,
             }
         }
 
@@ -598,6 +642,72 @@ mod implementation {
             });
             assert_eq!(decision, HookDecision::Pass);
             assert_eq!(dispatcher.last_cursor_axis, None);
+        }
+
+        #[test]
+        fn mouse_resize_disabled_left_down_cancels_an_armed_prefix() {
+            let mut dispatcher = dispatcher_with_mouse_resize(false);
+            let arm = dispatcher.prefix.handle_key_event(
+                KeyEvent {
+                    physical_key: PhysicalKey::new(0x30, false),
+                    logical_key: LogicalKey::Character('b'),
+                    transition: KeyTransition::Down,
+                    modifiers: Modifiers::new(true, false, false, false),
+                    injected: false,
+                    foreground_terminal: Some(target()),
+                },
+                Instant::now(),
+            );
+            assert_eq!(arm.disposition, KeyDisposition::Consume);
+            assert!(dispatcher.prefix.is_armed());
+
+            let decision = dispatcher.on_mouse(mouse_event(MouseEventKind::LeftDown));
+
+            assert_eq!(decision, HookDecision::Pass);
+            assert!(
+                !dispatcher.prefix.is_armed(),
+                "pointer input must cancel the armed prefix even with drag disabled"
+            );
+        }
+
+        #[test]
+        fn mouse_resize_disabled_move_and_release_return_before_the_enabled_bodies() {
+            let mut dispatcher = dispatcher_with_mouse_resize(false);
+            dispatcher.last_cursor_axis = Some(SplitAxis::Vertical);
+            let divider = PaneLayout::from_panes(vec![
+                PaneGeometry {
+                    bounds: ScreenRect::new(0, 0, 497, 800),
+                    has_keyboard_focus: false,
+                },
+                PaneGeometry {
+                    bounds: ScreenRect::new(503, 0, 1_000, 800),
+                    has_keyboard_focus: false,
+                },
+            ])
+            .divider_at(ScreenPoint::new(500, 400), 0)
+            .expect("fixture has a divider");
+            assert!(
+                dispatcher
+                    .pointer_drag
+                    .begin(Some((target(), divider)), ScreenPoint::new(500, 400))
+                    .consumes()
+            );
+
+            let move_decision = dispatcher.on_mouse(mouse_event(MouseEventKind::Move));
+            assert_eq!(move_decision, HookDecision::Pass);
+            assert_eq!(dispatcher.last_cursor_axis, Some(SplitAxis::Vertical));
+
+            let release_decision = dispatcher.on_mouse(mouse_event(MouseEventKind::LeftUp));
+            assert_eq!(release_decision, HookDecision::Pass);
+            assert_eq!(
+                dispatcher.last_cursor_axis,
+                Some(SplitAxis::Vertical),
+                "the disabled path returns before the LeftUp cursor reset"
+            );
+            assert!(
+                dispatcher.pointer_drag.end().consumes(),
+                "the disabled path returns before the LeftUp drag end"
+            );
         }
 
         #[test]

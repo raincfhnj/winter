@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{AppError, AppResult};
 
+use super::encoding::{UTF16LE_BOM, Utf16LeError, decode_utf16_le, encode_utf16_le_with_bom};
 use super::transaction::{atomic_replace, create_backup, read_optional_snapshot};
 use super::types::{ChangeStatus, IntegrationConfig, ShellIntegrationReport, ShellKind};
 
@@ -334,22 +335,15 @@ fn decode_profile(path: &Path, bytes: &[u8]) -> AppResult<(ProfileEncoding, Stri
             decode_utf8(path, content)?,
         ));
     }
-    if let Some(content) = bytes.strip_prefix(b"\xff\xfe") {
-        if content.len() % 2 != 0 {
-            return Err(AppError::Settings {
-                path: path.to_path_buf(),
-                message: "PowerShell profile has a truncated UTF-16LE byte sequence".to_owned(),
-            });
-        }
-        let units = content
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pair| u16::from_le_bytes(*pair))
-            .collect::<Vec<_>>();
-        let text = String::from_utf16(&units).map_err(|_| AppError::Settings {
+    if let Some(content) = bytes.strip_prefix(UTF16LE_BOM) {
+        let text = decode_utf16_le(content).map_err(|error| AppError::Settings {
             path: path.to_path_buf(),
-            message: "PowerShell profile is not valid UTF-16LE".to_owned(),
+            message: match error {
+                Utf16LeError::Truncated => {
+                    "PowerShell profile has a truncated UTF-16LE byte sequence".to_owned()
+                }
+                Utf16LeError::Invalid => "PowerShell profile is not valid UTF-16LE".to_owned(),
+            },
         })?;
         return Ok((ProfileEncoding::Utf16Le, text));
     }
@@ -383,14 +377,7 @@ fn write_profile(
             bytes.extend_from_slice(text.as_bytes());
             bytes
         }
-        ProfileEncoding::Utf16Le => {
-            let mut bytes = Vec::with_capacity(text.len() * 2 + 2);
-            bytes.extend_from_slice(b"\xff\xfe");
-            for unit in text.encode_utf16() {
-                bytes.extend_from_slice(&unit.to_le_bytes());
-            }
-            bytes
-        }
+        ProfileEncoding::Utf16Le => encode_utf16_le_with_bom(text),
     };
     atomic_replace(path, expected_sha256, &bytes)?;
     Ok(())

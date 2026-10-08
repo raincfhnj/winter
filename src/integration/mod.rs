@@ -6,6 +6,7 @@
 //! channel's root `keybindings` array.
 
 mod discovery;
+mod encoding;
 mod fragment;
 mod helpers;
 mod jsonc;

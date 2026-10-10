@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A system switch key (`Alt+Tab`, `Ctrl+Tab`, `Alt+F4`, …) cancelling an armed
+  prefix now ends the session *and* its suppressed-key ledger. Previously only
+  the state was reset, so the consumed prefix key stayed suppressed: its key-up
+  was swallowed after the session had already died, and the next physical
+  prefix press was eaten as a stale release, forcing the user to press the
+  prefix twice before it armed again.
+- Mouse divider dragging no longer moves the wrong separator in nested layouts.
+  Winter proved nothing about *which* separator `resizePane` would move; in a
+  layout such as `[A|B]|C` the request recursed into the subtree containing the
+  focused pane and resized the inner `A|B` separator the parser had inferred
+  from the rectangles. Dragging now focuses a pane from which the separator
+  under the pointer is provably the one Windows Terminal resizes, verified
+  against every split tree consistent with the observed rectangles. Where that
+  cannot be proven the drag is not captured and the click passes through to
+  Windows Terminal instead of moving an unrelated separator.
+- Legacy migration sweeps both historical shell-marker spellings. The abandoned
+  project was branded `WinTerminalPP` and its prompt wrapper used that
+  spelling, but the sweep only knew the single-`P` `WinTerminalP` markers, so an
+  existing install kept a live `OSC 9;9` wrapper next to the new Winter block —
+  double-wrapped prompts on every PowerShell session, while `doctor` reported a
+  clean migration. The old test could not catch it: it asserted
+  `!contains("WinTerminalP")`, and `WinTerminalPP` contains that substring.
+
 ### Added
 
 - `winter ui`: a tmux-style session manager for the terminal it runs in.
@@ -38,6 +63,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Pane splitting no longer drops back to the default directory for PowerShell 7.
+  A missing `Documents\PowerShell` folder used to be reported as `Skipped` even
+  when `pwsh.exe` was installed, so the shell that most users actually run never
+  received the managed `OSC 9;9` prompt wrapper and every duplicate pane fell
+  back to Windows Terminal's `%USERPROFILE%` default. `winter install` now probes
+  for the host executable (`PATH`, including the Microsoft Store app execution
+  alias, plus the `%ProgramFiles%\PowerShell\7[-preview]` roots) and creates the
+  profile folder it needs; only a genuinely absent shell is still left untouched.
+- The managed prompt wrapper now reports `OSC 9;9` only while the session is on
+  the `FileSystem` provider (`$loc.ProviderPath`). A PSDrive such as `HKLM:\` was
+  previously reported verbatim, and Windows Terminal 1.25 and earlier accepts any
+  non-empty report, hands it to `CreateProcess`, and fails the split instead of
+  falling back to the profile's directory.
 - Fragment ownership records survive external reformatting: a semantically
   unchanged fragment no longer drops its manifest record, so `winter uninstall`
   can still remove it instead of reporting `Missing`.

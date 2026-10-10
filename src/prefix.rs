@@ -563,7 +563,13 @@ impl PrefixMachine {
         cancellation: Option<CancelReason>,
     ) -> PrefixOutcome {
         if is_system_shortcut(event.logical_key, event.modifiers) {
-            self.state = PrefixState::Idle;
+            // The session ends here, so the ledger ends with it. Clearing only
+            // `state` would strand the consumed prefix key in
+            // `suppressed_keys`: its key-up (and any repeat) would then be
+            // swallowed *after* the session died, and the next physical prefix
+            // press would be consumed as a stale release — the user would have
+            // to press the prefix twice to arm it again.
+            self.reset_transient_state();
             return PrefixOutcome::pass_through(
                 cancellation.or(Some(CancelReason::SystemShortcut)),
             );
@@ -1212,6 +1218,54 @@ mod tests {
             assert_eq!(outcome.disposition, KeyDisposition::PassThrough);
             assert_eq!(outcome.cancellation, Some(CancelReason::SystemShortcut));
         }
+    }
+
+    /// A system switch key ends the session, so the ledger must end with it:
+    /// the prefix key's key-up reaches the newly focused window instead of
+    /// being swallowed, and the next physical prefix press still arms.
+    #[test]
+    fn system_shortcut_ends_the_session_with_its_suppressed_ledger() {
+        let now = Instant::now();
+        let terminal = target(12);
+        let mut machine = PrefixMachine::default();
+        let _ = machine.handle_key_event(prefix_event(KeyTransition::Down, Some(terminal)), now);
+
+        let switched = machine.handle_key_event(
+            event(
+                COMMAND_KEY,
+                LogicalKey::Tab,
+                KeyTransition::Down,
+                Modifiers::new(false, true, false, false),
+                Some(terminal),
+            ),
+            now + Duration::from_millis(1),
+        );
+        assert_eq!(switched.disposition, KeyDisposition::PassThrough);
+        assert_eq!(switched.cancellation, Some(CancelReason::SystemShortcut));
+        assert!(!machine.is_armed());
+
+        // The user is now in another window and lets go of the prefix key.
+        let orphaned_up = machine.handle_key_event(
+            prefix_event(KeyTransition::Up, None),
+            now + Duration::from_millis(2),
+        );
+        assert_eq!(
+            orphaned_up.disposition,
+            KeyDisposition::PassThrough,
+            "the cancelled session must not keep swallowing the prefix key"
+        );
+
+        // Back in the terminal, one press must be enough to arm again.
+        let rearm = machine.handle_key_event(
+            prefix_event(KeyTransition::Down, Some(terminal)),
+            now + Duration::from_millis(3),
+        );
+        assert_eq!(
+            rearm.disposition,
+            KeyDisposition::Consume,
+            "the first prefix press after a system switch must arm the prefix"
+        );
+        assert!(machine.is_armed());
     }
 
     #[test]

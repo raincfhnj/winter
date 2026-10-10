@@ -322,6 +322,26 @@ mod tests {
         legacy_name: &str,
         extra_settings: Option<&Path>,
     ) -> IntegrationConfig {
+        seed_legacy_with_markers(
+            root,
+            legacy_name,
+            extra_settings,
+            ("WinTerminalP", "WinTerminalP"),
+        )
+    }
+
+    /// [`seed_legacy`] with an explicit shell-marker branding.
+    ///
+    /// The abandoned project was branded `WinTerminalPP` and its shell markup
+    /// said so; only the state directory and fragment were ever renamed to the
+    /// single-`P` spelling. Both spellings exist in the wild, so the fixture
+    /// must be able to seed either one.
+    fn seed_legacy_with_markers(
+        root: &Path,
+        legacy_name: &str,
+        extra_settings: Option<&Path>,
+        (marker_begin, marker_end): (&str, &str),
+    ) -> IntegrationConfig {
         let config = config_with(root);
         let legacy_dir = root.join(legacy_name);
 
@@ -363,9 +383,11 @@ mod tests {
         let profile_dir = config.documents_dir.join("WindowsPowerShell");
         fs::create_dir_all(&profile_dir).expect("profile dir");
         let profile = profile_dir.join("Microsoft.PowerShell_profile.ps1");
-        let legacy_block = "# >>> WinTerminalP shell integration >>>\n\
-            $Global:__WinTerminalP_PromptWrapped = $true\n\
-            # <<< WinTerminalP shell integration <<<\n";
+        let legacy_block = format!(
+            "# >>> {marker_begin} shell integration >>>\n\
+             $Global:__WinTerminalPP_PromptWrapped = $true\n\
+             # <<< {marker_end} shell integration <<<\n"
+        );
         fs::write(&profile, format!("Write-Host hi\n{legacy_block}")).expect("profile");
 
         let definition = serde_json::json!({
@@ -451,7 +473,10 @@ mod tests {
             .join("WindowsPowerShell")
             .join("Microsoft.PowerShell_profile.ps1");
         let profile_text = fs::read_to_string(profile).expect("profile");
-        assert!(!profile_text.contains("WinTerminalP"));
+        assert!(
+            !profile_text.contains("WinTerminalPP"),
+            "no legacy marker spelling may survive: {profile_text}"
+        );
         assert!(profile_text.contains("Winter shell integration"));
         assert!(profile_text.contains("Write-Host hi"));
 
@@ -465,6 +490,60 @@ mod tests {
             doctor.issues
         );
         super::super::install(&config).expect("second install is a no-op");
+    }
+
+    /// The abandoned project was branded `WinTerminalPP`, and the shell markup
+    /// it wrote carried that spelling. Sweeping only the single-`P` markers left
+    /// a live prompt wrapper behind next to the current Winter block, while
+    /// `doctor` reported a clean migration.
+    #[test]
+    fn double_p_shell_markers_are_swept_too() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = seed_legacy_with_markers(
+            temp.path(),
+            "WinTerminalPP",
+            None,
+            ("WinTerminalPP", "WinTerminalPP"),
+        );
+
+        super::super::install(&config).expect("install migrates then installs");
+
+        let profile = config
+            .documents_dir
+            .join("WindowsPowerShell")
+            .join("Microsoft.PowerShell_profile.ps1");
+        let profile_text = fs::read_to_string(&profile).expect("profile");
+        assert!(
+            !profile_text.contains("WinTerminalPP") && !profile_text.contains("WinTerminalP"),
+            "both historical marker spellings must be swept: {profile_text}"
+        );
+        assert!(
+            profile_text.contains("Write-Host hi"),
+            "unmanaged profile content must survive: {profile_text}"
+        );
+        assert_eq!(
+            profile_text.matches("Winter shell integration").count(),
+            2,
+            "exactly one current block must remain: {profile_text}"
+        );
+
+        // `install` adds the current Winter block afterwards, so the final
+        // report entry for this profile is an `Update`. The sweep leaves its
+        // own evidence: a `legacy-shell` backup of the bytes it removed.
+        let legacy_backups = fs::read_dir(config.state_dir.join("backups"))
+            .expect("backups directory")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("legacy-shell.")
+            })
+            .count();
+        assert_eq!(
+            legacy_backups, 1,
+            "the double-P block must have been swept through a legacy-shell backup"
+        );
     }
 
     #[test]

@@ -190,7 +190,11 @@ Terminal settings 是 JSONC，允许注释和尾逗号。Integration 使用 CST 
 
 ### PowerShell Shell Integration
 
-Windows Terminal 只有在 Shell 通过 `OSC 9;9` 报告 CWD 时，才会让 `splitMode: duplicate` 的窗格继承当前目录（WT 的 `_MakeTerminalPane` 读取活动控件的 `WorkingDirectory`）。因此 `winter install` 会向 `Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1` 和存在时的 `Documents\PowerShell\Microsoft.PowerShell_profile.ps1` 追加一段带 `# >>> Winter shell integration >>>` / `# <<< Winter shell integration <<<` 标记的提示符包装：它保存原 `prompt`，先输出 `OSC 9;9`，再调用原提示符。安装使用与 Terminal 配置相同的快照、备份和 CAS 写入；重复安装幂等，卸载只移除内容未被用户修改的受管块，用户改动会被保留并报告。写入保持原 Profile 编码（UTF-8 / UTF-16LE），无法识别的编码只报告为冲突、不修改文件。该步骤不参与 `bridge_is_ready` 判定，任何 Profile 失败都只体现在报告里，不影响控制器启动，只会失去目录继承。
+Windows Terminal 只有在 Shell 通过 `OSC 9;9` 报告 CWD 时，才会让 `splitMode: duplicate` 的窗格继承当前目录（WT 1.18–1.25 的 `_HandleSplitPane` 把聚焦 Tab 交给 `_MakeTerminalPane`，后者读取活动控件的 `WorkingDirectory`，只要该值非空就覆盖 Profile 的 `startingDirectory`，否则回落到默认的 `%USERPROFILE%`；`main`/1.26 起改为要求该值是一个存在的目录）。因此 `winter install` 会向 `Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1` 和 `Documents\PowerShell\Microsoft.PowerShell_profile.ps1` 追加一段带 `# >>> Winter shell integration >>>` / `# <<< Winter shell integration <<<` 标记的提示符包装：它保存原 `prompt`，先输出 `OSC 9;9`，再调用原提示符。安装使用与 Terminal 配置相同的快照、备份和 CAS 写入；重复安装幂等，卸载只移除内容未被用户修改的受管块，用户改动会被保留并报告。写入保持原 Profile 编码（UTF-8 / UTF-16LE），无法识别的编码只报告为冲突、不修改文件。该步骤不参与 `bridge_is_ready` 判定，任何 Profile 失败都只体现在报告里，不影响控制器启动，只会失去目录继承。
+
+PowerShell 7 自己不会创建 `Documents\PowerShell`：只要没有任何工具为它生成过 `$PROFILE`，该目录就不存在，而 `pwsh` 正是用它。旧实现把“目录不存在”一律当作“该 Shell 未安装”而跳过，结果是最常见的 pwsh 场景完全没有包装、分屏永远回落到 `%USERPROFILE%`。现在 `shell::ShellPresence` 会先探测宿主可执行文件（`PATH` 上的 `pwsh.exe`——覆盖 Microsoft Store 的应用执行别名——以及 MSI 安装根目录 `%ProgramFiles%\PowerShell\7[-preview]`；`powershell.exe` 同理探测 `System32`），只有确认宿主也不存在时才保持 `Skipped`；宿主存在而目录缺失时报告 `Create` 并由原子写入顺带创建目录。该探测结果按目标注入，`plan_with` / `install_with` 使单元测试不依赖运行测试的机器。
+
+提示符包装只在文件系统位置上报目录：`$loc.Provider.Name -eq 'FileSystem'` 时才输出 `$loc.ProviderPath`。1.25 及更早版本对上报表只做非空判断，把 `HKLM:\` 这类 PSDrive 路径原样交给 `CreateProcess` 会让下一次分屏直接失败（WT #20373）；非文件系统位置保持静默后，WT 会继续使用构造时预置的 Profile 目录，分屏至少能正常打开。
 
 ## 8. 安全边界
 
@@ -231,7 +235,8 @@ Windows Terminal 只有在 Shell 通过 `OSC 9;9` 报告 CWD 时，才会让 `sp
 
 - Windows Terminal 没有公开的远程 Action API或 pane tree 查询 API。
 - UI Automation 只暴露可见 `TermControl` 的屏幕矩形，不暴露真实 pane tree；因此拖动以可见相邻矩形推导分隔线，并使用 Terminal 原生约 5% 父区域步长，而不是像素级重排。
+- 由于没有 pane tree，Winter 无法直接指定"移动哪条分隔线"，只能先证明"指针下这条线就是 `resizePane` 会移动的那条"。`pane_layout` 的做法是选择一个可证的聚焦目标——贴布局前缘（或镜像的贴后缘）且一边正好落在该线上的窗格；焦点叶向上最近的同轴祖先节点的分隔线必然就是这条线，且该论证与具体树形无关。无法证明时（例如一排四个窗格的中间线，矩形在两种一致树形下给出不同归属）拖动**不捕获**、左键透传，由 Windows Terminal 自行处理：这是刻意的 fail-closed 取舍，宁可拖不动也不移动错的分隔线。真机探针 `pointer_drag_moves_only_the_dragged_divider` 断言"其他分隔线坐标不动"。
 - SendInput 在重验目标和实际输入之间存在不可完全消除的微小竞争窗口。
 - 控制器只能提供 tmux 风格操作，不提供 tmux 的后台 session server。
-- 当前目录复制由 Windows Terminal 的 `duplicate` 语义加 Shell Integration 提供；Winter 只负责安装受管的 `OSC 9;9` 提示符包装，Shell 不加载 Profile 时仍回退到 Windows Terminal 默认目录。
+- 当前目录复制由 Windows Terminal 的 `duplicate` 语义加 Shell Integration 提供；Winter 只负责安装受管的 `OSC 9;9` 提示符包装。包装只对新启动的 Shell 生效（已运行的会话需重新打开标签页或重新加载 Profile），cmd、WSL 等非 PowerShell Shell 不在包装范围内；Shell 不加载 Profile 时仍回退到 Windows Terminal 默认目录。
 - Windows Terminal 不公开 Action 执行回执或 pane tree 查询；`SendInput` 成功只证明事件已插入，不能单独证明布局已改变。

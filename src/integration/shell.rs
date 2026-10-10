@@ -1,10 +1,18 @@
 //! Managed PowerShell shell integration.
 //!
 //! Windows Terminal only inherits the working directory of a duplicated pane
-//! when the shell reports it through the `OSC 9;9` sequence. Winter
-//! therefore appends a small, reversible prompt wrapper to the PowerShell
-//! profiles so that `splitPane` with `splitMode: duplicate` starts in the same
-//! directory as the focused pane.
+//! when the shell reports it through the `OSC 9;9` sequence (WT keeps the
+//! pane's `WorkingDirectory` from that sequence and only falls back to the
+//! profile's `startingDirectory` — `%USERPROFILE%` by default — when the
+//! sequence never arrived). Winter therefore appends a small, reversible
+//! prompt wrapper to the PowerShell profiles so that `splitPane` with
+//! `splitMode: duplicate` starts in the same directory as the focused pane.
+//!
+//! PowerShell 7 does not create `Documents\PowerShell` on its own, so a
+//! machine where nothing scaffolded a `$PROFILE` has no profile folder for the
+//! shell the user actually runs. [`ShellPresence`] decides whether a missing
+//! folder means "this shell is installed, create it" or "this shell is absent,
+//! leave the machine alone".
 
 use std::path::{Path, PathBuf};
 
@@ -17,10 +25,31 @@ use super::types::{ChangeStatus, IntegrationConfig, ShellIntegrationReport, Shel
 const BEGIN_MARKER: &str = "# >>> Winter shell integration >>>";
 const END_MARKER: &str = "# <<< Winter shell integration <<<";
 
-/// Historical marker pair written by pre-Winter releases; referenced only by
-/// the one-shot migration in [`super::legacy`].
-pub(super) const LEGACY_BEGIN_MARKER: &str = "# >>> WinTerminalP shell integration >>>";
-pub(super) const LEGACY_END_MARKER: &str = "# <<< WinTerminalP shell integration <<<";
+/// Every historical marker pair written by pre-Winter releases, newest
+/// branding first; referenced only by the one-shot migration in
+/// [`super::legacy`].
+///
+/// The abandoned project was branded `WinTerminalPP`, while its state
+/// directory and fragment were briefly renamed to `WinTerminalP`. Both
+/// spellings exist in the wild for the shell markup, so the sweep must know
+/// every one of them — see [`uninstall_legacy`].
+const LEGACY_SHELL_MARKER_PAIRS: [(&str, &str); 2] = [
+    (
+        "# >>> WinTerminalPP shell integration >>>",
+        "# <<< WinTerminalPP shell integration <<<",
+    ),
+    (
+        "# >>> WinTerminalP shell integration >>>",
+        "# <<< WinTerminalP shell integration <<<",
+    ),
+];
+
+/// Start and end offsets of a located marker block, markers included.
+#[derive(Clone, Copy)]
+struct MarkerBlock {
+    start: usize,
+    end: usize,
+}
 
 const SNIPPET_BODY: &str = r#"# Managed by Winter. Run `winter uninstall` to remove this block.
 if (-not $Global:__Winter_PromptWrapped) {
@@ -28,7 +57,15 @@ if (-not $Global:__Winter_PromptWrapped) {
     $Global:__Winter_OriginalPrompt = $function:prompt
     function global:prompt {
         $__winterLocation = $ExecutionContext.SessionState.Path.CurrentLocation
-        $__winterOsc = "$([char]27)]9;9;`"$__winterLocation`"$([char]7)"
+        # Only a filesystem path is a working directory. Windows Terminal <= 1.25
+        # accepts any non-empty report and hands it to CreateProcess, so a PSDrive
+        # such as `HKLM:\` would make the next split fail instead of falling back.
+        $__winterOsc = if ($__winterLocation.Provider.Name -eq 'FileSystem') {
+            "$([char]27)]9;9;`"$($__winterLocation.ProviderPath)`"$([char]7)"
+        }
+        else {
+            $null
+        }
         $__winterBase = if ($Global:__Winter_OriginalPrompt) {
             & $Global:__Winter_OriginalPrompt
         }
@@ -36,9 +73,12 @@ if (-not $Global:__Winter_PromptWrapped) {
             "PS $__winterLocation> "
         }
         if ($__winterBase -is [System.Array]) {
+            if ($null -eq $__winterOsc) {
+                return $__winterBase
+            }
             return @($__winterOsc) + @($__winterBase)
         }
-        return $__winterOsc + [string]$__winterBase
+        return [string]$__winterOsc + [string]$__winterBase
     }
 }"#;
 
@@ -46,6 +86,9 @@ fn managed_block(newline: &str) -> String {
     let body = SNIPPET_BODY.replace("\r\n", "\n").replace('\n', newline);
     format!("{BEGIN_MARKER}{newline}{body}{newline}{END_MARKER}")
 }
+
+/// Extra context on a `Create` plan entry whose shell has no profile folder yet.
+const CREATE_FOLDER_MESSAGE: &str = "profile folder will be created";
 
 fn profile_targets(config: &IntegrationConfig) -> [(ShellKind, PathBuf); 2] {
     [
@@ -66,22 +109,140 @@ fn profile_targets(config: &IntegrationConfig) -> [(ShellKind, PathBuf); 2] {
     ]
 }
 
+/// Whether the hosts that own the managed profiles are installed.
+///
+/// PowerShell 7 never creates `Documents\PowerShell` by itself, so that folder
+/// is missing on every machine where nothing scaffolded a `$PROFILE` yet.
+/// Skipping the target there silently costs working-directory inheritance for
+/// every `pwsh` pane, so a missing folder is only treated as "this shell is
+/// absent" when its host executable cannot be found either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShellPresence {
+    windows_powershell: bool,
+    powershell: bool,
+}
+
+impl ShellPresence {
+    /// Probes `PATH` — which carries the Microsoft Store `pwsh.exe` app
+    /// execution alias — and then the standard install roots, so an install
+    /// started from an environment with a trimmed `PATH` still finds the host.
+    fn detect() -> Self {
+        let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+            .map_or_else(Vec::new, |path| std::env::split_paths(&path).collect());
+        Self {
+            windows_powershell: shell_host_is_installed(ShellKind::WindowsPowerShell, &path_dirs),
+            powershell: shell_host_is_installed(ShellKind::PowerShell, &path_dirs),
+        }
+    }
+
+    const fn is_present(self, shell: ShellKind) -> bool {
+        match shell {
+            ShellKind::WindowsPowerShell => self.windows_powershell,
+            ShellKind::PowerShell => self.powershell,
+        }
+    }
+}
+
+/// File name of the host executable that owns each shell's profile.
+const fn host_executable(shell: ShellKind) -> &'static str {
+    match shell {
+        ShellKind::WindowsPowerShell => "powershell.exe",
+        ShellKind::PowerShell => "pwsh.exe",
+    }
+}
+
+fn shell_host_is_installed(shell: ShellKind, path_dirs: &[PathBuf]) -> bool {
+    let name = host_executable(shell);
+    find_executable(path_dirs.iter().map(PathBuf::as_path), name).is_some()
+        || host_candidates(shell)
+            .iter()
+            .any(|candidate| candidate.is_file())
+}
+
+/// First existing `name` below `directories`, mirroring Windows `PATH` lookup.
+fn find_executable<'a>(directories: impl Iterator<Item = &'a Path>, name: &str) -> Option<PathBuf> {
+    directories
+        .map(|directory| directory.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Well-known host locations used when `PATH` does not carry them: the
+/// per-user Store app execution alias and the MSI install roots.
+fn host_candidates(shell: ShellKind) -> Vec<PathBuf> {
+    let executable = host_executable(shell);
+    let mut candidates = Vec::new();
+    match shell {
+        ShellKind::WindowsPowerShell => {
+            if let Some(root) = std::env::var_os("SystemRoot") {
+                candidates.push(
+                    PathBuf::from(root)
+                        .join("System32")
+                        .join("WindowsPowerShell")
+                        .join("v1.0")
+                        .join(executable),
+                );
+            }
+        }
+        ShellKind::PowerShell => {
+            for variable in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+                if let Some(root) = std::env::var_os(variable) {
+                    let root = PathBuf::from(root).join("PowerShell");
+                    candidates.push(root.join("7").join(executable));
+                    candidates.push(root.join("7-preview").join(executable));
+                }
+            }
+            if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+                candidates.push(
+                    PathBuf::from(local)
+                        .join("Microsoft")
+                        .join("WindowsApps")
+                        .join(executable),
+                );
+            }
+        }
+    }
+    candidates
+}
+
+/// Whether a profile path can receive the managed block right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileFolder {
+    /// The folder exists; only the profile file decides the next step.
+    Present,
+    /// The folder is missing, but its shell is installed and the write creates it.
+    Creatable,
+    /// The folder is missing and its shell is not installed; leave it alone.
+    Absent,
+}
+
+fn profile_folder(path: &Path, shell: ShellKind, presence: ShellPresence) -> ProfileFolder {
+    if path.parent().is_some_and(Path::is_dir) {
+        ProfileFolder::Present
+    } else if presence.is_present(shell) {
+        ProfileFolder::Creatable
+    } else {
+        ProfileFolder::Absent
+    }
+}
+
+/// Message for a skipped entry: neither the folder nor the host exists.
+fn absent_message(shell: ShellKind) -> String {
+    format!(
+        "profile folder is not present and no {} was found",
+        host_executable(shell)
+    )
+}
+
 /// Plans both profiles. Per-profile failures are reported on that profile's
 /// entry — content conflicts as `Conflict`, environmental I/O failures as
 /// `Skipped` — instead of aborting the whole command, so a broken profile
 /// never blocks the Terminal action bridge.
 pub(crate) fn plan(config: &IntegrationConfig) -> Vec<ShellIntegrationReport> {
-    profile_targets(config)
-        .into_iter()
-        .map(|(shell, path)| plan_profile(shell, &path))
-        .collect()
+    plan_with(config, ShellPresence::detect())
 }
 
 pub(crate) fn install(config: &IntegrationConfig) -> Vec<ShellIntegrationReport> {
-    profile_targets(config)
-        .into_iter()
-        .map(|(shell, path)| install_profile(config, shell, &path))
-        .collect()
+    install_with(config, ShellPresence::detect())
 }
 
 pub(crate) fn uninstall(config: &IntegrationConfig) -> Vec<ShellIntegrationReport> {
@@ -91,26 +252,61 @@ pub(crate) fn uninstall(config: &IntegrationConfig) -> Vec<ShellIntegrationRepor
         .collect()
 }
 
-fn plan_profile(shell: ShellKind, path: &Path) -> ShellIntegrationReport {
-    plan_profile_inner(shell, path).unwrap_or_else(|error| shell_error(shell, path, error))
+/// [`plan`] with an explicit shell presence, so tests never depend on the
+/// machine that runs them.
+fn plan_with(config: &IntegrationConfig, presence: ShellPresence) -> Vec<ShellIntegrationReport> {
+    profile_targets(config)
+        .into_iter()
+        .map(|(shell, path)| plan_profile(shell, &path, presence))
+        .collect()
 }
 
-fn plan_profile_inner(shell: ShellKind, path: &Path) -> AppResult<ShellIntegrationReport> {
+/// [`install`] with an explicit shell presence.
+fn install_with(
+    config: &IntegrationConfig,
+    presence: ShellPresence,
+) -> Vec<ShellIntegrationReport> {
+    profile_targets(config)
+        .into_iter()
+        .map(|(shell, path)| install_profile(config, shell, &path, presence))
+        .collect()
+}
+
+fn plan_profile(shell: ShellKind, path: &Path, presence: ShellPresence) -> ShellIntegrationReport {
+    plan_profile_inner(shell, path, presence)
+        .unwrap_or_else(|error| shell_error(shell, path, error))
+}
+
+fn plan_profile_inner(
+    shell: ShellKind,
+    path: &Path,
+    presence: ShellPresence,
+) -> AppResult<ShellIntegrationReport> {
     let Some(snapshot) = read_optional_snapshot(path)? else {
-        return Ok(report(
-            shell,
-            path,
-            skipped_or(ChangeStatus::Create, path),
-            None,
-            None,
-        ));
+        return Ok(match profile_folder(path, shell, presence) {
+            ProfileFolder::Absent => report(
+                shell,
+                path,
+                ChangeStatus::Skipped,
+                None,
+                Some(absent_message(shell)),
+            ),
+            ProfileFolder::Present => report(shell, path, ChangeStatus::Create, None, None),
+            ProfileFolder::Creatable => report(
+                shell,
+                path,
+                ChangeStatus::Create,
+                None,
+                Some(CREATE_FOLDER_MESSAGE.to_owned()),
+            ),
+        });
     };
     let (_, text) = decode_profile(path, &snapshot.bytes)?;
     Ok(match block_state(&text, BEGIN_MARKER, END_MARKER) {
         BlockState::Absent => report(shell, path, ChangeStatus::Update, None, None),
-        BlockState::Present { start, end } => {
+        BlockState::Present(block) => {
             let desired = managed_block(detect_newline(&text));
-            if normalized_eq(&text[start..end], &desired) {
+            if normalized_eq(&text[block.start..block.end], &desired) {
                 report(shell, path, ChangeStatus::Unchanged, None, None)
             } else {
                 report(shell, path, ChangeStatus::Update, None, None)
@@ -126,8 +322,9 @@ fn install_profile(
     config: &IntegrationConfig,
     shell: ShellKind,
     path: &Path,
+    presence: ShellPresence,
 ) -> ShellIntegrationReport {
-    install_profile_inner(config, shell, path)
+    install_profile_inner(config, shell, path, presence)
         .unwrap_or_else(|error| shell_error(shell, path, error))
 }
 
@@ -135,17 +332,21 @@ fn install_profile_inner(
     config: &IntegrationConfig,
     shell: ShellKind,
     path: &Path,
+    presence: ShellPresence,
 ) -> AppResult<ShellIntegrationReport> {
     let Some(snapshot) = read_optional_snapshot(path)? else {
-        if !path.parent().is_some_and(Path::is_dir) {
+        if profile_folder(path, shell, presence) == ProfileFolder::Absent {
             return Ok(report(
                 shell,
                 path,
                 ChangeStatus::Skipped,
                 None,
-                Some("profile folder is not present".to_owned()),
+                Some(absent_message(shell)),
             ));
         }
+        // `atomic_replace` creates a missing parent folder, so an installed
+        // shell that never scaffolded `Documents\PowerShell` still receives
+        // the wrapper on this first install.
         let block = managed_block("\r\n");
         let mut bytes = block.into_bytes();
         bytes.push(b'\r');
@@ -164,16 +365,16 @@ fn install_profile_inner(
             None,
             Some(message),
         )),
-        BlockState::Present { start, end } => {
+        BlockState::Present(block) => {
             let desired = managed_block(newline);
-            if normalized_eq(&text[start..end], &desired) {
+            if normalized_eq(&text[block.start..block.end], &desired) {
                 return Ok(report(shell, path, ChangeStatus::Unchanged, None, None));
             }
             let backup = create_backup(&config.state_dir, "shell", path, &snapshot)?;
             let mut updated = String::with_capacity(text.len());
-            updated.push_str(&text[..start]);
+            updated.push_str(&text[..block.start]);
             updated.push_str(&desired);
-            updated.push_str(&text[end..]);
+            updated.push_str(&text[block.end..]);
             write_profile(path, encoding, &updated, Some(&snapshot.sha256))?;
             Ok(report(
                 shell,
@@ -227,26 +428,40 @@ fn uninstall_profile_inner(
     )
 }
 
-/// Removes the historical block written by pre-Winter releases.
+/// Removes every historical block written by pre-Winter releases.
+///
+/// Both historical spellings are swept. The branding of the abandoned project
+/// was `WinTerminalPP`, and only the state directory and fragment were ever
+/// renamed to the single-`P` `WinTerminalP`; the shell markers stayed
+/// double-`P` on the machines that actually received them. Sweeping only the
+/// single-`P` spelling therefore left a live `OSC 9;9` prompt wrapper behind
+/// next to the current Winter block — double-wrapped prompts on every new
+/// PowerShell session, while `winter doctor` reported a clean migration.
 ///
 /// The legacy markers are namespaced to this project, so a well-formed block
 /// is removed even when its content was edited; the current-marker path keeps
 /// edited blocks (see [`uninstall_profile_inner`]).
 pub(super) fn uninstall_legacy(config: &IntegrationConfig) -> Vec<ShellIntegrationReport> {
-    profile_targets(config)
-        .into_iter()
-        .map(|(shell, path)| {
-            uninstall_profile_with(
+    // A missing profile is reported once per marker pair, and an absent block
+    // reports `Missing`, so the pair that actually removes a block is the last
+    // report for that profile — which is what owns the meaningful status.
+    let mut reports: Vec<ShellIntegrationReport> = Vec::new();
+    for (shell, path) in profile_targets(config) {
+        for (begin_marker, end_marker) in LEGACY_SHELL_MARKER_PAIRS {
+            let report = uninstall_profile_with(
                 config,
                 shell,
                 &path,
-                LEGACY_BEGIN_MARKER,
-                LEGACY_END_MARKER,
+                begin_marker,
+                end_marker,
                 BlockPolicy::RemoveEvenIfEdited,
             )
-            .unwrap_or_else(|error| shell_error(shell, &path, error))
-        })
-        .collect()
+            .unwrap_or_else(|error| shell_error(shell, &path, error));
+            reports.retain(|existing| !(existing.shell == shell && existing.path == report.path));
+            reports.push(report);
+        }
+    }
+    reports
 }
 
 /// Whether an edited managed block may be removed (`RemoveEvenIfEdited`, used
@@ -290,10 +505,10 @@ fn uninstall_profile_with(
             None,
             Some(message),
         )),
-        BlockState::Present { start, end } => {
+        BlockState::Present(block) => {
             let newline = detect_newline(&text);
             if policy == BlockPolicy::PreserveEdited
-                && !normalized_eq(&text[start..end], &managed_block(newline))
+                && !normalized_eq(&text[block.start..block.end], &managed_block(newline))
             {
                 return Ok(report(
                     shell,
@@ -309,11 +524,11 @@ fn uninstall_profile_with(
                 "shell"
             };
             let backup = create_backup(&config.state_dir, backup_label, path, &snapshot)?;
-            let mut block_start = start;
+            let mut block_start = block.start;
             if block_start >= newline.len() && text[..block_start].ends_with(newline) {
                 block_start -= newline.len();
             }
-            let mut block_end = end;
+            let mut block_end = block.end;
             if &text[block_end..] == newline {
                 block_end += newline.len();
             }
@@ -370,14 +585,6 @@ fn shell_error(shell: ShellKind, path: &Path, error: AppError) -> ShellIntegrati
         _ => ChangeStatus::Conflict,
     };
     report(shell, path, status, None, Some(error.to_string()))
-}
-
-fn skipped_or(status: ChangeStatus, path: &Path) -> ChangeStatus {
-    if path.parent().is_some_and(Path::is_dir) {
-        status
-    } else {
-        ChangeStatus::Skipped
-    }
 }
 
 /// Encoding of an existing profile. The managed block is written back in the
@@ -455,7 +662,7 @@ fn normalized_eq(left: &str, right: &str) -> bool {
 
 enum BlockState {
     Absent,
-    Present { start: usize, end: usize },
+    Present(MarkerBlock),
     Malformed(String),
 }
 
@@ -472,10 +679,10 @@ fn block_state(text: &str, begin_marker: &str, end_marker: &str) -> BlockState {
     match (begin, end) {
         (None, None) => BlockState::Absent,
         (Some(begin), Some(end)) if begin_count == 1 && end_count == 1 && end >= begin => {
-            BlockState::Present {
+            BlockState::Present(MarkerBlock {
                 start: begin,
                 end: end + end_marker.len(),
-            }
+            })
         }
         _ => {
             let mut message = format!(
@@ -495,6 +702,31 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    /// Presence used by the shared test helpers: both hosts count as installed,
+    /// so no test depends on what the machine running it has on `PATH`.
+    const BOTH_SHELLS: ShellPresence = ShellPresence {
+        windows_powershell: true,
+        powershell: true,
+    };
+
+    /// Presence of a machine that has neither PowerShell host installed.
+    const NO_SHELLS: ShellPresence = ShellPresence {
+        windows_powershell: false,
+        powershell: false,
+    };
+
+    /// Shadows the production wrappers for the whole module, so every existing
+    /// test keeps its explicit, host-independent shell presence. Tests that
+    /// exercise detection use [`plan_with`]/[`install_with`] directly.
+    fn plan(config: &IntegrationConfig) -> Vec<ShellIntegrationReport> {
+        plan_with(config, BOTH_SHELLS)
+    }
+
+    /// See [`plan`]: the test-module counterpart of [`super::install`].
+    fn install(config: &IntegrationConfig) -> Vec<ShellIntegrationReport> {
+        install_with(config, BOTH_SHELLS)
+    }
 
     fn config_with(root: &Path) -> IntegrationConfig {
         IntegrationConfig::new(root, root.join("state"), root.join("Documents"))
@@ -529,6 +761,20 @@ mod tests {
             .find(|entry| entry.shell == ShellKind::WindowsPowerShell)
             .expect("windows powershell target");
         assert_eq!(windows.status, ChangeStatus::Unchanged);
+    }
+
+    #[test]
+    fn prompt_wrapper_reports_only_filesystem_locations() {
+        let block = managed_block("\n");
+        assert!(
+            block.contains("]9;9;") && block.contains("ProviderPath"),
+            "the wrapper must report the working directory through the provider path"
+        );
+        assert!(
+            block.contains("$__winterLocation.Provider.Name -eq 'FileSystem'"),
+            "a PSDrive such as HKLM:\\ must not be reported: Windows Terminal <= 1.25 \
+             hands any non-empty report to CreateProcess and the next split then fails"
+        );
     }
 
     #[test]
@@ -582,18 +828,127 @@ mod tests {
     }
 
     #[test]
-    fn install_skips_a_shell_without_a_profile_folder() {
+    fn install_skips_a_shell_that_is_not_installed() {
         let temp = tempfile::tempdir().expect("temporary directory should be created");
         let config = config_with(temp.path());
         fs::create_dir_all(config.documents_dir.join("WindowsPowerShell"))
             .expect("profile directory should be created");
 
-        let report = install(&config);
+        let report = install_with(&config, NO_SHELLS);
         let powershell = report
             .iter()
             .find(|entry| entry.shell == ShellKind::PowerShell)
             .expect("powershell target");
         assert_eq!(powershell.status, ChangeStatus::Skipped);
+        let message = powershell
+            .message
+            .as_deref()
+            .expect("a skipped shell should explain itself");
+        assert!(
+            message.contains("profile folder is not present") && message.contains("pwsh.exe"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            !config.documents_dir.join("PowerShell").exists(),
+            "an absent shell must not get a profile folder"
+        );
+    }
+
+    #[test]
+    fn install_creates_the_profile_folder_of_an_installed_shell() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let config = config_with(temp.path());
+        let presence = ShellPresence {
+            windows_powershell: false,
+            powershell: true,
+        };
+        assert!(
+            !config.documents_dir.join("PowerShell").exists(),
+            "the fixture must start without a PowerShell 7 profile folder"
+        );
+
+        let report = install_with(&config, presence);
+        let powershell = report
+            .iter()
+            .find(|entry| entry.shell == ShellKind::PowerShell)
+            .expect("powershell target");
+        assert_eq!(powershell.status, ChangeStatus::Create);
+
+        let profile = config
+            .documents_dir
+            .join("PowerShell")
+            .join("Microsoft.PowerShell_profile.ps1");
+        let text = fs::read_to_string(&profile).expect("created profile should be readable");
+        assert_eq!(text.matches(BEGIN_MARKER).count(), 1);
+        assert_eq!(text.matches(END_MARKER).count(), 1);
+        assert!(text.contains("]9;9;"));
+
+        let again = install_with(&config, presence);
+        let powershell = again
+            .iter()
+            .find(|entry| entry.shell == ShellKind::PowerShell)
+            .expect("powershell target");
+        assert_eq!(
+            powershell.status,
+            ChangeStatus::Unchanged,
+            "a second install must be idempotent after creating the folder"
+        );
+    }
+
+    #[test]
+    fn plan_announces_the_folder_it_will_create() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let config = config_with(temp.path());
+        let presence = ShellPresence {
+            windows_powershell: true,
+            powershell: true,
+        };
+
+        let report = plan_with(&config, presence);
+        for entry in &report {
+            assert_eq!(
+                entry.status,
+                ChangeStatus::Create,
+                "{:?} should be creatable",
+                entry.shell
+            );
+            assert_eq!(entry.message.as_deref(), Some(CREATE_FOLDER_MESSAGE));
+        }
+        assert!(
+            !config.documents_dir.join("PowerShell").exists(),
+            "planning must not create anything"
+        );
+
+        let absent = plan_with(&config, NO_SHELLS);
+        for entry in &absent {
+            assert_eq!(entry.status, ChangeStatus::Skipped);
+        }
+    }
+
+    #[test]
+    fn find_executable_returns_the_first_hit_in_path_order() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir_all(&first).expect("first directory should be created");
+        fs::create_dir_all(&second).expect("second directory should be created");
+        let executable = second.join("pwsh.exe");
+        fs::write(&executable, b"stub").expect("stub executable should be written");
+
+        let directories = [first.as_path(), second.as_path()];
+        assert_eq!(
+            find_executable(directories.into_iter(), "pwsh.exe"),
+            Some(executable)
+        );
+        assert_eq!(
+            find_executable(directories.into_iter(), "powershell.exe"),
+            None
+        );
+        assert_eq!(
+            find_executable(std::iter::empty(), "pwsh.exe"),
+            None,
+            "an empty PATH must not panic"
+        );
     }
 
     #[test]
@@ -892,8 +1247,8 @@ mod tests {
 
         let well_formed = format!("content\n{}\nmore", managed_block("\n"));
         match block_state(&well_formed, BEGIN_MARKER, END_MARKER) {
-            BlockState::Present { start, end } => {
-                assert_eq!(&well_formed[start..end], managed_block("\n"));
+            BlockState::Present(block) => {
+                assert_eq!(&well_formed[block.start..block.end], managed_block("\n"));
             }
             _ => panic!("a single well-formed block must be present"),
         }

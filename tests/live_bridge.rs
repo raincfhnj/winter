@@ -23,13 +23,23 @@
 //! - `WINTERMINAL_E2E_EXPECTED_PANES` (optional): expected pane count for the
 //!   geometry test; defaults to `2`. The divider assertion only runs when the
 //!   expected count is greater than `1`.
+//! - `WINTERMINAL_E2E_DRAG_PHASE` (`baseline` or `verify`), plus
+//!   `WINTERMINAL_E2E_DRAG_POINT=x,y` for the baseline phase: drives
+//!   `pointer_drag_moves_only_the_dragged_divider`, the two-phase probe for the
+//!   pointer-drag path. Optional: `WINTERMINAL_E2E_DRAG_BASELINE` (snapshot
+//!   path, default `%TEMP%\winter-drag-baseline.txt`),
+//!   `WINTERMINAL_E2E_DRAG_DELTA` (pixels the operator drags, default `120`),
+//!   `WINTERMINAL_E2E_DRAG_DIRECTION` (`left|right|up|down`),
+//!   `WINTERMINAL_E2E_DRAG_EXPECT` (`move` or `pass-through`),
+//!   `WINTERMINAL_E2E_DRAG_ALLOW_NATIVE=1`.
 
 use std::env;
+use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use winter::keymap::binding_for_action;
-use winter::pane_layout::PaneLayout;
+use winter::pane_layout::{PaneLayout, ScreenPoint, SplitAxis};
 use winter::platform::windows::{
     HookDecision, InputHook, TerminalAccessibility, foreground_terminal_window, send_bridge_chord,
     terminal_window_identity,
@@ -215,6 +225,386 @@ fn native_pane_geometry_from_environment() {
         == Some(target)
     {
         assert_eq!(focused_panes, 1);
+    }
+}
+
+/// Two-phase probe for the pointer-drag path on a dedicated Terminal window.
+///
+/// The bridge never injects pointer input, so one run cannot drag anything: the
+/// operator performs the drag between the two phases.
+///
+/// Reproduce the P1-2 check on a three-pane row (`split-right`, then
+/// `split-right` again so the layout is `[A|B|C]`):
+///
+/// 1. Position the pointer over the `B|C` divider and run the baseline phase:
+///
+///    ```text
+///    $env:WINTERMINAL_E2E_HWND="1234"
+///    $env:WINTERMINAL_E2E_DRAG_PHASE="baseline"
+///    $env:WINTERMINAL_E2E_DRAG_POINT="600,250"   # on the B|C divider
+///    cargo test --locked --test live_bridge -- --ignored --exact \
+///      pointer_drag_moves_only_the_dragged_divider --nocapture
+///    ```
+///
+///    Expect `WINTERMINAL_E2E_DRAG_EXPECT=move` and a focus target inside `C`
+///    (the pane on the trailing side), *not* inside `B`: focusing `B` is what
+///    made Windows Terminal resize `A|B` instead.
+/// 2. Drag that divider `WINTERMINAL_E2E_DRAG_DELTA` (default 120) pixels to
+///    the right, slowly enough to produce more than one resize step, then
+///    release the button.
+/// 3. Run the same command with `WINTERMINAL_E2E_DRAG_PHASE="verify"` and
+///    `WINTERMINAL_E2E_DRAG_DIRECTION="right"`. The probe re-reads the window
+///    and asserts that the dragged line moved by at least half the requested
+///    distance in the requested direction *and that every other divider line
+///    kept its coordinate*. A pre-fix run moves the `A|B` line instead, which
+///    fails that last assertion.
+///
+/// For a divider whose owning splitter cannot be proven from the rectangles
+/// (e.g. the middle divider of four panes in a row) the baseline phase reports
+/// `WINTERMINAL_E2E_DRAG_EXPECT=pass-through`: the bridge must not capture the
+/// drag at all. Run steps 1-3 with that expectation and the probe asserts the
+/// dragged line did not move either — unless `WINTERMINAL_E2E_DRAG_ALLOW_NATIVE=1`
+/// is set, which records the result without asserting it when the installed
+/// Windows Terminal implements divider dragging itself.
+#[test]
+#[ignore = "requires a dedicated Windows Terminal window and a manual pointer drag"]
+fn pointer_drag_moves_only_the_dragged_divider() {
+    let phase = env::var("WINTERMINAL_E2E_DRAG_PHASE")
+        .expect("WINTERMINAL_E2E_DRAG_PHASE must be set to baseline or verify");
+    let layout = live_pane_layout();
+    let vertical = divider_coordinates(&layout, SplitAxis::Vertical);
+    let horizontal = divider_coordinates(&layout, SplitAxis::Horizontal);
+    let delta = drag_delta();
+
+    match phase.as_str() {
+        "baseline" => {
+            let point = parse_point(
+                &env::var("WINTERMINAL_E2E_DRAG_POINT")
+                    .expect("WINTERMINAL_E2E_DRAG_POINT must be set to x,y on the divider to drag"),
+            );
+            let divider = layout.divider_at(point, 0).unwrap_or_else(|| {
+                panic!("no divider at {point:?}; vertical {vertical:?} / horizontal {horizontal:?}")
+            });
+            let focus = divider.resize_focus_point();
+            let expect = if focus.is_some() {
+                "move"
+            } else {
+                "pass-through"
+            };
+            println!(
+                "WINTERMINAL_E2E_DRAG_DIVIDER={:?}@{} span {}..{}",
+                divider.axis(),
+                divider.coordinate(),
+                divider.span_start(),
+                divider.span_end()
+            );
+            println!("WINTERMINAL_E2E_DRAG_EXPECT={expect}");
+            println!("WINTERMINAL_E2E_DRAG_FOCUS={focus:?}");
+            if let Some(focus) = focus {
+                let title = layout
+                    .panes()
+                    .iter()
+                    .find(|pane| pane.bounds.contains(focus))
+                    .map_or("<no pane>", |pane| pane.title.as_str());
+                println!("WINTERMINAL_E2E_DRAG_FOCUS_PANE={title:?}");
+            }
+            println!(
+                "WINTERMINAL_E2E_DRAG_VERTICAL={}",
+                format_coordinates(&vertical)
+            );
+            println!(
+                "WINTERMINAL_E2E_DRAG_HORIZONTAL={}",
+                format_coordinates(&horizontal)
+            );
+
+            let baseline = format!(
+                "point={},{}\naxis={}\ncoordinate={}\nexpect={expect}\nvertical={}\nhorizontal={}\n",
+                point.x,
+                point.y,
+                axis_name(divider.axis()),
+                divider.coordinate(),
+                format_coordinates(&vertical),
+                format_coordinates(&horizontal),
+            );
+            let path = baseline_path();
+            std::fs::write(&path, baseline).expect("the baseline snapshot must be writable");
+            println!("WINTERMINAL_E2E_DRAG_BASELINE={}", path.display());
+            println!(
+                "Drag the {expect} divider at ({}, {}) by about {delta}px, release, then run the \
+                 verify phase.",
+                point.x, point.y
+            );
+        }
+        "verify" => {
+            let path = baseline_path();
+            let baseline = DragBaseline::parse(
+                &std::fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("read {}: {error}", path.display())),
+            );
+            println!("WINTERMINAL_E2E_DRAG_BASELINE={}", path.display());
+            println!(
+                "WINTERMINAL_E2E_DRAG_BASELINE_LINES={:?}",
+                (dragged_list(&baseline), other_list(&baseline))
+            );
+            println!(
+                "WINTERMINAL_E2E_DRAG_CURRENT_LINES={:?}",
+                (
+                    dragged_current(&baseline, &vertical, &horizontal),
+                    other_current(&baseline, &vertical, &horizontal)
+                )
+            );
+
+            // Core P1-2 contract: whatever the bridge decided, it must never
+            // move a divider other than the one under the pointer.
+            let (other_gone, other_appeared) = unmatched_coordinates(
+                other_list(&baseline),
+                &other_current(&baseline, &vertical, &horizontal),
+                1,
+            );
+            assert!(
+                other_gone.is_empty() && other_appeared.is_empty(),
+                "a divider other than the dragged one moved: gone {other_gone:?}, \
+                 appeared {other_appeared:?}"
+            );
+
+            let (gone, appeared) = unmatched_coordinates(
+                dragged_list(&baseline),
+                &dragged_current(&baseline, &vertical, &horizontal),
+                1,
+            );
+            match baseline.expect.as_str() {
+                "move" => {
+                    assert!(
+                        gone.is_empty(),
+                        "the dragged divider at {} disappeared: gone {gone:?}",
+                        baseline.coordinate
+                    );
+                    assert_eq!(
+                        appeared.len(),
+                        1,
+                        "exactly one dragged divider line must appear, got {appeared:?}"
+                    );
+                    let moved = appeared[0] - baseline.coordinate;
+                    assert!(
+                        moved.abs() >= (delta / 2).max(1),
+                        "the dragged divider moved {moved}px, expected at least {}px for a \
+                         {delta}px drag",
+                        (delta / 2).max(1)
+                    );
+                    if let Ok(name) = env::var("WINTERMINAL_E2E_DRAG_DIRECTION") {
+                        let direction = parse_direction(&name)
+                            .expect("WINTERMINAL_E2E_DRAG_DIRECTION must be left/right/up/down");
+                        let positive = matches!(direction, Direction::Right | Direction::Down);
+                        assert_eq!(
+                            moved > 0,
+                            positive,
+                            "the dragged divider moved {moved}px, opposite to {name:?}"
+                        );
+                    }
+                }
+                "pass-through" => {
+                    if env::var("WINTERMINAL_E2E_DRAG_ALLOW_NATIVE").as_deref() == Ok("1") {
+                        println!("WINTERMINAL_E2E_DRAG_UNCAPTURED_MOVE={gone:?}->{appeared:?}");
+                    } else {
+                        assert!(
+                            gone.is_empty() && appeared.is_empty(),
+                            "the divider was reported as pass-through but moved: \
+                             {gone:?}->{appeared:?}"
+                        );
+                    }
+                }
+                other => panic!("unknown WINTERMINAL_E2E_DRAG_EXPECT {other:?} in the baseline"),
+            }
+        }
+        other => panic!("WINTERMINAL_E2E_DRAG_PHASE must be baseline or verify, got {other:?}"),
+    }
+}
+
+/// The pane layout of the window named by `WINTERMINAL_E2E_HWND`.
+fn live_pane_layout() -> PaneLayout {
+    let hwnd = env::var("WINTERMINAL_E2E_HWND")
+        .expect("WINTERMINAL_E2E_HWND must be set")
+        .parse::<isize>()
+        .expect("WINTERMINAL_E2E_HWND must be a decimal HWND");
+    let target = terminal_window_identity(hwnd)
+        .expect("target identity query should succeed")
+        .expect("target must be a Windows Terminal window");
+    let accessibility =
+        TerminalAccessibility::initialize().expect("UI Automation should initialize");
+    let panes = accessibility
+        .pane_geometries(target.hwnd)
+        .expect("native TermControl geometry should be readable");
+    PaneLayout::from_panes(panes)
+}
+
+/// Distinct divider coordinates on `axis`, sorted.
+fn divider_coordinates(layout: &PaneLayout, axis: SplitAxis) -> Vec<i32> {
+    let mut coordinates = layout
+        .dividers()
+        .iter()
+        .filter(|divider| divider.axis() == axis)
+        .map(|divider| divider.coordinate())
+        .collect::<Vec<_>>();
+    coordinates.sort_unstable();
+    coordinates.dedup();
+    coordinates
+}
+
+fn drag_delta() -> i32 {
+    env::var("WINTERMINAL_E2E_DRAG_DELTA")
+        .ok()
+        .map_or(120, |value| {
+            value
+                .parse()
+                .expect("WINTERMINAL_E2E_DRAG_DELTA must be numeric")
+        })
+}
+
+fn baseline_path() -> PathBuf {
+    env::var_os("WINTERMINAL_E2E_DRAG_BASELINE").map_or_else(
+        || env::temp_dir().join("winter-drag-baseline.txt"),
+        PathBuf::from,
+    )
+}
+
+const fn axis_name(axis: SplitAxis) -> &'static str {
+    match axis {
+        SplitAxis::Vertical => "vertical",
+        SplitAxis::Horizontal => "horizontal",
+    }
+}
+
+fn format_coordinates(coordinates: &[i32]) -> String {
+    coordinates
+        .iter()
+        .map(i32::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn parse_coordinates(value: &str) -> Vec<i32> {
+    value
+        .split(',')
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| {
+            part.trim()
+                .parse()
+                .expect("a divider coordinate must be numeric")
+        })
+        .collect()
+}
+
+fn parse_point(value: &str) -> ScreenPoint {
+    let (x, y) = value
+        .split_once(',')
+        .expect("a point must be written as x,y");
+    ScreenPoint::new(
+        x.trim().parse().expect("x must be numeric"),
+        y.trim().parse().expect("y must be numeric"),
+    )
+}
+
+/// Pairs every baseline coordinate with a current one within `tolerance`,
+/// returning the unmatched baseline and current coordinates.
+fn unmatched_coordinates(
+    baseline: &[i32],
+    current: &[i32],
+    tolerance: i32,
+) -> (Vec<i32>, Vec<i32>) {
+    let mut remaining = current.to_vec();
+    let mut missing = Vec::new();
+    for coordinate in baseline {
+        match remaining
+            .iter()
+            .position(|candidate| (candidate - coordinate).abs() <= tolerance)
+        {
+            Some(index) => {
+                remaining.remove(index);
+            }
+            None => missing.push(*coordinate),
+        }
+    }
+    (missing, remaining)
+}
+
+/// The divider lines recorded by the baseline phase, and which of them the
+/// operator dragged.
+struct DragBaseline {
+    axis: SplitAxis,
+    coordinate: i32,
+    expect: String,
+    vertical: Vec<i32>,
+    horizontal: Vec<i32>,
+}
+
+impl DragBaseline {
+    fn parse(raw: &str) -> Self {
+        let mut axis = None;
+        let mut coordinate = None;
+        let mut expect = None;
+        let mut vertical = Vec::new();
+        let mut horizontal = Vec::new();
+        for line in raw.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            match key.trim() {
+                "axis" => {
+                    axis = Some(match value.trim() {
+                        "vertical" => SplitAxis::Vertical,
+                        "horizontal" => SplitAxis::Horizontal,
+                        other => panic!("unknown baseline axis {other:?}"),
+                    });
+                }
+                "coordinate" => {
+                    coordinate = Some(
+                        value
+                            .trim()
+                            .parse()
+                            .expect("the baseline coordinate must be numeric"),
+                    );
+                }
+                "expect" => expect = Some(value.trim().to_owned()),
+                "vertical" => vertical = parse_coordinates(value),
+                "horizontal" => horizontal = parse_coordinates(value),
+                _ => {}
+            }
+        }
+        Self {
+            axis: axis.expect("the baseline must record the dragged divider axis"),
+            coordinate: coordinate.expect("the baseline must record the dragged coordinate"),
+            expect: expect.expect("the baseline must record the expected capture decision"),
+            vertical,
+            horizontal,
+        }
+    }
+}
+
+fn dragged_list(baseline: &DragBaseline) -> &[i32] {
+    match baseline.axis {
+        SplitAxis::Vertical => &baseline.vertical,
+        SplitAxis::Horizontal => &baseline.horizontal,
+    }
+}
+
+fn other_list(baseline: &DragBaseline) -> &[i32] {
+    match baseline.axis {
+        SplitAxis::Vertical => &baseline.horizontal,
+        SplitAxis::Horizontal => &baseline.vertical,
+    }
+}
+
+fn dragged_current(baseline: &DragBaseline, vertical: &[i32], horizontal: &[i32]) -> Vec<i32> {
+    match baseline.axis {
+        SplitAxis::Vertical => vertical.to_vec(),
+        SplitAxis::Horizontal => horizontal.to_vec(),
+    }
+}
+
+fn other_current(baseline: &DragBaseline, vertical: &[i32], horizontal: &[i32]) -> Vec<i32> {
+    match baseline.axis {
+        SplitAxis::Vertical => horizontal.to_vec(),
+        SplitAxis::Horizontal => vertical.to_vec(),
     }
 }
 

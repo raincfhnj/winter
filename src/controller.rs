@@ -431,7 +431,13 @@ mod implementation {
             let target = snapshot
                 .terminal
                 .filter(|identity| identity.hwnd == current_hwnd)?;
-            let divider = snapshot.pane_layout.divider_at(point, hit_slop_pixels)?;
+            // Fail closed: `capturable_divider_at` also rejects a divider whose
+            // moved splitter cannot be proven from the observed rectangles, so
+            // `begin` receives `None` and the click is passed through to
+            // Windows Terminal instead of moving an unrelated separator.
+            let divider = snapshot
+                .pane_layout
+                .capturable_divider_at(point, hit_slop_pixels)?;
             Some((target, divider))
         }
     }

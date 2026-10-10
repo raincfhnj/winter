@@ -22,6 +22,8 @@
 
 多窗格时，把鼠标移到 Windows Terminal 原生分隔线上，光标会变成横向或纵向缩放样式；按住左键拖动即可调整相邻窗格比例。实现仍调用 Terminal 原生 `resizePane`，因此尺寸按父分栏约 5% 的步长变化，而不是任意像素变化。
 
+Terminal 不暴露 pane tree，Winter 只能从可见矩形推导"这次拖动会移动哪条分隔线"。因此控制器会先证明"指针下那条线就是 `resizePane` 实际会移动的线"，证明成立才捕获鼠标；**无法从矩形唯一证明归属的嵌套布局**（例如一排四个窗格的中间那条线）不会捕获：左键原样透传给 Windows Terminal，由 Terminal 自己处理，而不是去移动一条你没有抓住的分隔线。这是刻意的 fail-closed 取舍——宁可这次拖不动，也不移动错的分隔线。
+
 鼠标拖动默认开启，可在配置中调整边界命中宽度和几何刷新周期：
 
 ```toml
@@ -98,7 +100,7 @@ winter
 - Prefix 后仍按住 Ctrl 再按方向键，执行 resize；若要移动焦点，请先释放 Ctrl。
 - `send_prefix_literal`（默认第二键 `B`）由控制器直接注入当前配置的 Prefix 组合，自定义 Prefix 后仍然有效，无需重新安装桥接。
 - `closePane` 沿用 Windows Terminal 原生语义：没有分屏时会关闭标签页，最后一个标签页时会关闭窗口。
-- 分屏与新建标签页的当前目录继承由 Windows Terminal 的 Shell Integration 提供。`winter install` 会向 `Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1`（以及存在时的 `Documents\PowerShell\...`）追加一段受管提示符包装，使提示符输出 `OSC 9;9` 工作目录；`winter uninstall` 只移除未被修改的受管块。修改后需重新打开 PowerShell 标签页（或在会话中重新加载 Profile）才能生效。
+- 分屏与新建标签页的当前目录继承由 Windows Terminal 的 Shell Integration 提供。`winter install` 会向 `Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1` 与 `Documents\PowerShell\Microsoft.PowerShell_profile.ps1` 追加一段受管提示符包装，使提示符输出 `OSC 9;9` 工作目录；该目录缺失时，只要探测到对应的宿主（`pwsh.exe` / `powershell.exe`）就会创建它——PowerShell 7 不会自己创建 `Documents\PowerShell`，否则 `pwsh` 分屏会一直回落到默认目录。宿主也不存在时该目标报告为 `skipped`、不落任何文件。`winter uninstall` 只移除未被修改的受管块。修改后需重新打开 PowerShell 标签页（或在会话中重新加载 Profile）才能生效。
 - `winter run`、`winter launch` 和 `winterd.exe` 会在未提权时通过 UAC 自重启；控制器核心拒绝以普通权限安装 Hook 或向 Terminal 派发动作。
 - 鼠标左键在分隔线以外完全透传；点击或开始拖动会取消尚未完成的 Prefix，避免下一键误触发动作。
 

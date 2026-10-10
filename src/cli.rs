@@ -7,6 +7,7 @@ use std::process::{Command, ExitCode, Stdio};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde::Serialize;
 
+use crate::autostart::{self, AutostartReport, AutostartStatus, VIA_ELEVATION_LONG};
 use crate::integration::{DoctorReport, IntegrationConfig, doctor, install, plan, uninstall};
 use crate::platform::windows::relaunch_current_process_elevated;
 use crate::{
@@ -39,10 +40,23 @@ enum CliCommand {
     ///
     /// Exit status: 0 ready, 2 not installable, 1 failure.
     Plan,
-    /// Install the managed action fragment and hidden bridge keybindings.
-    Install,
+    /// Install the managed action fragment, hidden bridge keybindings, and the
+    /// logon task that keeps the controller available after a reboot.
+    Install {
+        /// Skip the logon task; the controller then has to be started by hand.
+        #[arg(long)]
+        no_autostart: bool,
+    },
     /// Remove only integration entries still owned by Winter.
     Uninstall,
+    /// Manage the per-user logon task that starts the controller at sign-in.
+    Autostart {
+        #[command(subcommand)]
+        action: Option<AutostartAction>,
+        /// Internal: set when Windows started this process through UAC.
+        #[arg(long = VIA_ELEVATION_LONG, hide = true, global = true)]
+        via_elevation: bool,
+    },
     /// Diagnose the current Windows Terminal integration.
     ///
     /// Exit status: 0 healthy, 2 needs attention, 1 failure.
@@ -63,6 +77,16 @@ enum CliCommand {
         #[arg(long, hide = true)]
         path: Option<PathBuf>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum AutostartAction {
+    /// Report whether the logon task is registered (read-only, no UAC).
+    Status,
+    /// Register or repair the logon task so the controller survives a reboot.
+    Enable,
+    /// Remove the logon task and stop starting the controller automatically.
+    Disable,
 }
 
 /// Parses `args` using `bin_name` for usage text and runs the selected command.
@@ -105,26 +129,66 @@ fn execute(cli: Cli) -> AppResult<ExitCode> {
                 ExitCode::from(2)
             })
         }
-        CliCommand::Install => {
+        CliCommand::Install { no_autostart } => {
             let report = install(&integration)?;
-            print_json(&report)?;
+            let autostart = if no_autostart {
+                AutostartReport::skipped("--no-autostart was passed, so nothing starts at sign-in")
+            } else {
+                autostart::ensure_enabled()
+            };
+            warn_unless_persistent(&autostart);
+            print_json(&InstallCommandReport {
+                integration: report,
+                autostart,
+            })?;
             Ok(ExitCode::SUCCESS)
         }
         CliCommand::Uninstall => {
-            let report = uninstall(&integration)?;
-            print_json(&report)?;
+            let mut report = uninstall(&integration)?;
+            let autostart = autostart::ensure_disabled();
+            report.issues.extend(
+                autostart
+                    .issues
+                    .iter()
+                    .map(|issue| format!("autostart: {issue}")),
+            );
+            print_json(&UninstallCommandReport {
+                integration: report,
+                autostart,
+            })?;
             Ok(ExitCode::SUCCESS)
         }
+        CliCommand::Autostart {
+            action,
+            via_elevation,
+        } => run_autostart(action.unwrap_or(AutostartAction::Status), via_elevation),
         CliCommand::Doctor => {
             let report = build_doctor_report(&integration, &default_config_path()?)?;
+            let healthy = report.healthy;
             print_json(&report)?;
-            Ok(ExitCode::from(doctor_exit_code(report.healthy)))
+            Ok(ExitCode::from(doctor_exit_code(healthy)))
         }
         CliCommand::Run { no_launch } => run_command(&integration, no_launch),
         CliCommand::Launch => launch(&integration),
         CliCommand::Config { .. } => unreachable!("config is handled before integration is loaded"),
         CliCommand::Ui { .. } => unreachable!("ui is handled before integration is loaded"),
     }
+}
+
+/// `winter install` report: the integration work plus the persistence state.
+#[derive(Debug, Serialize)]
+struct InstallCommandReport {
+    #[serde(flatten)]
+    integration: crate::integration::InstallReport,
+    autostart: AutostartReport,
+}
+
+/// `winter uninstall` report: what was removed plus the persistence state.
+#[derive(Debug, Serialize)]
+struct UninstallCommandReport {
+    #[serde(flatten)]
+    integration: crate::integration::UninstallReport,
+    autostart: AutostartReport,
 }
 
 /// Single JSON document written to stdout by `winter doctor`.
@@ -134,6 +198,58 @@ struct DoctorCommandReport {
     healthy: bool,
     config: ConfigDiagnosis,
     integration: DoctorReport,
+    autostart: AutostartReport,
+}
+
+/// Tells the user, on stderr, when the install did not become persistent.
+///
+/// The install itself succeeded; only the logon task is missing, so this is a
+/// warning with the exact remedy rather than a failure. Nothing is printed on
+/// the happy path: stdout already carries `autostart.status`, and an empty
+/// stderr keeps `winter install` usable as a single JSON document even for
+/// callers that merge the two streams.
+fn warn_unless_persistent(autostart: &AutostartReport) {
+    if autostart.persistent() {
+        return;
+    }
+    eprintln!(
+        "warning: the controller will not start automatically ({:?}).",
+        autostart.status
+    );
+    for issue in &autostart.issues {
+        eprintln!("  {issue}");
+    }
+}
+
+/// Runs `winter autostart …`.
+///
+/// Exit status follows the documented "needs attention" convention: `0` when
+/// the request is satisfied, `2` when the task is still not in the requested
+/// state (a dismissed UAC prompt, or a task owned by someone else).
+fn run_autostart(action: AutostartAction, via_elevation: bool) -> AppResult<ExitCode> {
+    let (report, satisfied) = match action {
+        AutostartAction::Status => {
+            let report = autostart::status_or_skipped();
+            let satisfied = report.status != AutostartStatus::Skipped;
+            (report, satisfied)
+        }
+        AutostartAction::Enable => {
+            let report = autostart::enable(via_elevation)?;
+            let satisfied = report.persistent();
+            (report, satisfied)
+        }
+        AutostartAction::Disable => {
+            let report = autostart::disable(via_elevation)?;
+            let satisfied = !report.registered;
+            (report, satisfied)
+        }
+    };
+    print_json(&report)?;
+    Ok(if satisfied {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    })
 }
 
 /// Configuration half of the doctor envelope.
@@ -161,6 +277,7 @@ fn build_doctor_report(
         healthy,
         config,
         integration: integration_report,
+        autostart: autostart::status_or_skipped(),
     })
 }
 

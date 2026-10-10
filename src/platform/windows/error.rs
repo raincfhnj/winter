@@ -1,4 +1,5 @@
 use std::io;
+use std::path::PathBuf;
 
 use thiserror::Error;
 
@@ -120,6 +121,34 @@ pub enum PlatformError {
 
     #[error("Windows refused the elevated controller launch (ShellExecute result {result_code})")]
     ElevationLaunch { result_code: isize },
+
+    #[error("the administrator approval prompt was dismissed; nothing was changed")]
+    ElevationDeclined,
+
+    #[error("the current account SID could not be read: {0}")]
+    CurrentUserSid(String),
+
+    #[error("failed to run schtasks.exe: {source}")]
+    ScheduledTaskSpawn {
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to stage the scheduled-task definition at {path}: {source}")]
+    ScheduledTaskStaging {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error(
+        "the scheduled task could not be {operation}: {message} (schtasks exit status {exit_code:?})"
+    )]
+    ScheduledTask {
+        operation: String,
+        exit_code: Option<i32>,
+        message: String,
+    },
 }
 
 impl PlatformError {

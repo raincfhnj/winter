@@ -191,6 +191,55 @@ fn help_documents_the_ui_subcommand() {
         .stdout(predicate::str::contains("live dashboard"));
 }
 
+/// The autostart surface is the install-time promise of persistence, so its
+/// command line must stay parseable: an unusable flag here would leave every
+/// `winter install` without a logon task.
+#[test]
+fn help_documents_the_autostart_subcommands() {
+    let assert = Command::cargo_bin("winter")
+        .expect("winter binary should build")
+        .args(["autostart", "--help"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    for expected in ["status", "enable", "disable"] {
+        assert!(
+            stdout.contains(expected),
+            "`winter autostart --help` must document {expected}: {stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("via-elevation"),
+        "the internal helper switch must stay hidden: {stdout}"
+    );
+}
+
+#[test]
+fn autostart_status_prints_a_read_only_report() {
+    let assert = Command::cargo_bin("winter")
+        .expect("winter binary should build")
+        .args(["autostart", "status"])
+        .assert()
+        .success();
+
+    let report: Value =
+        serde_json::from_slice(&assert.get_output().stdout).expect("status stdout should be JSON");
+    assert_eq!(
+        report["taskName"],
+        Value::String("WinterController".to_owned()),
+        "the managed task name is part of the contract: {report}"
+    );
+    assert!(
+        report["registered"].is_boolean(),
+        "status must always state whether persistence is active: {report}"
+    );
+    assert!(
+        report["issues"].is_array(),
+        "status must always carry an issues array: {report}"
+    );
+}
+
 #[test]
 fn ui_once_renders_a_fixture_dashboard() {
     let temp = tempdir().expect("temporary directory should be created");

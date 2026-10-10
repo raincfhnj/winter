@@ -4,9 +4,16 @@
 
 .DESCRIPTION
     Builds the release binaries, installs the `winter` command into the Cargo
-    bin directory, and installs the Windows Terminal integration. Run this once
-    after cloning. Afterwards `winter` works from any shell and keeps working
-    across reboots.
+    bin directory, installs the Windows Terminal integration, and registers
+    the per-user logon task that keeps the controller running.
+
+    Run this once after cloning. Afterwards `winter` works from any shell, the
+    prefix is available in every session, and the controller comes back by
+    itself after a restart - no further action is required.
+
+    Two things need administrator approval, and Windows asks for both once:
+    `cargo install` is not one of them, but the logon task registration is.
+    Answer the prompt and the rest of the script continues unattended.
 
     The script never edits the persisted (User/Machine) PATH: it only reloads
     it into the current process so the freshly installed binaries can be
@@ -16,7 +23,11 @@
     PS> .\install.ps1
 #>
 [CmdletBinding()]
-param()
+param(
+    # Install the binaries and the Windows Terminal integration, but leave the
+    # controller out of the sign-in sequence.
+    [switch]$NoAutostart
+)
 
 Set-StrictMode -Version Latest
 # Keep native-command exit codes observable through $LASTEXITCODE instead of
@@ -89,10 +100,35 @@ if ($pathEntries -notcontains $winterDir) {
 }
 
 Write-Host 'Installing the Windows Terminal integration...' -ForegroundColor Cyan
-& $winterExe install
+if ($NoAutostart) {
+    & $winterExe install --no-autostart
+} else {
+    & $winterExe install
+}
 if ($LASTEXITCODE -ne 0) {
     throw "winter install failed with exit code $LASTEXITCODE"
 }
 
-Write-Host ''
-Write-Host "Done. Run 'winter' to start the controller (Windows will prompt for UAC)." -ForegroundColor Green
+if ($NoAutostart) {
+    Write-Host ''
+    Write-Host "Done. Run 'winter' after every restart: autostart was skipped because of -NoAutostart." -ForegroundColor Yellow
+    return
+}
+
+# The install already registered the logon task; read it back so the summary
+# reflects persisted state instead of the request.
+Write-Host 'Verifying persistent autostart...' -ForegroundColor Cyan
+$autostartJson = & $winterExe autostart status | Out-String
+$autostart = $autostartJson | ConvertFrom-Json
+
+if ($autostart.registered) {
+    Write-Host ''
+    Write-Host 'Done. The controller now starts automatically at sign-in and survives restarts.' -ForegroundColor Green
+    Write-Host "  task        : $($autostart.taskName)" -ForegroundColor DarkGray
+    Write-Host "  command     : $($autostart.command)" -ForegroundColor DarkGray
+    Write-Host "  run level   : $($autostart.runLevel)" -ForegroundColor DarkGray
+    Write-Host "  stop it now : winter autostart disable" -ForegroundColor DarkGray
+} else {
+    Write-Warning "Persistent autostart is not active ($($autostart.status)). Run 'winter autostart enable' from an elevated shell to finish the setup."
+    Write-Host "Run 'winter' to start the controller now." -ForegroundColor Green
+}

@@ -125,6 +125,12 @@ pub enum PlatformError {
     #[error("the administrator approval prompt was dismissed; nothing was changed")]
     ElevationDeclined,
 
+    #[error(
+        "the elevated helper did not finish within {seconds} seconds and was terminated; \
+         the operation may be partially applied — run `winter doctor` to inspect the state"
+    )]
+    ElevationHelperTimeout { seconds: u64 },
+
     #[error("the current account SID could not be read: {0}")]
     CurrentUserSid(String),
 

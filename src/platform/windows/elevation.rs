@@ -3,10 +3,10 @@ use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, WaitForSingleObject,
+    GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, TerminateProcess, WaitForSingleObject,
 };
 use windows::Win32::UI::Shell::{
     SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW, ShellExecuteW,
@@ -18,6 +18,53 @@ use super::error::{PlatformError, PlatformResult};
 
 /// `ERROR_CANCELLED`: the user dismissed the UAC consent dialog.
 const ERROR_CANCELLED: i32 = 1223;
+
+/// Upper bound on how long `run_current_process_elevated_and_wait` blocks.
+///
+/// The helper only performs a scheduled-task write, which is fast even on a
+/// slow machine; two minutes is generous enough that a hit means the helper is
+/// genuinely wedged (antivirus interception, hung `schtasks`) rather than slow.
+const ELEVATED_HELPER_TIMEOUT_MS: u32 = 120_000;
+
+/// Short grace period for reaping a helper that was just terminated.
+const ELEVATED_HELPER_REAP_TIMEOUT_MS: u32 = 5_000;
+
+/// Exit code reported for a helper that had to be terminated.
+const ELEVATED_HELPER_TIMEOUT_EXIT_CODE: u32 = 0xDEAD;
+
+/// The wait must be finite: `u32::MAX` is `INFINITE`, which is the unbounded
+/// behaviour this constant replaced. Compile-time so a future edit that
+/// reintroduces an endless wait fails the build rather than hanging a user.
+const _: () = assert!(
+    ELEVATED_HELPER_TIMEOUT_MS > 0 && ELEVATED_HELPER_TIMEOUT_MS < u32::MAX,
+    "the elevated helper wait must be finite"
+);
+
+/// How a `WaitForSingleObject` on the elevated helper finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelperOutcome {
+    /// The child exited; its exit code is meaningful.
+    Exited,
+    /// The bounded wait elapsed; the child has to be terminated.
+    TimedOut,
+    /// The wait itself failed, so no exit code can be trusted.
+    Failed,
+}
+
+/// Classifies a `WaitForSingleObject` result.
+///
+/// Kept separate from the FFI call so the decision table is testable: the
+/// interesting cases (a helper that never returns, a wait that fails) cannot be
+/// produced on demand against a real elevated child.
+fn classify_wait(waited: windows::Win32::Foundation::WAIT_EVENT) -> HelperOutcome {
+    if waited == WAIT_OBJECT_0 {
+        HelperOutcome::Exited
+    } else if waited == WAIT_TIMEOUT {
+        HelperOutcome::TimedOut
+    } else {
+        HelperOutcome::Failed
+    }
+}
 
 const RUN_AS_VERB: &[u16] = &[
     b'r' as u16,
@@ -112,7 +159,39 @@ pub fn run_current_process_elevated_and_wait(arguments: &[&str]) -> PlatformResu
     // SAFETY: SEE_MASK_NOCLOSEPROCESS guarantees a valid handle on success.
     let process = unsafe { Owned::new(info.hProcess) };
     // SAFETY: `process` is a live process handle owned by this scope.
-    unsafe { WaitForSingleObject(*process, u32::MAX) };
+    let waited = unsafe { WaitForSingleObject(*process, ELEVATED_HELPER_TIMEOUT_MS) };
+    match classify_wait(waited) {
+        HelperOutcome::Exited => {}
+        HelperOutcome::TimedOut => {
+            // A helper that never returns must not hang `winter install` or
+            // `winter uninstall` forever: waiting on it with `INFINITE` had no
+            // cancellation path at all, so an antivirus stall or a wedged
+            // `schtasks` left the parent process stuck with no way out.
+            //
+            // The child is terminated so the caller is not left with a rogue
+            // elevated process still writing the task definition, and the error
+            // says the operation may be partial rather than claiming success.
+            // SAFETY: `process` is a live handle owned by this scope; the exit
+            // code is irrelevant because the caller is told the helper was
+            // killed.
+            let _ = unsafe { TerminateProcess(*process, ELEVATED_HELPER_TIMEOUT_EXIT_CODE) };
+            // SAFETY: the handle is still valid; this reaps the terminated child
+            // so the caller is not left waiting on a zombie.
+            unsafe { WaitForSingleObject(*process, ELEVATED_HELPER_REAP_TIMEOUT_MS) };
+            return Err(PlatformError::ElevationHelperTimeout {
+                seconds: u64::from(ELEVATED_HELPER_TIMEOUT_MS) / 1_000,
+            });
+        }
+        HelperOutcome::Failed => {
+            // The wait itself did not observe the child exit, so reading an
+            // exit code would report whatever the process happens to have. Say
+            // the wait failed instead of inventing a status.
+            return Err(PlatformError::win32(
+                "WaitForSingleObject",
+                windows::core::Error::from_thread(),
+            ));
+        }
+    }
     let mut code = 0_u32;
     // SAFETY: `process` is a live process handle; `code` is a writable out
     // parameter of the documented type.
@@ -209,7 +288,12 @@ fn wide_null_os(value: &std::ffi::OsStr) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_line_parameters, quote_windows_command_line_argument};
+    use windows::Win32::Foundation::{WAIT_ABANDONED, WAIT_FAILED};
+
+    use super::{
+        ELEVATED_HELPER_TIMEOUT_MS, HelperOutcome, WAIT_OBJECT_0, WAIT_TIMEOUT, classify_wait,
+        command_line_parameters, quote_windows_command_line_argument,
+    };
 
     #[test]
     fn quotes_relaunch_arguments_with_windows_rules() {
@@ -234,5 +318,30 @@ mod tests {
             command_line_parameters(&["run", "--no-launch", "中文 path"]),
             "run --no-launch \"中文 path\""
         );
+    }
+
+    /// The helper is only ever waited on with a finite timeout: an unbounded
+    /// wait would hang `winter install` / `winter uninstall` with no way out
+    /// when the elevated child wedges. The bound itself is asserted at compile
+    /// time (see the `const _` next to the constant).
+    #[test]
+    fn the_elevated_helper_wait_is_bounded() {
+        assert_eq!(
+            ELEVATED_HELPER_TIMEOUT_MS, 120_000,
+            "two minutes: generous for a task write, short enough to notice a wedged helper"
+        );
+    }
+
+    #[test]
+    fn wait_results_map_to_exit_timeout_and_failure() {
+        assert_eq!(classify_wait(WAIT_OBJECT_0), HelperOutcome::Exited);
+        assert_eq!(classify_wait(WAIT_TIMEOUT), HelperOutcome::TimedOut);
+        // WAIT_FAILED and WAIT_ABANDONED both mean "no exit code can be trusted".
+        assert_eq!(
+            classify_wait(WAIT_FAILED),
+            HelperOutcome::Failed,
+            "a failed wait must not be read as a clean exit"
+        );
+        assert_eq!(classify_wait(WAIT_ABANDONED), HelperOutcome::Failed);
     }
 }

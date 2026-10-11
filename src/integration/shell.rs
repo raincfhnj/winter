@@ -262,14 +262,26 @@ fn plan_with(config: &IntegrationConfig, presence: ShellPresence) -> Vec<ShellIn
 }
 
 /// [`install`] with an explicit shell presence.
+///
+/// Leftover pre-Winter wrappers are swept first (see [`uninstall_legacy`]): the
+/// one-shot migration only runs while legacy state still exists, so a profile
+/// that kept one would wrap the prompt a second time forever — and its
+/// unguarded `OSC 9;9` reports PSDrives, which make Windows Terminal 1.25 and
+/// earlier fail the next split. Sweeping before the managed block means such a
+/// profile is rewritten once, with the current block.
 fn install_with(
     config: &IntegrationConfig,
     presence: ShellPresence,
 ) -> Vec<ShellIntegrationReport> {
-    profile_targets(config)
+    let legacy = uninstall_legacy(config)
+        .into_iter()
+        .filter(|report| report.status != ChangeStatus::Missing);
+    let mut reports = profile_targets(config)
         .into_iter()
         .map(|(shell, path)| install_profile(config, shell, &path, presence))
-        .collect()
+        .collect::<Vec<_>>();
+    reports.extend(legacy);
+    reports
 }
 
 fn plan_profile(shell: ShellKind, path: &Path, presence: ShellPresence) -> ShellIntegrationReport {
@@ -442,9 +454,10 @@ fn uninstall_profile_inner(
 /// is removed even when its content was edited; the current-marker path keeps
 /// edited blocks (see [`uninstall_profile_inner`]).
 pub(super) fn uninstall_legacy(config: &IntegrationConfig) -> Vec<ShellIntegrationReport> {
-    // A missing profile is reported once per marker pair, and an absent block
-    // reports `Missing`, so the pair that actually removes a block is the last
-    // report for that profile — which is what owns the meaningful status.
+    // One entry per profile. A profile is probed once per historical marker
+    // pair, and the first pair is usually the one that matches, so the merge
+    // must keep the informative status: a removal or a malformed block is never
+    // masked by the `Missing` report of a later, unrelated pair.
     let mut reports: Vec<ShellIntegrationReport> = Vec::new();
     for (shell, path) in profile_targets(config) {
         for (begin_marker, end_marker) in LEGACY_SHELL_MARKER_PAIRS {
@@ -457,8 +470,14 @@ pub(super) fn uninstall_legacy(config: &IntegrationConfig) -> Vec<ShellIntegrati
                 BlockPolicy::RemoveEvenIfEdited,
             )
             .unwrap_or_else(|error| shell_error(shell, &path, error));
-            reports.retain(|existing| !(existing.shell == shell && existing.path == report.path));
-            reports.push(report);
+            match reports
+                .iter_mut()
+                .find(|existing| existing.shell == shell && existing.path == report.path)
+            {
+                Some(existing) if existing.status == ChangeStatus::Missing => *existing = report,
+                Some(_) => {}
+                None => reports.push(report),
+            }
         }
     }
     reports
@@ -892,6 +911,88 @@ mod tests {
             powershell.status,
             ChangeStatus::Unchanged,
             "a second install must be idempotent after creating the folder"
+        );
+    }
+
+    #[test]
+    fn install_removes_a_leftover_pre_winter_prompt_wrapper() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let config = config_with(temp.path());
+        let profile_dir = config.documents_dir.join("WindowsPowerShell");
+        fs::create_dir_all(&profile_dir).expect("profile directory should be created");
+        let profile = profile_dir.join("Microsoft.PowerShell_profile.ps1");
+        let (begin, end) = LEGACY_SHELL_MARKER_PAIRS[0];
+        fs::write(
+            &profile,
+            format!(
+                "Set-Alias ll Get-ChildItem\n{begin}\nfunction global:prompt {{ 'PS> ' }}\n{end}\n"
+            ),
+        )
+        .expect("profile should be written");
+
+        let report = install(&config);
+
+        let text = fs::read_to_string(&profile).expect("profile should be readable");
+        assert!(
+            !text.contains(begin) && !text.contains(end),
+            "the pre-Winter wrapper must be swept on install: {text}"
+        );
+        assert!(text.contains("Set-Alias ll Get-ChildItem"));
+        assert_eq!(text.matches(BEGIN_MARKER).count(), 1);
+        assert_eq!(text.matches(END_MARKER).count(), 1);
+
+        let swept = report
+            .iter()
+            .find(|entry| entry.shell == ShellKind::WindowsPowerShell)
+            .expect("windows powershell target");
+        assert!(
+            report
+                .iter()
+                .any(|entry| entry.path == profile && entry.status == ChangeStatus::Removed),
+            "the sweep must be reported even though the later marker pair finds nothing"
+        );
+        assert_eq!(
+            report
+                .iter()
+                .filter(|entry| entry.shell == ShellKind::WindowsPowerShell)
+                .count(),
+            2,
+            "one entry for the managed block and one for the sweep"
+        );
+        assert_eq!(swept.path, profile);
+    }
+
+    #[test]
+    fn install_reports_a_malformed_legacy_block_without_failing() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let config = config_with(temp.path());
+        let profile_dir = config.documents_dir.join("WindowsPowerShell");
+        fs::create_dir_all(&profile_dir).expect("profile directory should be created");
+        let profile = profile_dir.join("Microsoft.PowerShell_profile.ps1");
+        let (begin, _) = LEGACY_SHELL_MARKER_PAIRS[0];
+        fs::write(
+            &profile,
+            format!("Set-Alias ll Get-ChildItem\n{begin}\nfunction global:prompt {{ 'PS> ' }}\n"),
+        )
+        .expect("profile should be written");
+
+        let report = install(&config);
+
+        let text = fs::read_to_string(&profile).expect("profile should be readable");
+        assert!(
+            text.contains(begin),
+            "a malformed marker pair must be left for the user to fix"
+        );
+        assert!(
+            text.contains(BEGIN_MARKER),
+            "the managed block is still installed next to the broken legacy markup"
+        );
+        assert!(
+            report
+                .iter()
+                .any(|entry| entry.shell == ShellKind::WindowsPowerShell
+                    && entry.status == ChangeStatus::Conflict),
+            "the malformed legacy block must be reported instead of silently skipped"
         );
     }
 

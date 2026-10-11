@@ -100,7 +100,7 @@ winter
 - Prefix 后仍按住 Ctrl 再按方向键，执行 resize；若要移动焦点，请先释放 Ctrl。
 - `send_prefix_literal`（默认第二键 `B`）由控制器直接注入当前配置的 Prefix 组合，自定义 Prefix 后仍然有效，无需重新安装桥接。
 - `closePane` 沿用 Windows Terminal 原生语义：没有分屏时会关闭标签页，最后一个标签页时会关闭窗口。
-- 分屏与新建标签页的当前目录继承由 Windows Terminal 的 Shell Integration 提供。`winter install` 会向 `Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1` 与 `Documents\PowerShell\Microsoft.PowerShell_profile.ps1` 追加一段受管提示符包装，使提示符输出 `OSC 9;9` 工作目录；该目录缺失时，只要探测到对应的宿主（`pwsh.exe` / `powershell.exe`）就会创建它——PowerShell 7 不会自己创建 `Documents\PowerShell`，否则 `pwsh` 分屏会一直回落到默认目录。宿主也不存在时该目标报告为 `skipped`、不落任何文件。`winter uninstall` 只移除未被修改的受管块。修改后需重新打开 PowerShell 标签页（或在会话中重新加载 Profile）才能生效。
+- 分屏与新建标签页的当前目录继承由 Windows Terminal 的 Shell Integration 提供。`winter install` 会向 `Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1` 与 `Documents\PowerShell\Microsoft.PowerShell_profile.ps1` 追加一段受管提示符包装，使提示符输出 `OSC 9;9` 工作目录；该目录缺失时，只要探测到对应的宿主（`pwsh.exe` / `powershell.exe`）就会创建它——PowerShell 7 不会自己创建 `Documents\PowerShell`，否则 `pwsh` 分屏会一直回落到默认目录。宿主也不存在时该目标报告为 `skipped`、不落任何文件。每次 `install` 还会清扫历史品牌（`WinTerminalPP` / `WinTerminalP`）遗留的包装块，避免同一个提示符输出两次 `OSC 9;9`、并消除旧块缺少 provider 保护造成的分屏失败。`winter uninstall` 只移除未被修改的受管块。修改后需重新打开 PowerShell 标签页（或在会话中重新加载 Profile）才能生效。
 - `winter run`、`winter launch` 和 `winterd.exe` 会在未提权时通过 UAC 自重启；控制器核心拒绝以普通权限安装 Hook 或向 Terminal 派发动作。
 - 鼠标左键在分隔线以外完全透传；点击或开始拖动会取消尚未完成的 Prefix，避免下一键误触发动作。
 

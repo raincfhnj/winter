@@ -196,6 +196,8 @@ PowerShell 7 自己不会创建 `Documents\PowerShell`：只要没有任何工�
 
 提示符包装只在文件系统位置上报目录：`$loc.Provider.Name -eq 'FileSystem'` 时才输出 `$loc.ProviderPath`。1.25 及更早版本对上报表只做非空判断，把 `HKLM:\` 这类 PSDrive 路径原样交给 `CreateProcess` 会让下一次分屏直接失败（WT #20373）；非文件系统位置保持静默后，WT 会继续使用构造时预置的 Profile 目录，分屏至少能正常打开。
 
+每次 `winter install` 还会先清扫历史品牌的包装块（`WinTerminalPP` / `WinTerminalP` 两套标记，`BlockPolicy::RemoveEvenIfEdited`）。一次性迁移只在旧状态目录仍存在时才触发，否则残留块会与受管块叠加：同一个提示符输出两次 `OSC 9;9`，且旧块没有 provider 保护，PSDrive 上的分屏会失败。两套标记的探测结果按 Profile 合并时保留信息量最大的状态，因此“移除了旧块”或“旧块标记损坏”不会被后一次 `Missing` 覆盖——迁移路径也会因此如实报错而不是静默通过；清扫失败（内容冲突、环境 I/O）只作为报告条目出现，不阻断安装。
+
 ## 8. 安全边界
 
 - Hook 只判断有限快捷键和原生分隔线附近的左键拖动，不记录字符流或鼠标轨迹。

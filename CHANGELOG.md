@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `winter ui` no longer reports a running controller as offline while the
+  workspace is idle. The controller wrote `dashboard.json` only when the
+  observable state changed, but liveness is inferred from that file's age, so
+  two quiet seconds were enough to cross the 2s staleness window and replace
+  every live panel with `OFFLINE`. The observer now refreshes the file once a
+  second even when nothing changed (`DASHBOARD_HEARTBEAT_MS`, guarded by a
+  compile-time assertion that it stays inside the staleness window); writes
+  still happen on change as before, and an idle session simply stays online.
+- The dashboard says `1 pane`, not `1 panes`.
 - A system switch key (`Alt+Tab`, `Ctrl+Tab`, `Alt+F4`, …) cancelling an armed
   prefix now ends the session *and* its suppressed-key ledger. Previously only
   the state was reset, so the consumed prefix key stayed suppressed: its key-up

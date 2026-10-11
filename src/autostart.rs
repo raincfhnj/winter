@@ -66,6 +66,9 @@ pub enum AutostartStatus {
     Missing,
     /// A task with the managed name exists but was not created by Winter.
     Foreign,
+    /// Winter's own task exists, but it no longer starts this binary — it
+    /// points at a moved, renamed, or deleted executable.
+    Stale,
     /// The task could not be touched (for example a dismissed UAC prompt).
     Skipped,
 }
@@ -121,6 +124,18 @@ impl AutostartReport {
         report
     }
 
+    /// Winter owns the task, but it would start something other than the
+    /// binary that is asking — usually because the install moved.
+    fn stale(snapshot: &TaskSnapshot, expected: &Path) -> Self {
+        let mut report = Self::for_snapshot(snapshot, AutostartStatus::Stale, false);
+        report.issues.push(format!(
+            "the registered task starts {}, not {}; run `winter autostart enable` to point it at this binary",
+            snapshot.command.as_deref().unwrap_or("<unknown>"),
+            expected.display()
+        ));
+        report
+    }
+
     /// Report for a task that could not be touched, with the reason attached.
     #[must_use]
     pub fn skipped(reason: &str) -> Self {
@@ -142,12 +157,20 @@ impl AutostartReport {
 }
 
 /// Read-only autostart state; never asks for elevation.
+///
+/// A task Winter owns but that no longer starts *this* binary is reported as
+/// [`AutostartStatus::Stale`] rather than registered: a moved or deleted
+/// install would otherwise look persistent while every sign-in fails with
+/// "the system cannot find the file specified".
 pub fn status() -> AppResult<AutostartReport> {
     Ok(match current_task()? {
-        Some(snapshot) if snapshot.managed => {
-            AutostartReport::for_snapshot(&snapshot, AutostartStatus::Registered, true)
-        }
-        Some(snapshot) => AutostartReport::foreign(&snapshot),
+        Some(snapshot) if !snapshot.managed => AutostartReport::foreign(&snapshot),
+        Some(snapshot) => match controller_command() {
+            Ok(command) if !snapshot.matches(&command) => {
+                AutostartReport::stale(&snapshot, &command)
+            }
+            _ => AutostartReport::for_snapshot(&snapshot, AutostartStatus::Registered, true),
+        },
         None => AutostartReport::missing(),
     })
 }
@@ -535,6 +558,38 @@ mod tests {
         assert!(!snapshot.matches(Path::new(r"C:\Other\winterd.exe")));
     }
 
+    /// A moved or deleted install leaves the task pointing at nothing. That is
+    /// not "registered": every sign-in would fail with "the system cannot find
+    /// the file specified", so the report has to say so.
+    #[test]
+    fn a_task_that_starts_something_else_is_reported_stale() {
+        let snapshot = TaskSnapshot::parse(REGISTERED_XML);
+        let expected = Path::new(r"C:\Program Files\Winter\winterd.exe");
+
+        let report = AutostartReport::stale(&snapshot, expected);
+
+        assert_eq!(report.status, AutostartStatus::Stale);
+        assert!(
+            !report.registered,
+            "a task that cannot start this binary is not persistent"
+        );
+        assert!(!report.persistent());
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.contains("run `winter autostart enable`")),
+            "the repair path must be spelled out: {report:?}"
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.contains(expected.to_str().unwrap_or_default())),
+            "the issue must name the binary the caller expected: {report:?}"
+        );
+    }
+
     #[test]
     fn a_task_without_the_highest_run_level_does_not_match() {
         let downgraded = REGISTERED_XML.replace("HighestAvailable", "LeastPrivilege");
@@ -616,9 +671,18 @@ mod tests {
             assert!(
                 matches!(
                     report.status,
-                    AutostartStatus::Missing | AutostartStatus::Foreign | AutostartStatus::Skipped
+                    AutostartStatus::Missing
+                        | AutostartStatus::Foreign
+                        | AutostartStatus::Stale
+                        | AutostartStatus::Skipped
                 ),
                 "an unregistered task must not claim a live status: {report:?}"
+            );
+        }
+        if report.status == AutostartStatus::Stale {
+            assert!(
+                !report.issues.is_empty(),
+                "a stale task must explain what to repair: {report:?}"
             );
         }
     }

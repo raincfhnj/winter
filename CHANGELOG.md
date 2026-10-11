@@ -56,6 +56,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before consulting the action bindings, so `prefix = "ctrl+a"` together with
   `new_tab = "ctrl+a"` produced a silently unreachable action instead of a
   configuration error.
+- Persistent autostart now refuses to register the logon task for an executable
+  an unprivileged process of this account could replace. The task starts
+  `winterd.exe` with `HighestAvailable`, and approving it once is the only
+  approval it ever needs — but the program it runs needed none, so a task
+  pointing into a writable directory (the default Cargo install location,
+  `%USERPROFILE%\.cargo\bin`, is one) was a persistence primitive: replace the
+  binary now, be elevated at the next sign-in. Before registering, every
+  directory from the executable up to the volume root is inspected through
+  `GetFileSecurityW`, and any grant of write, delete, or re-permission access to
+  Everyone, Authenticated Users, `BUILTIN\Users`, an interactive/AppContainer
+  SID, the running account's own SID, or a group its token holds enabled is a
+  refusal. Unreadable descriptors, an absent DACL, and ACE types Winter cannot
+  interpret are refusals too, never passes. `winter autostart enable` reports
+  the offending directory, the trustee, and where to install instead; `winter
+  autostart status` carries the verdict as `locationProtected` /
+  `locationDirectory` / `locationIssue`; `winter install` reports `Skipped` with
+  the same reason. There is deliberately no switch to bypass the check.
+- `install.ps1` no longer installs the controller from the user-writable Cargo
+  bin directory. It builds the release binaries, deploys `winter.exe`,
+  `winterminalp.exe`, and `winterd.exe` to `%ProgramFiles%\Winter` (writable
+  only by administrators), puts that directory on the machine `PATH` once, and
+  runs `winter install` from the deployed copy so the task points at a protected
+  executable. It requires administrator rights instead of silently degrading,
+  keeps the previous binaries as a backup, restores them and reverts the `PATH`
+  entry when `winter install` fails, and is idempotent on re-runs. The Cargo bin
+  copy remains as the interactive entry point; it cannot be persisted, and the
+  status report says so.
+- The scheduled-task definition is no longer staged under a predictable name in
+  the shared temporary directory. `%TEMP%\winter-task-<pid>.xml` was writable by
+  every process of the account, the process id is guessable, and the write
+  followed symbolic links, so the staging step could be redirected into an
+  arbitrary file. The definition is now written with `create_new` — which fails
+  on any existing entry, including a link — to an unpredictable name inside
+  `%LOCALAPPDATA%\Winter\staging`, and the staging file is removed on every
+  path, successful or not.
+- `winter autostart disable` now reports the task that is actually on disk after
+  the elevated helper exits. The non-elevated branch returned `Removed` from the
+  snapshot taken *before* the UAC prompt, so a helper that failed, was dismissed
+  late, or removed nothing still produced "removed"; a surviving task is now
+  reported as still registered, a foreign task as foreign, and an unreadable
+  task store as an incomplete operation instead of a success.
 
 ### Added
 

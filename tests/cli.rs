@@ -240,6 +240,50 @@ fn autostart_status_prints_a_read_only_report() {
     );
 }
 
+/// The location verdict is the gate `winter install` acts on, so it has to be
+/// part of the status contract: a caller must be able to tell whether the
+/// directory the controller starts from may host a persisted, elevated task,
+/// and an unprotected one must come with the reason and the remedy.
+#[test]
+fn autostart_status_reports_whether_its_own_location_is_protected() {
+    let assert = Command::cargo_bin("winter")
+        .expect("winter binary should build")
+        .args(["autostart", "status"])
+        .assert()
+        .success();
+
+    let report: Value =
+        serde_json::from_slice(&assert.get_output().stdout).expect("status stdout should be JSON");
+
+    assert!(
+        report["locationProtected"].is_boolean(),
+        "the location verdict is part of the contract: {report}"
+    );
+    assert!(
+        report["locationDirectory"].is_string(),
+        "the verdict must name the directory it judged: {report}"
+    );
+    if report["locationProtected"] == Value::Bool(true) {
+        assert!(
+            report["locationIssue"].is_null(),
+            "a protected location has nothing to explain: {report}"
+        );
+    } else {
+        let issue = report["locationIssue"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            !issue.is_empty(),
+            "an unprotected location must carry an actionable reason: {report}"
+        );
+        assert!(
+            issue.contains("administrators can write"),
+            "the reason must say how to fix it: {issue}"
+        );
+    }
+}
+
 #[test]
 fn ui_once_renders_a_fixture_dashboard() {
     let temp = tempdir().expect("temporary directory should be created");

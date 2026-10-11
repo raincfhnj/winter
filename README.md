@@ -22,11 +22,19 @@ One run of `install.ps1` builds the release binaries, puts `winter` on your `PAT
 installs the Windows Terminal integration, and registers a per-user logon task. It needs
 administrator approval exactly once, for that task.
 
+The controller itself is deployed to `%ProgramFiles%\Winter`, and that is not incidental:
+the logon task starts it elevated at every sign-in, so it may only live where an ordinary
+process cannot replace it. Installing to a user-writable directory (the Cargo bin
+directory is one) cannot be persisted — `winter autostart enable` refuses it and says
+which directory is unsafe and where to install instead, with no flag to bypass the check.
+That is why `install.ps1` requires administrator rights rather than degrading silently,
+and why the Cargo bin copy of `winter` is an interactive convenience only.
+
 Afterwards the prefix is available in every session and comes back by itself after a
 restart: there is nothing to run again. To inspect or change that:
 
 ```powershell
-winter autostart status     # read-only report, no UAC
+winter autostart status     # read-only report, no UAC (includes locationProtected)
 winter autostart enable     # re-register after moving the binaries
 winter autostart disable    # stop starting at sign-in
 ```

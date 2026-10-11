@@ -5,6 +5,7 @@
 //! callbacks.
 
 mod accessibility;
+mod acl;
 mod cursor;
 mod dpi;
 mod elevation;
@@ -19,6 +20,10 @@ mod scheduled_task;
 mod single_instance;
 
 pub use accessibility::{TabInfo, TerminalAccessibility};
+pub use acl::{
+    AclViolation, Capability, GrantSource, PathSafety, check_path_safety, require_protected_path,
+    suggested_install_directory,
+};
 pub use cursor::show_pane_resize_cursor;
 pub use dpi::enable_per_monitor_dpi_awareness;
 pub use elevation::{

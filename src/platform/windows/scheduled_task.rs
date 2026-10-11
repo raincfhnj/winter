@@ -9,10 +9,16 @@
 //! The module owns process spawning, file encoding, and text decoding only;
 //! deciding *which* task to register belongs to [`crate::autostart`].
 
+use std::collections::hash_map::RandomState;
+use std::env;
 use std::fs;
+use std::hash::{BuildHasher, Hasher};
+use std::io::Write;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::error::{PlatformError, PlatformResult};
 
@@ -105,18 +111,23 @@ pub fn task_xml(spec: &TaskSpec) -> String {
 ///
 /// `schtasks /Create` accepts both UTF-16LE and UTF-8 input, but the task
 /// scheduler service is happiest with the encoding it writes itself, so the
-/// document is staged as UTF-16LE with a byte-order mark and removed again.
+/// document is staged as UTF-16LE with a byte-order mark.
+///
+/// The staging file is removed on every path — a successful registration, a
+/// `schtasks` failure, and a failure to write it in the first place — because it
+/// names this account and carries the exact task definition.
 pub fn register_task(name: &str, xml: &str) -> PlatformResult<()> {
     let staging = staging_path();
-    write_utf16(&staging, xml)?;
-    let result = run(&[
-        "/Create",
-        "/TN",
-        name,
-        "/XML",
-        &staging.to_string_lossy(),
-        "/F",
-    ]);
+    let result = write_utf16(&staging, xml).and_then(|()| {
+        run(&[
+            "/Create",
+            "/TN",
+            name,
+            "/XML",
+            &staging.to_string_lossy(),
+            "/F",
+        ])
+    });
     let _ = fs::remove_file(&staging);
     result.map(|_| ())
 }
@@ -212,21 +223,72 @@ fn decode_utf16(bytes: &[u8], to_unit: fn([u8; 2]) -> u16) -> String {
     String::from_utf16_lossy(&units)
 }
 
-fn staging_path() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("winter-task-{}.xml", std::process::id()))
+/// Directory the task definition is staged in.
+///
+/// `%LOCALAPPDATA%\Winter\staging` is preferred over the shared `%TEMP%` root:
+/// this module creates it, so no other process can pre-populate it, and it is
+/// not a location where unrelated tools leave same-named files. The process
+/// temporary directory stays as the fallback, because a machine without
+/// `%LOCALAPPDATA%` (or with an unwritable one) must still be able to install.
+fn staging_directory() -> PathBuf {
+    if let Some(local) = env::var_os("LOCALAPPDATA") {
+        let candidate = PathBuf::from(local).join("Winter").join("staging");
+        if fs::create_dir_all(&candidate).is_ok() {
+            return candidate;
+        }
+    }
+    env::temp_dir()
 }
 
-/// Writes `xml` as UTF-16LE with a byte-order mark.
+/// A staging path that another process can neither predict nor pre-create.
+///
+/// The previous spelling was `%TEMP%\winter-task-<pid>.xml`: the process id is
+/// guessable, `%TEMP%` is writable by every process of the account, and the
+/// write followed symbolic links. Together that turned the staging step into a
+/// redirectable write of attacker-chosen content. The name now carries a 64-bit
+/// value from the OS-seeded `RandomState` hasher plus a per-process counter, so
+/// two calls in the same process cannot collide either.
+fn staging_path() -> PathBuf {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u32(std::process::id());
+    hasher.write_u64(SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    hasher.write_u128(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos()),
+    );
+
+    staging_directory().join(format!("winter-task-{:016x}.xml", hasher.finish()))
+}
+
+/// Writes `xml` as UTF-16LE with a byte-order mark into a *new* file.
+///
+/// `create_new` is the load-bearing part: it maps to `CREATE_NEW`, so the call
+/// fails when anything already occupies the path — including a symbolic link, a
+/// junction, or a hard link another process placed there. `fs::write` opened
+/// whatever it found and wrote through it.
+///
+/// A partial file is left behind when the write itself fails; the caller
+/// ([`register_task`]) owns the cleanup, because it owns the path.
 fn write_utf16(path: &Path, xml: &str) -> PlatformResult<()> {
     let mut bytes = Vec::with_capacity(xml.len() * 2 + 2);
     bytes.extend_from_slice(&[0xFF, 0xFE]);
     for unit in xml.encode_utf16() {
         bytes.extend_from_slice(&unit.to_le_bytes());
     }
-    fs::write(path, bytes).map_err(|source| PlatformError::ScheduledTaskStaging {
+
+    let staging = |source| PlatformError::ScheduledTaskStaging {
         path: path.to_path_buf(),
         source,
-    })
+    };
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(staging)?;
+    file.write_all(&bytes).map_err(staging)
 }
 
 /// Escapes the five XML metacharacters.
@@ -348,5 +410,66 @@ mod tests {
             "an absent task must be None: {queried:?}"
         );
         delete_task(&missing).expect("deleting an absent task is a no-op");
+    }
+
+    /// Staging must create, never reuse. The fixture uses a hard link because a
+    /// hard link shares its content: the old `fs::write` spelling wrote straight
+    /// through it, so this test fails on the pre-fix code without needing the
+    /// privileges a symbolic link would need.
+    #[test]
+    fn staging_refuses_an_existing_path_and_leaves_it_untouched() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let sentinel = directory.path().join("sentinel.txt");
+        fs::write(&sentinel, b"sentinel").expect("fixture should be written");
+        let staging = directory.path().join("winter-task.xml");
+        fs::hard_link(&sentinel, &staging).expect("a hard link should be creatable");
+
+        let error =
+            write_utf16(&staging, "<Task/>").expect_err("an occupied staging path must be refused");
+
+        assert!(
+            matches!(error, PlatformError::ScheduledTaskStaging { .. }),
+            "the failure must be reported as a staging error: {error:?}"
+        );
+        assert_eq!(
+            fs::read(&sentinel).expect("the sentinel must stay readable"),
+            b"sentinel",
+            "the linked file must not receive the task definition"
+        );
+    }
+
+    /// Two staging paths in one process must differ, and neither may be derived
+    /// from the process id: the old name was `winter-task-<pid>.xml`, which any
+    /// process of the account could compute in advance.
+    #[test]
+    fn staging_paths_are_unique_and_not_derived_from_the_process_id() {
+        let first = staging_path();
+        let second = staging_path();
+
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), second.parent());
+        assert!(
+            !first
+                .to_string_lossy()
+                .contains(&format!("winter-task-{}.xml", std::process::id())),
+            "the staging name must not be predictable from the process id: {first:?}"
+        );
+        assert_eq!(first.extension().and_then(|ext| ext.to_str()), Some("xml"));
+    }
+
+    /// The preferred staging directory is created by this module, so the write
+    /// is not racing whatever else lives in the shared temporary directory.
+    #[test]
+    fn the_staging_directory_exists_and_is_writable() {
+        let directory = staging_directory();
+
+        assert!(
+            directory.is_dir(),
+            "the staging directory must exist: {}",
+            directory.display()
+        );
+        let probe = directory.join("winter-probe.tmp");
+        fs::write(&probe, b"probe").expect("the staging directory must be writable");
+        fs::remove_file(&probe).expect("the probe must be removable");
     }
 }

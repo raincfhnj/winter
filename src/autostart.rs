@@ -17,6 +17,14 @@
 //! so `winter install` still returns a truthful report; a dismissed prompt is
 //! reported as [`AutostartStatus::Skipped`] rather than an error, because the
 //! Windows Terminal integration itself installed fine.
+//!
+//! Approving registration is the *only* approval the persisted task ever needs:
+//! from then on Task Scheduler starts the controller elevated at every sign-in.
+//! The executable therefore has to be one a medium-integrity process of this
+//! account cannot replace, so [`enable`] refuses to register anything outside a
+//! protected directory. There is deliberately no switch to skip that check: a
+//! persisted elevated task pointing at a writable path is a privilege
+//! escalation primitive, not a preference.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -24,8 +32,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::platform::windows::{
-    PlatformError, TaskSpec, current_user_sid_string, delete_task, is_current_process_elevated,
-    query_task_xml, register_task, run_current_process_elevated_and_wait, task_xml,
+    PathSafety, PlatformError, TaskSpec, check_path_safety, current_user_sid_string, delete_task,
+    is_current_process_elevated, query_task_xml, register_task, require_protected_path,
+    run_current_process_elevated_and_wait, task_xml,
 };
 use crate::{AppError, AppResult};
 
@@ -87,6 +96,17 @@ pub struct AutostartReport {
     pub run_level: Option<String>,
     /// Trigger kind of the registered task, when it could be read.
     pub trigger: Option<String>,
+    /// True when the directory the controller starts from was *proven* writable
+    /// only by administrators, so a persisted elevated task may point at it.
+    #[serde(default)]
+    pub location_protected: bool,
+    /// The directory that verdict describes, when it could be resolved.
+    #[serde(default)]
+    pub location_directory: Option<String>,
+    /// Actionable reason the current location may not host a persisted
+    /// controller, or why it could not be proven safe.
+    #[serde(default)]
+    pub location_issue: Option<String>,
     pub issues: Vec<String>,
 }
 
@@ -99,6 +119,9 @@ impl AutostartReport {
             command: snapshot.command.clone(),
             run_level: snapshot.run_level.clone(),
             trigger: snapshot.trigger.clone(),
+            location_protected: false,
+            location_directory: None,
+            location_issue: None,
             issues: Vec::new(),
         }
     }
@@ -111,8 +134,37 @@ impl AutostartReport {
             command: None,
             run_level: None,
             trigger: None,
+            location_protected: false,
+            location_directory: None,
+            location_issue: None,
             issues: Vec::new(),
         }
+    }
+
+    /// Nothing is registered: the report describes an absent task, not the
+    /// snapshot that was taken before an elevated helper ran.
+    ///
+    /// Carrying the pre-removal snapshot forward would claim a `command` and a
+    /// `runLevel` for a task that no longer exists, and reporting `Removed`
+    /// without re-reading the store would claim a removal that may not have
+    /// happened.
+    fn removed() -> Self {
+        let mut report = Self::missing();
+        report.status = AutostartStatus::Removed;
+        report
+    }
+
+    /// Attaches the location verdict, and surfaces its reason through `issues`
+    /// so existing consumers (`winter doctor`, `winter install`'s warning) show
+    /// it without having to know the new fields.
+    fn with_location(mut self, location: &LocationAssessment) -> Self {
+        self.location_protected = location.protected;
+        self.location_directory = location.directory.clone();
+        self.location_issue = location.issue.clone();
+        if let Some(issue) = &location.issue {
+            self.issues.push(issue.clone());
+        }
+        self
     }
 
     fn foreign(snapshot: &TaskSnapshot) -> Self {
@@ -162,8 +214,14 @@ impl AutostartReport {
 /// [`AutostartStatus::Stale`] rather than registered: a moved or deleted
 /// install would otherwise look persistent while every sign-in fails with
 /// "the system cannot find the file specified".
+///
+/// The report always carries the location verdict as well, so a task that *is*
+/// registered from a writable directory — the state every install lands in
+/// before it is moved under `%ProgramFiles%` — is visible here instead of only
+/// when someone tries to enable it.
 pub fn status() -> AppResult<AutostartReport> {
-    Ok(match current_task()? {
+    let location = LocationAssessment::inspect();
+    let report = match current_task()? {
         Some(snapshot) if !snapshot.managed => AutostartReport::foreign(&snapshot),
         Some(snapshot) => match controller_command() {
             Ok(command) if !snapshot.matches(&command) => {
@@ -172,14 +230,28 @@ pub fn status() -> AppResult<AutostartReport> {
             _ => AutostartReport::for_snapshot(&snapshot, AutostartStatus::Registered, true),
         },
         None => AutostartReport::missing(),
-    })
+    };
+    Ok(report.with_location(&location))
 }
 
 /// Registers or repairs the logon task, asking for elevation when needed.
 ///
 /// `via_elevation` marks a helper process that Windows started through UAC;
 /// such a process must never try to elevate itself again.
+///
+/// The location is verified *before* anything else, including before the UAC
+/// prompt: registering the task first and refusing afterwards would already
+/// have created the elevated-at-logon entry the refusal exists to prevent, and
+/// asking for approval for a registration that must not happen wastes the one
+/// prompt the user is willing to answer.
 pub fn enable(via_elevation: bool) -> AppResult<AutostartReport> {
+    let command = controller_command()?;
+    let location = LocationAssessment::verify(&command)?;
+    Ok(enable_at(via_elevation, &command)?.with_location(&location))
+}
+
+/// Registers or repairs the logon task for a location already proven safe.
+fn enable_at(via_elevation: bool, command: &Path) -> AppResult<AutostartReport> {
     let existing = current_task()?;
     if let Some(snapshot) = &existing
         && !snapshot.managed
@@ -187,9 +259,8 @@ pub fn enable(via_elevation: bool) -> AppResult<AutostartReport> {
         return Ok(AutostartReport::foreign(snapshot));
     }
 
-    let command = controller_command()?;
     if let Some(snapshot) = &existing
-        && snapshot.matches(&command)
+        && snapshot.matches(command)
     {
         return Ok(AutostartReport::for_snapshot(
             snapshot,
@@ -236,7 +307,7 @@ pub fn enable(via_elevation: bool) -> AppResult<AutostartReport> {
         };
     }
 
-    let spec = desired_spec(&command)?;
+    let spec = desired_spec(command)?;
     register_task(TASK_NAME, &task_xml(&spec)).map_err(AppError::platform)?;
     let installed = current_task()?.ok_or_else(|| {
         AppError::OperationIncomplete(
@@ -282,19 +353,47 @@ pub fn disable(via_elevation: bool) -> AppResult<AutostartReport> {
             }
             Err(error) => return Err(AppError::platform(error)),
         }
-        return Ok(AutostartReport::for_snapshot(
-            &snapshot,
-            AutostartStatus::Removed,
-            false,
-        ));
+        // The helper ran in its own process and was waited on, so its exit
+        // status says nothing about the store. Re-read the task and report what
+        // is actually there: the pre-fix code reported `Removed` from the
+        // snapshot taken *before* the UAC prompt, which claimed a removal the
+        // helper might never have performed.
+        return removal_report();
     }
 
     delete_task(TASK_NAME).map_err(AppError::platform)?;
-    Ok(AutostartReport::for_snapshot(
-        &snapshot,
-        AutostartStatus::Removed,
-        false,
-    ))
+    removal_report()
+}
+
+/// Reads the managed task back after a removal attempt.
+fn removal_report() -> AppResult<AutostartReport> {
+    match current_task() {
+        Ok(observed) => Ok(report_removal(observed)),
+        // The removal may well have succeeded; what failed is the proof. That is
+        // an incomplete operation, not a successful one.
+        Err(error) => Err(AppError::OperationIncomplete(format!(
+            "the scheduled task could not be read back after the removal, so its state is \
+             unverified: {error}"
+        ))),
+    }
+}
+
+/// Maps the task state observed after a removal attempt into a report.
+fn report_removal(observed: Option<TaskSnapshot>) -> AutostartReport {
+    match observed {
+        None => AutostartReport::removed(),
+        Some(snapshot) if snapshot.managed => {
+            let mut report =
+                AutostartReport::for_snapshot(&snapshot, AutostartStatus::Registered, true);
+            report.issues.push(
+                "the scheduled task is still registered after the removal finished; run \
+                 `winter autostart disable` from an elevated shell to remove it"
+                    .to_owned(),
+            );
+            report
+        }
+        Some(snapshot) => AutostartReport::foreign(&snapshot),
+    }
 }
 
 /// Best-effort registration used by `winter install`.
@@ -321,6 +420,80 @@ pub fn status_or_skipped() -> AutostartReport {
 
 fn elevated() -> AppResult<bool> {
     is_current_process_elevated().map_err(AppError::platform)
+}
+
+/// Whether the directory the controller starts from may host a persisted,
+/// elevated executable, and why not when it may not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocationAssessment {
+    protected: bool,
+    directory: Option<String>,
+    issue: Option<String>,
+}
+
+impl LocationAssessment {
+    /// Inspects the executable this process would register.
+    ///
+    /// Infallible by construction: the read-only commands must still describe
+    /// the task on disk when the location cannot be proven safe, so every
+    /// failure becomes part of the verdict instead of an error.
+    fn inspect() -> Self {
+        match controller_command() {
+            Ok(command) => match check_path_safety(&command) {
+                Ok(safety) => Self::from_safety(&command, &safety),
+                Err(error) => Self::refused(
+                    Some(&command),
+                    format!(
+                        "the permissions on the controller's location could not be verified, so \
+                         it cannot be trusted for a persisted controller: {error}"
+                    ),
+                ),
+            },
+            Err(error) => Self::refused(
+                None,
+                format!("the executable this process would persist could not be resolved: {error}"),
+            ),
+        }
+    }
+
+    /// The verifying half: an unsafe or unprovable location is an error whose
+    /// message is the verdict, including how to fix it.
+    ///
+    /// This must stay a hard failure. Returning the verdict as a value here is
+    /// what let `enable` register a task for a user-writable executable while
+    /// the report already knew the location was unsafe.
+    fn verify(command: &Path) -> AppResult<Self> {
+        let safety = require_protected_path(command).map_err(AppError::platform)?;
+        Ok(Self::from_safety(command, &safety))
+    }
+
+    /// Turns a successful inspection into an assessment.
+    fn from_safety(command: &Path, safety: &PathSafety) -> Self {
+        if safety.is_protected() {
+            Self {
+                protected: true,
+                directory: Self::directory_of(Some(command)),
+                issue: None,
+            }
+        } else {
+            Self::refused(Some(command), safety.summary())
+        }
+    }
+
+    fn refused(command: Option<&Path>, reason: String) -> Self {
+        Self {
+            protected: false,
+            directory: Self::directory_of(command),
+            issue: Some(reason),
+        }
+    }
+
+    fn directory_of(command: Option<&Path>) -> Option<String> {
+        command
+            .and_then(Path::parent)
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(|parent| parent.display().to_string())
+    }
 }
 
 /// Resolves the executable the logon task should start.
@@ -685,5 +858,186 @@ mod tests {
                 "a stale task must explain what to repair: {report:?}"
             );
         }
+    }
+
+    /// The read-only status must never claim a location is protected without
+    /// evidence: a refusal always carries the reason, so the operator can act on
+    /// it instead of reading a bare `false`.
+    #[test]
+    fn the_status_report_never_claims_a_protected_location_without_a_verdict() {
+        let report = status_or_skipped();
+
+        if report.location_protected {
+            assert!(
+                report.location_issue.is_none(),
+                "a protected location has nothing to explain: {report:?}"
+            );
+        } else {
+            assert!(
+                report.location_issue.is_some() || report.status == AutostartStatus::Skipped,
+                "an unprotected location must say why: {report:?}"
+            );
+        }
+    }
+
+    /// The location verdict has to survive into the JSON the CLI prints, since
+    /// that is how `winter autostart status` and `winter doctor` report it.
+    #[test]
+    fn the_location_verdict_is_part_of_the_json_contract() {
+        let location = LocationAssessment {
+            protected: false,
+            directory: Some(r"C:\Users\dev\.cargo\bin".to_owned()),
+            issue: Some("C:\\Users\\dev\\.cargo\\bin can be overwritten".to_owned()),
+        };
+        let report = AutostartReport::missing().with_location(&location);
+        let json = serde_json::to_value(&report).expect("the report must serialize");
+
+        assert_eq!(json["locationProtected"], serde_json::json!(false));
+        assert_eq!(
+            json["locationDirectory"],
+            serde_json::json!(r"C:\Users\dev\.cargo\bin")
+        );
+        assert_eq!(
+            json["locationIssue"],
+            serde_json::json!("C:\\Users\\dev\\.cargo\\bin can be overwritten")
+        );
+        assert_eq!(
+            report.issues.len(),
+            1,
+            "the reason must also be visible to consumers that only read `issues`"
+        );
+
+        let protected = AutostartReport::missing().with_location(&LocationAssessment {
+            protected: true,
+            directory: Some(r"C:\Program Files\Winter".to_owned()),
+            issue: None,
+        });
+        assert!(protected.location_protected);
+        assert!(protected.issues.is_empty());
+    }
+
+    /// The location check must actually refuse the default Cargo location: the
+    /// test binary runs from a user-writable tree, so `enable` on it can only
+    /// fail, and it must fail *before* any registration.
+    #[test]
+    fn an_account_writable_location_is_refused_before_registration() {
+        let command = controller_command().expect("the test binary must resolve");
+        let safety = crate::platform::windows::check_path_safety(&command)
+            .expect("the test binary's location must be inspectable");
+        assert!(
+            !safety.is_protected(),
+            "the test binary lives in a user-writable tree; a fixture that changed that would \
+             invalidate this test: {safety:?}"
+        );
+
+        let error =
+            require_protected_path(&command).expect_err("an account-writable path is refused");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("refusing to persist a logon task"),
+            "the refusal must say what it refused: {message}"
+        );
+        assert!(
+            message.contains("administrators can write"),
+            "the refusal must say how to fix it: {message}"
+        );
+    }
+
+    /// `winter install` must not silently register. When the location is
+    /// refused, the install path has to report a `Skipped` report carrying the
+    /// refusal — not an error, and above all not a task.
+    ///
+    /// The guard is deliberate: on a machine where the test binary happens to
+    /// live in a protected directory this call would really register the task,
+    /// and a test suite must never do that.
+    #[test]
+    fn ensure_enabled_reports_a_skipped_install_for_an_unprotected_location() {
+        let command = controller_command().expect("the test binary must resolve");
+        let safety =
+            check_path_safety(&command).expect("the test binary's location must be readable");
+        if safety.is_protected() {
+            eprintln!("skipping: this test binary lives in a protected location");
+            return;
+        }
+
+        let report = ensure_enabled();
+
+        assert_eq!(report.status, AutostartStatus::Skipped, "{report:?}");
+        assert!(!report.registered, "nothing may be registered: {report:?}");
+        assert!(!report.persistent());
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.contains("refusing to persist a logon task")),
+            "the skip must carry the refusal and its remedy: {report:?}"
+        );
+    }
+
+    /// The verifying entry point must *fail*, not merely describe: a verdict
+    /// carried as a value is what let `enable` register a task for a
+    /// user-writable executable while the report already knew it was unsafe.
+    #[test]
+    fn verifying_an_account_writable_location_is_an_error() {
+        let command = controller_command().expect("the test binary must resolve");
+
+        let error = LocationAssessment::verify(&command)
+            .expect_err("an account-writable location must not verify");
+
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to persist a logon task"),
+            "the failure must be the refusal itself: {error}"
+        );
+    }
+
+    /// A removal that did not take effect must be reported from the disk, not
+    /// from the snapshot taken before the elevated helper ran. This is the bug
+    /// the read-back fixes: the old code returned `Removed` either way.
+    #[test]
+    fn a_task_that_survives_the_removal_is_reported_as_still_registered() {
+        let removed = report_removal(None);
+
+        assert_eq!(removed.status, AutostartStatus::Removed);
+        assert!(!removed.registered);
+        assert!(
+            removed.command.is_none(),
+            "nothing is registered, so no command may be described: {removed:?}"
+        );
+        assert!(removed.issues.is_empty());
+
+        let survived = report_removal(Some(TaskSnapshot::parse(REGISTERED_XML)));
+
+        assert_eq!(survived.status, AutostartStatus::Registered);
+        assert!(
+            survived.registered,
+            "a task still on disk is still persistent: {survived:?}"
+        );
+        assert!(
+            survived.persistent(),
+            "a surviving task still restores the controller: {survived:?}"
+        );
+        assert!(
+            survived
+                .issues
+                .iter()
+                .any(|issue| issue.contains("still registered")),
+            "the survivor must explain the repair: {survived:?}"
+        );
+    }
+
+    /// A same-named task that is not ours, reappearing during the removal, must
+    /// still be reported as foreign rather than as a successful removal.
+    #[test]
+    fn a_foreign_task_observed_after_the_removal_is_not_reported_as_removed() {
+        let foreign =
+            TaskSnapshot::parse(&REGISTERED_XML.replace(OWNERSHIP_MARKER, "Nightly backup"));
+
+        let report = report_removal(Some(foreign));
+
+        assert_eq!(report.status, AutostartStatus::Foreign);
+        assert!(!report.registered);
     }
 }

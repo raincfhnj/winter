@@ -210,6 +210,8 @@ PowerShell 7 自己不会创建 `Documents\PowerShell`：只要没有任何工�
 - 控制器运行入口会先检测访问令牌；未提权时通过 UAC 以相同命令自重启，只有提权实例可安装 Hook、UI Automation 与输入桥接。因此管理员启动的 Windows Terminal 可使用全部 Prefix 与鼠标 resize 功能。`SendInput` 仍只向相同或更低完整性目标注入。[SendInput](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput)
 - `winter run`、`winter launch` 和 `winterd.exe` 只要进入控制器运行态就必须提权；`config`、`plan`、`install`、`uninstall`、`doctor` 仍是无副作用或用户配置命令，不触发 UAC。
 - 控制器不开放网络端口、不读取终端缓冲区。
+- 计划任务只接受**受保护路径**。任务以 `HighestAvailable` 启动 `winterd.exe`，注册时的一次 UAC 批准是它唯一需要的批准；被执行的二进制本身并不需要批准。因此"目录可写"就等于"下次登录以 High IL 执行任意代码"：默认安装位置 `%USERPROFILE%\.cargo\bin` 正是这样。注册前 `autostart` 会先证明可执行文件本身及其每一级祖先目录都不能被本账户的中完整性进程覆盖、删除、改名或改权限——用 `GetFileSecurityW` 读取 owner 与 DACL，拒绝 Everyone、Authenticated Users、`BUILTIN\Users`、INTERACTIVE/AppContainer 等任意用户 SID，以及本进程账户自身的 SID 和其 token 中已启用组所持有的写权限。祖先目录只把 `FILE_DELETE_CHILD` / `DELETE` / `WRITE_DAC` / `WRITE_OWNER` 视为不安全，因此 `C:\`（按设计给 Authenticated Users 追加数据权限，允许在根目录新建文件夹）不会让整块盘失效，而 `C:\Users\<账户>`（给账户完全控制）依然会被拒绝。描述符读不到、DACL 缺失、ACE 类型无法解释，一律判为不安全。判定结果写入 `winter autostart status` 的 `locationProtected` / `locationDirectory` / `locationIssue`，`winter install` 遇到它时返回 `Skipped` 并给出原因与修复方式，且**不提供跳过开关**。`install.ps1` 因此把三个二进制部署到 `%ProgramFiles%\Winter`（仅管理员可写）并从该副本执行安装；cargo bin 中的副本只作为交互入口，不能持久化。
+- 计划任务定义的暂存文件用 `create_new` 创建（路径已存在即失败，不会跟随符号链接），文件名不可预测，目录优先用本模块自建的 `%LOCALAPPDATA%\Winter\staging`；无论注册成功与否都会删除。
 
 ## 9. 失败语义
 

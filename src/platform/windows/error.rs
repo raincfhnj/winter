@@ -155,6 +155,22 @@ pub enum PlatformError {
         exit_code: Option<i32>,
         message: String,
     },
+
+    #[error("the security descriptor of {path} could not be read: {source}")]
+    SecurityDescriptorRead {
+        path: PathBuf,
+        #[source]
+        source: windows::core::Error,
+    },
+
+    #[error("the security descriptor query failed: {0}")]
+    SecurityDescriptorQuery(String),
+
+    /// The executable a persisted task would start can be replaced by an
+    /// unprivileged process of this account. The message is the full verdict,
+    /// including the remedy, so it can be shown to the user verbatim.
+    #[error("{0}")]
+    UnprotectedInstallPath(String),
 }
 
 impl PlatformError {

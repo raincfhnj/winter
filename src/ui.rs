@@ -548,7 +548,7 @@ fn render_narrow(
         lines.push(String::new());
         lines.extend(map);
         lines.push("* = focused pane".to_owned());
-        lines.push(format!("{pane_count} panes"));
+        lines.push(pane_count_label(pane_count));
     } else {
         lines.push(String::new());
         lines.push(placeholder(offline, pane_count));
@@ -626,7 +626,7 @@ fn status_bar(
             "{}/{}/{}",
             state.dispatched_actions, state.failed_actions, state.dropped_actions
         ));
-        parts.push(format!("{} panes", state.panes.len()));
+        parts.push(pane_count_label(state.panes.len()));
         if let Some(selection) = selection {
             parts.push(format!("> {}", selection_label(state, selection)));
         }
@@ -667,7 +667,8 @@ fn right_zone_lines(
         lines.push(placeholder(offline, pane_count));
     }
     lines.push(format!(
-        "{pane_count} panes \u{B7} refreshed {age_ms}ms ago"
+        "{} \u{B7} refreshed {age_ms}ms ago",
+        pane_count_label(pane_count)
     ));
     fit_lines(lines, width, rows)
 }
@@ -912,6 +913,15 @@ fn pad(line: &str, width: usize) -> String {
     let missing = width.saturating_sub(padded.chars().count());
     padded.extend(std::iter::repeat_n(' ', missing));
     padded
+}
+
+/// `1 pane` / `3 panes` — the count is user-facing text in three places.
+fn pane_count_label(count: usize) -> String {
+    if count == 1 {
+        "1 pane".to_owned()
+    } else {
+        format!("{count} panes")
+    }
 }
 
 /// True when the state is absent, stale, or the controller has stopped.
@@ -1524,6 +1534,26 @@ mod tests {
         assert!(
             bar.chars().count() <= 100,
             "status bar exceeded the width: {bar}"
+        );
+    }
+
+    /// A single pane is the common case right after a restart, and the status
+    /// bar is read by humans: it must not say "1 panes".
+    #[test]
+    fn a_single_pane_is_labelled_in_the_singular() {
+        assert_eq!(pane_count_label(0), "0 panes");
+        assert_eq!(pane_count_label(1), "1 pane");
+        assert_eq!(pane_count_label(2), "2 panes");
+
+        let mut state = tabbed_fixture();
+        state.panes.truncate(1);
+        state.tabs.truncate(1);
+        let frame = render_with(Some(&state), 5, 100, 30, None, None);
+
+        assert!(frame.contains("1 pane"), "singular pane count: {frame}");
+        assert!(
+            !frame.contains("1 panes"),
+            "the count must not be pluralized for one pane: {frame}"
         );
     }
 

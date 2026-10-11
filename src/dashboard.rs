@@ -26,6 +26,22 @@ pub const DASHBOARD_COMMAND_FILE_NAME: &str = "command.json";
 /// Age beyond which `winter ui` reports the controller as offline.
 pub const DASHBOARD_STALE_AFTER_MS: u64 = 2_000;
 
+/// Interval at which the controller refreshes the state file even when the
+/// observable body did not change.
+///
+/// The file is normally written only on change, which keeps an idle session
+/// quiet — but liveness is inferred from the file's age, so without a
+/// heartbeat an idle controller would cross [`DASHBOARD_STALE_AFTER_MS`] and
+/// `winter ui` would report a perfectly healthy controller as offline. The
+/// interval is deliberately well below the staleness window: the observer
+/// ticks far more often than this, and one missed or slow write must not be
+/// enough to look dead.
+pub const DASHBOARD_HEARTBEAT_MS: u64 = 1_000;
+
+/// The heartbeat must stay strictly inside the staleness window, or every
+/// idle controller would flap between online and offline.
+const _: () = assert!(DASHBOARD_HEARTBEAT_MS < DASHBOARD_STALE_AFTER_MS);
+
 /// Observable controller state rendered by `winter ui`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

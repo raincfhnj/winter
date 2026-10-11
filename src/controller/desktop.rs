@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 
 use crate::config::MouseResizeConfig;
 use crate::dashboard::{
-    DASHBOARD_SCHEMA_VERSION, DashboardCommand, DashboardCommandAction, DashboardDivider,
-    DashboardPane, DashboardState, DashboardTab, command_path, dashboard_path, take_command,
-    unix_ms_now,
+    DASHBOARD_HEARTBEAT_MS, DASHBOARD_SCHEMA_VERSION, DashboardCommand, DashboardCommandAction,
+    DashboardDivider, DashboardPane, DashboardState, DashboardTab, command_path, dashboard_path,
+    take_command, unix_ms_now,
 };
 use crate::model::WindowIdentity;
 use crate::pane_layout::{PaneGeometry, PaneLayout, ScreenPoint, SplitAxis};
@@ -21,6 +21,10 @@ use crate::{AppError, AppResult};
 
 use super::DashboardTelemetry;
 use super::action_worker::WorkerMessage;
+
+/// Liveness refresh cadence, derived from the window `winter ui` uses to
+/// declare the controller offline.
+const DASHBOARD_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(DASHBOARD_HEARTBEAT_MS);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct DesktopSnapshot {
@@ -230,6 +234,9 @@ struct DashboardPublisher {
     mouse_resize_enabled: bool,
     path: Option<PathBuf>,
     last_written: Option<DashboardState>,
+    /// When the file was last written, for the liveness heartbeat. `None`
+    /// until the first successful write.
+    last_write: Option<Instant>,
 }
 
 impl DashboardPublisher {
@@ -241,6 +248,7 @@ impl DashboardPublisher {
             mouse_resize_enabled,
             path: dashboard_path().ok(),
             last_written: None,
+            last_write: None,
         }
     }
 
@@ -248,6 +256,10 @@ impl DashboardPublisher {
     /// rewritten. Checked every tick so a counter or flag flip lands even
     /// when the desktop snapshot itself is unchanged. Never fails: a write
     /// error is housekeeping, retried on the next tick.
+    ///
+    /// An unchanged tick still refreshes the file once per heartbeat, because
+    /// `winter ui` derives liveness from the file's age: without it, an idle
+    /// controller would be reported as offline while it is running.
     fn publish(
         &mut self,
         snapshot: &DesktopSnapshot,
@@ -261,7 +273,27 @@ impl DashboardPublisher {
             tabs,
             activity,
         );
-        publish_if_changed(self.path.as_deref(), &state, &mut self.last_written)
+        let now = Instant::now();
+        let heartbeat_due = self.heartbeat_due(now);
+        let rewritten = publish_if_changed(
+            self.path.as_deref(),
+            &state,
+            &mut self.last_written,
+            heartbeat_due,
+        );
+        if rewritten {
+            self.last_write = Some(now);
+        }
+        rewritten
+    }
+
+    /// True when the state file has gone a full heartbeat without a write.
+    ///
+    /// A publisher that has never written counts as due, so the very first
+    /// tick still lands even if the body comparison somehow matched.
+    fn heartbeat_due(&self, now: Instant) -> bool {
+        self.last_write
+            .is_none_or(|at| now.saturating_duration_since(at) >= DASHBOARD_HEARTBEAT_INTERVAL)
     }
 }
 
@@ -330,24 +362,26 @@ fn build_dashboard_state(
     }
 }
 
-/// Writes `state` only when its [`DashboardState::body`] differs from the
-/// last body that was successfully written; the timestamp alone never
-/// triggers a write.
+/// Writes `state` when its [`DashboardState::body`] differs from the last body
+/// that was successfully written, or when `heartbeat_due` asks for a liveness
+/// refresh; the timestamp alone never triggers a content write.
 ///
-/// Returns whether the file was rewritten. Only successful writes advance
-/// the comparison baseline, so a transient failure is retried on the next
-/// tick. `path` of `None` (dashboard path unresolvable) is a quiet no-op.
+/// Returns whether the file was rewritten. Only successful writes advance the
+/// comparison baseline, so a transient failure is retried on the next tick.
+/// `path` of `None` (dashboard path unresolvable) is a quiet no-op.
 fn publish_if_changed(
     path: Option<&Path>,
     state: &DashboardState,
     last_written: &mut Option<DashboardState>,
+    heartbeat_due: bool,
 ) -> bool {
     let Some(path) = path else {
         return false;
     };
-    if last_written
-        .as_ref()
-        .is_some_and(|previous| previous.body() == state.body())
+    if !heartbeat_due
+        && last_written
+            .as_ref()
+            .is_some_and(|previous| previous.body() == state.body())
     {
         return false;
     }
@@ -858,11 +892,21 @@ mod tests {
         let mut last_written = None;
 
         assert!(
-            publish_if_changed(Some(&path), &state_for(false, 1_000), &mut last_written),
+            publish_if_changed(
+                Some(&path),
+                &state_for(false, 1_000),
+                &mut last_written,
+                false
+            ),
             "the first publish writes the initial state"
         );
         assert!(
-            !publish_if_changed(Some(&path), &state_for(false, 2_000), &mut last_written),
+            !publish_if_changed(
+                Some(&path),
+                &state_for(false, 2_000),
+                &mut last_written,
+                false
+            ),
             "a fresh timestamp over an identical body must not write"
         );
 
@@ -885,6 +929,7 @@ mod tests {
             mouse_resize_enabled: false,
             path: Some(path.clone()),
             last_written: None,
+            last_write: None,
         };
         let snapshot = DesktopSnapshot::default();
 
@@ -921,6 +966,7 @@ mod tests {
             mouse_resize_enabled: false,
             path: Some(path.clone()),
             last_written: None,
+            last_write: None,
         };
         let snapshot = DesktopSnapshot::default();
 
@@ -944,9 +990,90 @@ mod tests {
         assert!(!publish_if_changed(
             None,
             &state_for(false, 1_000),
-            &mut last_written
+            &mut last_written,
+            true
         ));
         assert!(last_written.is_none());
+    }
+
+    /// Liveness is derived from the state file's age, so an idle controller
+    /// must keep refreshing it. Without the heartbeat the file would cross
+    /// `DASHBOARD_STALE_AFTER_MS` and `winter ui` would report a running
+    /// controller as offline.
+    #[test]
+    fn an_idle_controller_keeps_refreshing_the_state_file() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let path = temp.path().join(DASHBOARD_FILE_NAME);
+        let mut publisher = DashboardPublisher {
+            telemetry: telemetry(false),
+            mouse_resize_enabled: false,
+            path: Some(path.clone()),
+            last_written: None,
+            last_write: None,
+        };
+        let snapshot = DesktopSnapshot::default();
+
+        assert!(
+            publisher.publish(&snapshot, &[], &FocusActivity::default()),
+            "the first tick writes the state"
+        );
+        assert!(
+            !publisher.publish(&snapshot, &[], &FocusActivity::default()),
+            "a tick inside the heartbeat window is still a quiet no-op"
+        );
+
+        // Pretend the heartbeat interval has elapsed without another write.
+        publisher.last_write = Instant::now().checked_sub(DASHBOARD_HEARTBEAT_INTERVAL);
+        assert!(
+            publisher.publish(&snapshot, &[], &FocusActivity::default()),
+            "an idle publisher must refresh the file once per heartbeat"
+        );
+
+        let stored = crate::dashboard::read_dashboard(&path).expect("valid dashboard JSON");
+        assert!(
+            stored.controller_running,
+            "the refresh keeps the state live"
+        );
+        assert!(staging_leftovers(temp.path()).is_empty());
+    }
+
+    #[test]
+    fn the_heartbeat_is_due_only_after_its_interval() {
+        let temp = tempfile::tempdir().expect("temporary directory should be created");
+        let publisher = DashboardPublisher {
+            telemetry: telemetry(false),
+            mouse_resize_enabled: false,
+            path: Some(temp.path().join(DASHBOARD_FILE_NAME)),
+            last_written: None,
+            last_write: None,
+        };
+        let now = Instant::now();
+
+        assert!(
+            publisher.heartbeat_due(now),
+            "a publisher that never wrote is always due"
+        );
+
+        let fresh = DashboardPublisher {
+            last_write: Some(now),
+            ..publisher
+        };
+        assert!(!fresh.heartbeat_due(now), "a fresh write is not due yet");
+        assert!(
+            fresh.heartbeat_due(now + DASHBOARD_HEARTBEAT_INTERVAL),
+            "the interval boundary itself is due"
+        );
+    }
+
+    /// The heartbeat must never fire so rarely that the file can age past the
+    /// window `winter ui` uses to declare the controller offline.
+    #[test]
+    fn the_heartbeat_interval_stays_inside_the_offline_window() {
+        assert!(
+            DASHBOARD_HEARTBEAT_INTERVAL
+                < Duration::from_millis(crate::dashboard::DASHBOARD_STALE_AFTER_MS),
+            "a heartbeat at or beyond the staleness window cannot prove liveness"
+        );
     }
 
     #[test]
@@ -985,7 +1112,12 @@ mod tests {
 
         let mut last_written = None;
         assert!(
-            !publish_if_changed(Some(&path), &state_for(false, 1_000), &mut last_written),
+            !publish_if_changed(
+                Some(&path),
+                &state_for(false, 1_000),
+                &mut last_written,
+                true
+            ),
             "a failed write must not report a publish"
         );
         assert!(

@@ -31,6 +31,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   double-wrapped prompts on every PowerShell session, while `doctor` reported a
   clean migration. The old test could not catch it: it asserted
   `!contains("WinTerminalP")`, and `WinTerminalPP` contains that substring.
+- Loading a configuration file no longer writes it back. A schema 1 file was
+  migrated on disk by `migrate_schema`, which meant the read-only commands
+  (`winter config`, `winter doctor`) silently rewrote user configuration on
+  every run. Legacy files are now migrated in memory only and keep their
+  `schema_version = 1` until the user saves a new configuration; each load
+  applies the same defaults, so behaviour is unchanged.
+- `mouse_resize` tuning values are validated even when the feature is disabled.
+  A disabled feature used to skip the range checks entirely, so an out-of-range
+  `divider_hit_slop_px` or `geometry_poll_interval_ms` was accepted and would
+  take effect as soon as `enabled` was flipped back on — without the file being
+  re-validated.
+- An action bound to the prefix chord is now rejected at load time. The prefix
+  owns the first stage of every sequence and `handle_idle_key_down` matches it
+  before consulting the action bindings, so `prefix = "ctrl+a"` together with
+  `new_tab = "ctrl+a"` produced a silently unreachable action instead of a
+  configuration error.
 
 ### Added
 
@@ -76,6 +92,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   previously reported verbatim, and Windows Terminal 1.25 and earlier accepts any
   non-empty report, hands it to `CreateProcess`, and fails the split instead of
   falling back to the profile's directory.
+- `winter install` also sweeps a leftover pre-Winter prompt wrapper. The one-shot
+  migration only removes those blocks while legacy state still exists, so a
+  machine whose legacy directory was already gone kept a live wrapper beside the
+  managed one: every Windows PowerShell prompt reported `OSC 9;9` twice, and the
+  old wrapper has no provider guard, so a session on a PSDrive such as `HKLM:\`
+  made the next split fail on Windows Terminal 1.25 and earlier. The per-profile
+  sweep result now keeps its informative status — a removal or a malformed marker
+  pair is no longer masked by the `Missing` report of the second marker spelling,
+  which also means the migration reports a broken legacy block instead of
+  passing it silently.
 - Fragment ownership records survive external reformatting: a semantically
   unchanged fragment no longer drops its manifest record, so `winter uninstall`
   can still remove it instead of reporting `Missing`.

@@ -17,6 +17,12 @@ pub const CONFIG_SCHEMA_VERSION: u32 = 2;
 const LEGACY_CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_PREFIX_TIMEOUT_MS: u64 = 1_500;
 pub const DISABLED_SHORTCUT: &str = "disabled";
+
+/// Sentinel owner recorded for the prefix chord in the shortcut conflict map.
+///
+/// A real shortcut name can never equal it, so a hit proves the chord belongs to
+/// the prefix rather than to another action.
+const PREFIX_CHORD_OWNER: &str = "prefix";
 const MIN_PREFIX_TIMEOUT_MS: u64 = 250;
 const MAX_PREFIX_TIMEOUT_MS: u64 = 5_000;
 const MAX_DIVIDER_HIT_SLOP_PX: u8 = 32;
@@ -50,10 +56,13 @@ impl Default for MouseResizeConfig {
 }
 
 impl MouseResizeConfig {
+    /// Validates the tuning values regardless of `enabled`.
+    ///
+    /// A disabled feature is not an excuse to accept out-of-range settings: the
+    /// user can flip `enabled` back on without reloading a valid file, and the
+    /// values would take effect unchecked. Rejecting them at load time keeps
+    /// every accepted file startable.
     fn validate(self) -> AppResult<()> {
-        if !self.enabled {
-            return Ok(());
-        }
         if self.divider_hit_slop_px > MAX_DIVIDER_HIT_SLOP_PX {
             return Err(AppError::InvalidConfiguration(format!(
                 "mouse_resize.divider_hit_slop_px must be between 0 and {MAX_DIVIDER_HIT_SLOP_PX}"
@@ -132,7 +141,7 @@ impl ControllerConfig {
             .map_err(|error| AppError::io("read controller config", path, error))?;
         let mut config = parse_config_source(&source, path)?;
         config.validate()?;
-        config.migrate_schema(path);
+        config.migrate_schema();
         Ok(config)
     }
 
@@ -226,6 +235,7 @@ impl ControllerConfig {
 
         let mut bindings = HashMap::new();
         let mut owners = HashMap::<KeyChord, &'static str>::new();
+        owners.insert(prefix_chord, PREFIX_CHORD_OWNER);
         for spec in shortcut_specs() {
             let configured = self.shortcuts.get(spec.name);
             let chord = match configured.map(String::as_str) {
@@ -254,11 +264,24 @@ impl ControllerConfig {
                     spec.name
                 )));
             }
+            // The prefix chord owns the first stage of every sequence, so an
+            // action bound to it could never fire: `handle_idle_key_down` matches
+            // the prefix before it consults the action bindings. Seed the owner
+            // map with it so the same "two bindings, one chord" rule rejects the
+            // configuration instead of silently shadowing an action.
             if let Some(existing) = owners.insert(chord, spec.name) {
-                return Err(AppError::InvalidConfiguration(format!(
-                    "shortcuts {existing:?} and {:?} both use {chord}",
-                    spec.name
-                )));
+                let message = if existing == PREFIX_CHORD_OWNER {
+                    format!(
+                        "shortcut {:?} cannot use {chord} because it is the prefix chord",
+                        spec.name
+                    )
+                } else {
+                    format!(
+                        "shortcuts {existing:?} and {:?} both use {chord}",
+                        spec.name
+                    )
+                };
+                return Err(AppError::InvalidConfiguration(message));
             }
             bindings.insert(chord, spec.command);
         }
@@ -298,21 +321,15 @@ impl ControllerConfig {
         Duration::from_millis(self.prefix_timeout_ms)
     }
 
-    fn migrate_schema(&mut self, path: &Path) {
-        if self.schema_version != LEGACY_CONFIG_SCHEMA_VERSION {
-            return;
-        }
-        self.schema_version = CONFIG_SCHEMA_VERSION;
-        let write_back = toml::to_string_pretty(self)
-            .map_err(|error| {
-                AppError::InvalidConfiguration(format!("serialize migrated configuration: {error}"))
-            })
-            .and_then(|contents| replace_file_contents(path, &contents));
-        if let Err(error) = write_back {
-            eprintln!(
-                "warning: could not write back migrated configuration {}: {error}; continuing with the in-memory schema {CONFIG_SCHEMA_VERSION}",
-                path.display()
-            );
+    /// Migrates a legacy schema in memory only.
+    ///
+    /// Loading must never rewrite the user's file: `winter config` and
+    /// `winter doctor` are read-only commands. A schema 1 file keeps its
+    /// `schema_version = 1` on disk until the user saves a new configuration,
+    /// and every load transparently applies the same in-memory defaults.
+    fn migrate_schema(&mut self) {
+        if self.schema_version == LEGACY_CONFIG_SCHEMA_VERSION {
+            self.schema_version = CONFIG_SCHEMA_VERSION;
         }
     }
 }
@@ -382,19 +399,6 @@ fn write_temp_file(temp: &Path, target: &Path, contents: &str) -> AppResult<()> 
         return Err(AppError::io("write controller config", target, error));
     }
     Ok(())
-}
-
-/// Atomically replaces `path` with `contents` via a sibling temp file.
-fn replace_file_contents(path: &Path, contents: &str) -> AppResult<()> {
-    let temp = config_temp_path(path);
-    write_temp_file(&temp, path, contents)?;
-    match fs::rename(&temp, path) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = fs::remove_file(&temp);
-            Err(AppError::io("replace controller config", path, error))
-        }
-    }
 }
 
 /// Atomically installs `contents` at `path` only while `path` is absent.
@@ -536,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_mouse_resize_ignores_out_of_range_settings() {
+    fn a_disabled_mouse_resize_still_range_checks_its_settings() {
         let config = ControllerConfig {
             mouse_resize: MouseResizeConfig {
                 enabled: false,
@@ -546,20 +550,47 @@ mod tests {
             ..ControllerConfig::default()
         };
 
-        config
-            .validate()
-            .expect("a disabled feature must not range-check its settings");
-        config
-            .prefix_config()
-            .expect("chord compilation must agree with scalar validation");
+        assert!(
+            config
+                .validate()
+                .expect_err("out-of-range settings must fail even while disabled")
+                .to_string()
+                .contains("divider_hit_slop_px"),
+            "the slop bound must be validated before the poll interval"
+        );
+        assert!(
+            config.prefix_config().is_err(),
+            "chord compilation must agree with scalar validation"
+        );
 
+        // `enabled` can be flipped back on without editing the file, so a value
+        // that could only ever be reached through a disabled feature is still
+        // rejected at load time.
         let parsed: ControllerConfig = toml::from_str(
-            "schema_version = 2\n[mouse_resize]\nenabled = false\ndivider_hit_slop_px = 200\ngeometry_poll_interval_ms = 5\n",
+            "schema_version = 2\n[mouse_resize]\nenabled = false\ndivider_hit_slop_px = 200\n",
         )
         .expect("representable dummy values must deserialize");
-        parsed
+        assert!(
+            parsed.validate().is_err(),
+            "a disabled feature must not accept an out-of-range slop"
+        );
+
+        let poll: ControllerConfig = toml::from_str(
+            "schema_version = 2\n[mouse_resize]\nenabled = false\ngeometry_poll_interval_ms = 5\n",
+        )
+        .expect("representable dummy values must deserialize");
+        assert!(
+            poll.validate().is_err(),
+            "a disabled feature must not accept an out-of-range poll interval"
+        );
+
+        let in_range: ControllerConfig = toml::from_str(
+            "schema_version = 2\n[mouse_resize]\nenabled = false\ndivider_hit_slop_px = 0\ngeometry_poll_interval_ms = 50\n",
+        )
+        .expect("in-range values must deserialize");
+        in_range
             .validate()
-            .expect("a disabled feature must accept dummy values from TOML");
+            .expect("a disabled feature still accepts in-range settings");
     }
 
     #[test]
@@ -631,8 +662,8 @@ mod tests {
         assert_eq!(config.schema_version, CONFIG_SCHEMA_VERSION);
         let migrated = fs::read_to_string(&path).expect("legacy fixture should remain readable");
         assert!(
-            migrated.contains("schema_version = 2"),
-            "migration must write the current schema back to disk: {migrated}"
+            migrated.contains("schema_version = 1"),
+            "the on-disk file keeps its schema until the user saves a new one: {migrated}"
         );
         assert!(migrated.contains("prefix_timeout_ms = 1500"));
         assert!(migrated.contains("launch_terminal_on_start = true"));
@@ -796,6 +827,50 @@ new_tab = "t"
         );
     }
 
+    /// The prefix owns the first stage of every sequence, so an action bound to
+    /// the prefix chord is unreachable: `handle_idle_key_down` matches the prefix
+    /// before it looks at the action bindings. It must be a load error, not a
+    /// silently dead shortcut.
+    #[test]
+    fn an_action_bound_to_the_prefix_chord_is_rejected() {
+        let mut config = ControllerConfig {
+            prefix: "ctrl+a".to_owned(),
+            ..ControllerConfig::default()
+        };
+        config
+            .shortcuts
+            .insert("new_tab".to_owned(), "ctrl+a".to_owned());
+
+        let error = config
+            .prefix_config()
+            .expect_err("an action on the prefix chord can never fire")
+            .to_string();
+        assert!(
+            error.contains("prefix chord"),
+            "the error must name the prefix as the conflict: {error}"
+        );
+
+        // The default prefix is covered the same way.
+        let mut default_prefix = ControllerConfig::default();
+        default_prefix
+            .shortcuts
+            .insert("new_tab".to_owned(), "ctrl+b".to_owned());
+        assert!(
+            default_prefix
+                .prefix_config()
+                .expect_err("the default prefix chord is reserved too")
+                .to_string()
+                .contains("prefix chord")
+        );
+
+        // Any other unused chord still binds normally.
+        let mut free = ControllerConfig::default();
+        free.shortcuts
+            .insert("new_tab".to_owned(), "ctrl+t".to_owned());
+        free.prefix_config()
+            .expect("a chord distinct from the prefix must stay bindable");
+    }
+
     #[test]
     fn schema_version_above_current_is_rejected_before_strict_parse() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
@@ -828,55 +903,48 @@ new_tab = "t"
         assert!(message.contains("future_field"), "unexpected: {message}");
     }
 
+    /// Every read path — `winter config`, `winter doctor`, controller start-up —
+    /// goes through `load`, so a legacy file must survive it byte for byte.
+    /// Migrating it on disk would mean a diagnostic command silently rewrites
+    /// user configuration.
     #[test]
-    fn atomic_replace_removes_temp_file_when_rename_fails() {
+    fn loading_a_legacy_configuration_leaves_the_file_untouched() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
         let path = directory.path().join("config.toml");
-        fs::create_dir(&path).expect("blocking destination should be created");
+        let original =
+            "schema_version = 1\nprefix_timeout_ms = 1500\nlaunch_terminal_on_start = true\n";
+        fs::write(&path, original).expect("legacy fixture should be written");
 
-        assert!(
-            replace_file_contents(&path, "schema_version = 2\n").is_err(),
-            "renaming a file over a directory must fail"
+        let config = ControllerConfig::load(&path).expect("legacy configuration should load");
+        assert_eq!(
+            config.schema_version, CONFIG_SCHEMA_VERSION,
+            "the in-memory schema must be migrated for this process"
+        );
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("fixture should remain readable"),
+            original,
+            "load must not rewrite the user's configuration file"
         );
         assert!(
             temporary_leftovers(directory.path()).is_empty(),
-            "the temporary file must be removed after a failed rename"
+            "load must not stage a temporary file"
         );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn migration_write_back_failure_is_non_fatal() {
-        use std::os::windows::fs::OpenOptionsExt;
-
-        let directory = tempfile::tempdir().expect("temporary directory should be created");
-        let path = directory.path().join("config.toml");
-        fs::write(
-            &path,
-            "schema_version = 1\nprefix_timeout_ms = 1500\nlaunch_terminal_on_start = true\n",
-        )
-        .expect("legacy fixture should be written");
-
-        let locked = OpenOptions::new()
-            .read(true)
-            .share_mode(0x1 | 0x2)
-            .open(&path)
-            .expect("fixture should stay readable");
-
-        let config =
-            ControllerConfig::load(&path).expect("a failed write-back must not fail the load");
-        assert_eq!(config.schema_version, CONFIG_SCHEMA_VERSION);
-        drop(locked);
-
-        assert!(
-            fs::read_to_string(&path)
-                .expect("fixture should remain readable")
-                .contains("schema_version = 1"),
-            "the on-disk file must keep its schema when the write-back fails"
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .expect("directory is readable")
+                .count(),
+            1,
+            "load must not create backups or any other file next to the configuration"
         );
-        assert!(
-            temporary_leftovers(directory.path()).is_empty(),
-            "a failed write-back must not leave a temporary file behind"
+
+        // A second load reports the same effective schema, so nothing depends on
+        // the on-disk version having been bumped.
+        let again = ControllerConfig::load(&path).expect("legacy configuration loads repeatedly");
+        assert_eq!(again.schema_version, CONFIG_SCHEMA_VERSION);
+        assert_eq!(
+            fs::read_to_string(&path).expect("fixture should remain readable"),
+            original
         );
     }
 
